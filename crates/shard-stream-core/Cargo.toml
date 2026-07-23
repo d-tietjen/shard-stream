@@ -10,5 +10,8 @@ rust-version.workspace = true
 description = "Core sequencing and bounded execution primitives for shard-stream"
 publish = false
 
+[dependencies]
+xxhash-rust.workspace = true
+
 [lints]
 workspace = true

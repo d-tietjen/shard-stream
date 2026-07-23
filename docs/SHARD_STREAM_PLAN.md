@@ -1210,6 +1210,10 @@ The claims above should stay precise:
 
 ### Milestone 8: elasticity and active-active ownership
 
+- Ship a static RF1 active-active profile first: deterministically assign
+  disjoint logical partitions across a sorted broker membership, proxy native
+  REST requests by owner, advertise Kafka leaders, and synchronize topic
+  creation. Label it capacity scaling rather than HA.
 - Change ring membership without rewriting historical packs.
 - Add disjoint partition/topic active-active placement.
 - Add fenced, observable replication of consumer checkpoints and stream-cut

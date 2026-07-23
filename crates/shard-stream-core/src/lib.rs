@@ -3,6 +3,7 @@
 mod channel;
 mod ids;
 mod sequencer;
+mod topology;
 
 pub use channel::{
     Budgeted, ByteBoundedReceiver, ByteBoundedSender, ChannelConfigError, ChannelStats,
@@ -13,3 +14,4 @@ pub use ids::{
     TopicPartition,
 };
 pub use sequencer::{Placement, Reservation, SequencerError, SequencerState, TopicSequencer};
+pub use topology::{ClusterNode, StaticTopology};

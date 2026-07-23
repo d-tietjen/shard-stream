@@ -15,6 +15,51 @@
         }
       }
     },
+    "/v1/topology": {
+      "get": {
+        "summary": "Get static cluster membership and advertised endpoints",
+        "responses": {
+          "200": {
+            "description": "Current static topology and ownership algorithm",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "cluster_mode",
+                    "local_node_id",
+                    "topology_digest",
+                    "ownership",
+                    "nodes"
+                  ],
+                  "properties": {
+                    "cluster_mode": {
+                      "type": "string"
+                    },
+                    "local_node_id": {
+                      "type": "integer",
+                      "format": "uint32"
+                    },
+                    "topology_digest": {
+                      "type": "string"
+                    },
+                    "ownership": {
+                      "type": "string"
+                    },
+                    "nodes": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/topics": {
       "post": {
         "summary": "Create a topic",

@@ -1,0 +1,77 @@
+x-cluster-nodes: &cluster-nodes "0@http://shard-stream-0:7420@http://localhost:17420@http://localhost:17421@localhost:19092,1@http://shard-stream-1:7420@http://localhost:27420@http://localhost:27421@localhost:29092,2@http://shard-stream-2:7420@http://localhost:37420@http://localhost:37421@localhost:39092"
+
+x-shard-stream-common: &shard-stream-common
+  build:
+    context: .
+  command:
+    - --listen
+    - 0.0.0.0:7420
+    - --grpc-listen
+    - 0.0.0.0:7421
+    - --kafka-listen
+    - 0.0.0.0:9092
+    - --data-dir
+    - /var/lib/shard-stream
+    - --shards
+    - "8"
+    - --replication-factor
+    - "1"
+  environment: &cluster-environment
+    SHARD_STREAM_APPEND_LINGER_MS: ${SHARD_STREAM_APPEND_LINGER_MS:-1}
+    SHARD_STREAM_CLUSTER_NODES: *cluster-nodes
+    SHARD_STREAM_CLUSTER_TOKEN: ${SHARD_STREAM_CLUSTER_TOKEN:-local-multi-node-development}
+    SHARD_STREAM_MAX_BATCH_BYTES: ${SHARD_STREAM_MAX_BATCH_BYTES:-16777216}
+    SHARD_STREAM_MAX_FETCH_BYTES: ${SHARD_STREAM_MAX_FETCH_BYTES:-67108864}
+    SHARD_STREAM_MAX_REQUEST_BYTES: ${SHARD_STREAM_MAX_REQUEST_BYTES:-33554432}
+  healthcheck:
+    test:
+      - CMD
+      - curl
+      - --fail
+      - --silent
+      - http://127.0.0.1:7420/readyz
+    interval: 5s
+    timeout: 3s
+    retries: 20
+
+services:
+  shard-stream-0:
+    <<: *shard-stream-common
+    environment:
+      <<: *cluster-environment
+      SHARD_STREAM_NODE_ID: "0"
+    ports:
+      - "17420:7420"
+      - "17421:7421"
+      - "19092:9092"
+    volumes:
+      - shard-stream-0-data:/var/lib/shard-stream
+
+  shard-stream-1:
+    <<: *shard-stream-common
+    environment:
+      <<: *cluster-environment
+      SHARD_STREAM_NODE_ID: "1"
+    ports:
+      - "27420:7420"
+      - "27421:7421"
+      - "29092:9092"
+    volumes:
+      - shard-stream-1-data:/var/lib/shard-stream
+
+  shard-stream-2:
+    <<: *shard-stream-common
+    environment:
+      <<: *cluster-environment
+      SHARD_STREAM_NODE_ID: "2"
+    ports:
+      - "37420:7420"
+      - "37421:7421"
+      - "39092:9092"
+    volumes:
+      - shard-stream-2-data:/var/lib/shard-stream
+
+volumes:
+  shard-stream-0-data:
+  shard-stream-1-data:
+  shard-stream-2-data:

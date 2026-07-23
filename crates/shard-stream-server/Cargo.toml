@@ -15,6 +15,7 @@ axum.workspace = true
 clap.workspace = true
 eden_logger.workspace = true
 fast-telemetry.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 shard-stream-core.workspace = true

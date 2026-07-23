@@ -1,7 +1,11 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
-use shard_stream_core::{LogicalOffset, LogicalPartitionId, TopicId};
+#[cfg(test)]
+use shard_stream_core::ClusterNode;
+use shard_stream_core::{
+    LogicalOffset, LogicalPartitionId, StaticTopology, TopicId, TopicPartition,
+};
 use shard_stream_engine::{EngineError, FetchedBatch, StreamEngine};
 use shard_stream_protocol::{
     AppendRequest as EngineAppendRequest, Durability as EngineDurability,
@@ -23,12 +27,14 @@ use v1::producer_service_server::{ProducerService, ProducerServiceServer};
 #[derive(Clone)]
 struct GrpcService {
     engine: Arc<StreamEngine>,
+    topology: Arc<StaticTopology>,
     stream_capacity: usize,
 }
 
 pub async fn serve(
     listener: TcpListener,
     engine: Arc<StreamEngine>,
+    topology: Arc<StaticTopology>,
     stream_capacity: usize,
     max_request_bytes: usize,
     max_response_bytes: usize,
@@ -36,6 +42,7 @@ pub async fn serve(
 ) -> Result<(), tonic::transport::Error> {
     let service = GrpcService {
         engine,
+        topology,
         stream_capacity,
     };
     let producer = ProducerServiceServer::new(service.clone())
@@ -67,6 +74,7 @@ impl ProducerService for GrpcService {
         let mut inbound = request.into_inner();
         let (sender, receiver) = mpsc::channel(self.stream_capacity);
         let engine = Arc::clone(&self.engine);
+        let topology = Arc::clone(&self.topology);
         tokio::spawn(async move {
             loop {
                 let message = match inbound.message().await {
@@ -84,6 +92,10 @@ impl ProducerService for GrpcService {
                         break;
                     }
                 };
+                if let Err(status) = ensure_local_owner(&topology, &request) {
+                    let _ = sender.send(Err(status)).await;
+                    break;
+                }
                 let engine = Arc::clone(&engine);
                 let result = tokio::task::spawn_blocking(move || engine.append(request))
                     .await
@@ -108,6 +120,7 @@ impl ConsumerService for GrpcService {
         request: Request<v1::FetchRequest>,
     ) -> Result<Response<Self::FetchStream>, Status> {
         let request = decode_fetch(request.into_inner())?;
+        ensure_local_fetch_owner(&self.topology, &request)?;
         let request_id = request.request_id;
         let engine = Arc::clone(&self.engine);
         let batches = tokio::task::spawn_blocking(move || engine.fetch(request))
@@ -128,6 +141,37 @@ impl ConsumerService for GrpcService {
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
+}
+
+fn ensure_local_owner(
+    topology: &StaticTopology,
+    request: &EngineAppendRequest,
+) -> Result<(), Status> {
+    ensure_local(
+        topology,
+        TopicPartition::new(request.topic_id, request.partition_id),
+    )
+}
+
+fn ensure_local_fetch_owner(
+    topology: &StaticTopology,
+    request: &EngineFetchRequest,
+) -> Result<(), Status> {
+    ensure_local(
+        topology,
+        TopicPartition::new(request.topic_id, request.partition_id),
+    )
+}
+
+fn ensure_local(topology: &StaticTopology, topic_partition: TopicPartition) -> Result<(), Status> {
+    let owner = topology.owner(topic_partition);
+    if owner.node_id == topology.local_node_id() {
+        return Ok(());
+    }
+    Err(Status::failed_precondition(format!(
+        "not partition coordinator; retry {}",
+        owner.advertised_grpc
+    )))
 }
 
 fn decode_append(request: v1::AppendRequest) -> Result<EngineAppendRequest, Status> {
@@ -287,6 +331,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn non_owner_status_returns_the_advertised_grpc_endpoint() {
+        let topology = StaticTopology::new(
+            0,
+            (0..3)
+                .map(|node_id| ClusterNode {
+                    node_id,
+                    internal_rest: format!("http://node-{node_id}:7420"),
+                    advertised_rest: format!("http://node-{node_id}:7420"),
+                    advertised_grpc: format!("http://node-{node_id}:7421"),
+                    kafka_host: format!("node-{node_id}"),
+                    kafka_port: 9092,
+                })
+                .collect(),
+        )
+        .expect("topology");
+        let topic_partition = (0..100)
+            .map(|partition| {
+                TopicPartition::new(TopicId::new(7), LogicalPartitionId::new(partition))
+            })
+            .find(|topic_partition| !topology.is_local_owner(*topic_partition))
+            .expect("remote partition");
+        let owner = topology.owner(topic_partition);
+        let status = ensure_local(&topology, topic_partition).expect_err("not coordinator");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains(&owner.advertised_grpc));
+    }
+
     #[tokio::test]
     #[ignore = "requires local TCP sockets, which are unavailable in some sandboxes"]
     async fn standard_grpc_clients_append_and_fetch() {
@@ -319,10 +391,25 @@ mod tests {
         let address = listener.local_addr().expect("address");
         let (shutdown_sender, shutdown_receiver) = watch::channel(false);
         let server_engine = Arc::clone(&engine);
+        let topology = Arc::new(
+            StaticTopology::new(
+                0,
+                vec![ClusterNode {
+                    node_id: 0,
+                    internal_rest: "http://127.0.0.1:7420".into(),
+                    advertised_rest: "http://127.0.0.1:7420".into(),
+                    advertised_grpc: format!("http://{address}"),
+                    kafka_host: "127.0.0.1".into(),
+                    kafka_port: 9092,
+                }],
+            )
+            .expect("topology"),
+        );
         let server = tokio::spawn(async move {
             serve(
                 listener,
                 server_engine,
+                topology,
                 8,
                 1024 * 1024,
                 1024 * 1024,

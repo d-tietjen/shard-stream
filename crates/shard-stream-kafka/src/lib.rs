@@ -9,6 +9,8 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -42,8 +44,10 @@ use kafka_protocol::records::{
     NO_PRODUCER_EPOCH, NO_PRODUCER_ID, NO_SEQUENCE, RecordBatchDecoder, RecordBatchEncoder,
     RecordEncodeOptions, RecordSet,
 };
-use shard_stream_core::{LogicalOffset, LogicalPartitionId, TopicId, TopicPartition};
-use shard_stream_engine::{EngineError, StreamEngine, TopicConfig};
+use shard_stream_core::{
+    LogicalOffset, LogicalPartitionId, StaticTopology, TopicId, TopicPartition,
+};
+use shard_stream_engine::{EngineError, EngineResult, StreamEngine, TopicConfig};
 use shard_stream_protocol::{AppendRequest, Durability, FetchMode, FetchRequest, ProducerIdentity};
 use tokio::io::AsyncRead;
 #[cfg(test)]
@@ -69,20 +73,13 @@ const API_VERSIONS: &[(ApiKey, i16, i16)] = &[
 
 #[derive(Debug, Clone)]
 pub struct KafkaConfig {
-    pub advertised_host: String,
-    pub advertised_port: u16,
-    pub node_id: i32,
+    pub topology: Arc<StaticTopology>,
     pub max_frame_bytes: usize,
     pub max_fetch_bytes: usize,
 }
 
 impl KafkaConfig {
     fn validate(&self) -> KafkaResult<()> {
-        if self.advertised_host.is_empty() {
-            return Err(KafkaError::Protocol(
-                "Kafka advertised host cannot be empty".into(),
-            ));
-        }
         if self.max_frame_bytes == 0
             || self.max_frame_bytes > MAX_FRAME_HARD_LIMIT
             || self.max_fetch_bytes == 0
@@ -95,9 +92,37 @@ impl KafkaConfig {
     }
 }
 
+pub trait TopicAdmin: Send + Sync {
+    fn create_topic(
+        &self,
+        topic: TopicConfig,
+    ) -> Pin<Box<dyn Future<Output = EngineResult<()>> + Send + '_>>;
+}
+
+struct LocalTopicAdmin {
+    engine: Arc<StreamEngine>,
+}
+
+impl TopicAdmin for LocalTopicAdmin {
+    fn create_topic(
+        &self,
+        topic: TopicConfig,
+    ) -> Pin<Box<dyn Future<Output = EngineResult<()>> + Send + '_>> {
+        let engine = Arc::clone(&self.engine);
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || engine.create_topic(topic))
+                .await
+                .map_err(|error| {
+                    EngineError::InvalidConfig(format!("Kafka topic admin task failed: {error}"))
+                })?
+        })
+    }
+}
+
 struct Broker {
     engine: Arc<StreamEngine>,
     config: KafkaConfig,
+    topic_admin: Arc<dyn TopicAdmin>,
     known_topics: KnownTopics,
     next_request_id: AtomicU64,
 }
@@ -169,6 +194,19 @@ pub async fn serve(
     listener: TcpListener,
     engine: Arc<StreamEngine>,
     config: KafkaConfig,
+    shutdown: watch::Receiver<bool>,
+) -> KafkaResult<()> {
+    let topic_admin = Arc::new(LocalTopicAdmin {
+        engine: Arc::clone(&engine),
+    });
+    serve_with_admin(listener, engine, config, topic_admin, shutdown).await
+}
+
+pub async fn serve_with_admin(
+    listener: TcpListener,
+    engine: Arc<StreamEngine>,
+    config: KafkaConfig,
+    topic_admin: Arc<dyn TopicAdmin>,
     mut shutdown: watch::Receiver<bool>,
 ) -> KafkaResult<()> {
     config.validate()?;
@@ -176,6 +214,7 @@ pub async fn serve(
     let broker = Arc::new(Broker {
         engine,
         config,
+        topic_admin,
         known_topics: KnownTopics::spawn()?,
         next_request_id: AtomicU64::new(1),
     });
@@ -254,11 +293,7 @@ async fn handle_connection(stream: TcpStream, broker: Arc<Broker>) -> KafkaResul
                 "Kafka request contains trailing bytes".into(),
             ));
         }
-        let broker_for_request = Arc::clone(&broker);
-        let response =
-            tokio::task::spawn_blocking(move || broker_for_request.handle(request, version))
-                .await
-                .map_err(|error| KafkaError::Protocol(format!("Kafka task failed: {error}")))??;
+        let response = Arc::clone(&broker).handle(request, version).await?;
         let Some(response) = response else {
             continue;
         };
@@ -349,21 +384,33 @@ fn encode_response(
 }
 
 impl Broker {
-    fn handle(&self, request: RequestKind, version: i16) -> KafkaResult<Option<ResponseKind>> {
+    async fn handle(
+        self: Arc<Self>,
+        request: RequestKind,
+        version: i16,
+    ) -> KafkaResult<Option<ResponseKind>> {
         if !version_supported(request_key(&request), version) {
             return Err(KafkaError::Protocol(format!(
                 "unsupported Kafka {:?} version {version}",
                 request_key(&request)
             )));
         }
+        if let RequestKind::CreateTopics(request) = request {
+            return Ok(Some(ResponseKind::CreateTopics(
+                self.create_topics(request).await,
+            )));
+        }
+        tokio::task::spawn_blocking(move || self.handle_blocking(request))
+            .await
+            .map_err(|error| KafkaError::Protocol(format!("Kafka task failed: {error}")))?
+    }
+
+    fn handle_blocking(&self, request: RequestKind) -> KafkaResult<Option<ResponseKind>> {
         match request {
             RequestKind::ApiVersions(_) => Ok(Some(ResponseKind::ApiVersions(self.api_versions()))),
             RequestKind::Metadata(request) => {
                 Ok(Some(ResponseKind::Metadata(self.metadata(request))))
             }
-            RequestKind::CreateTopics(request) => Ok(Some(ResponseKind::CreateTopics(
-                self.create_topics(request),
-            ))),
             RequestKind::Produce(request) => {
                 let send_response = request.acks != 0;
                 let response = self.produce(request);
@@ -407,14 +454,21 @@ impl Broker {
             .map(|name| self.metadata_topic(name))
             .collect();
         MetadataResponse::default()
-            .with_brokers(vec![
-                MetadataResponseBroker::default()
-                    .with_node_id(BrokerId(self.config.node_id))
-                    .with_host(StrBytes::from_string(self.config.advertised_host.clone()))
-                    .with_port(i32::from(self.config.advertised_port)),
-            ])
+            .with_brokers(
+                self.config
+                    .topology
+                    .nodes()
+                    .iter()
+                    .map(|node| {
+                        MetadataResponseBroker::default()
+                            .with_node_id(BrokerId(node.node_id as i32))
+                            .with_host(StrBytes::from_string(node.kafka_host.clone()))
+                            .with_port(i32::from(node.kafka_port))
+                    })
+                    .collect(),
+            )
             .with_cluster_id(Some(StrBytes::from_static_str(CLUSTER_ID)))
-            .with_controller_id(BrokerId(self.config.node_id))
+            .with_controller_id(BrokerId(self.config.topology.nodes()[0].node_id as i32))
             .with_topics(topics)
     }
 
@@ -434,52 +488,57 @@ impl Broker {
                 partitions
                     .into_iter()
                     .map(|partition| {
+                        let owner = self
+                            .config
+                            .topology
+                            .owner(TopicPartition::new(topic_id, partition));
+                        let owner_id = BrokerId(owner.node_id as i32);
                         MetadataResponsePartition::default()
                             .with_partition_index(partition.get() as i32)
-                            .with_leader_id(BrokerId(self.config.node_id))
-                            .with_replica_nodes(vec![BrokerId(self.config.node_id)])
-                            .with_isr_nodes(vec![BrokerId(self.config.node_id)])
+                            .with_leader_id(owner_id)
+                            .with_replica_nodes(vec![owner_id])
+                            .with_isr_nodes(vec![owner_id])
                     })
                     .collect(),
             )
     }
 
-    fn create_topics(
+    async fn create_topics(
         &self,
         request: kafka_protocol::messages::CreateTopicsRequest,
     ) -> CreateTopicsResponse {
-        let topics = request
-            .topics
-            .into_iter()
-            .map(|topic| {
-                let name = topic_string(topic.name);
-                let result = if topic.num_partitions <= 0
-                    || !topic.assignments.is_empty()
-                    || !topic.configs.is_empty()
-                    || !matches!(topic.replication_factor, -1 | 1)
-                {
-                    Err(ResponseError::InvalidRequest)
-                } else if request.validate_only {
-                    Ok(())
-                } else {
-                    self.engine
-                        .create_topic(TopicConfig {
-                            topic_id: topic_id(&name),
-                            partitions: topic.num_partitions as u32,
-                            shards: None,
-                        })
-                        .map_err(engine_error)
-                };
-                if result.is_ok() {
-                    self.known_topics.insert(name.clone());
-                }
+        let mut topics = Vec::with_capacity(request.topics.len());
+        for topic in request.topics {
+            let name = topic_string(topic.name);
+            let result = if topic.num_partitions <= 0
+                || !topic.assignments.is_empty()
+                || !topic.configs.is_empty()
+                || !matches!(topic.replication_factor, -1 | 1)
+            {
+                Err(ResponseError::InvalidRequest)
+            } else if request.validate_only {
+                Ok(())
+            } else {
+                self.topic_admin
+                    .create_topic(TopicConfig {
+                        topic_id: topic_id(&name),
+                        partitions: topic.num_partitions as u32,
+                        shards: None,
+                    })
+                    .await
+                    .map_err(engine_error)
+            };
+            if result.is_ok() {
+                self.known_topics.insert(name.clone());
+            }
+            topics.push(
                 CreatableTopicResult::default()
                     .with_name(topic_name(name))
                     .with_num_partitions(topic.num_partitions)
                     .with_replication_factor(1)
-                    .with_error_code(result.err().map_or(0, |error| error.code()))
-            })
-            .collect();
+                    .with_error_code(result.err().map_or(0, |error| error.code())),
+            );
+        }
         CreateTopicsResponse::default().with_topics(topics)
     }
 
@@ -505,6 +564,11 @@ impl Broker {
                             Err(ResponseError::UnsupportedForMessageFormat)
                         } else if partition.index < 0 {
                             Err(ResponseError::UnknownTopicOrPartition)
+                        } else if !self.config.topology.is_local_owner(TopicPartition::new(
+                            topic_id,
+                            LogicalPartitionId::new(partition.index as u32),
+                        )) {
+                            Err(ResponseError::NotLeaderOrFollower)
                         } else if let Some(durability) = durability {
                             self.append_kafka(
                                 topic_id,
@@ -613,6 +677,11 @@ impl Broker {
         }
         let topic_partition =
             TopicPartition::new(topic_id, LogicalPartitionId::new(partition as u32));
+        if !self.config.topology.is_local_owner(topic_partition) {
+            return PartitionData::default()
+                .with_partition_index(partition)
+                .with_error_code(ResponseError::NotLeaderOrFollower.code());
+        }
         let watermarks = match self.engine.watermarks(topic_partition) {
             Ok(watermarks) => watermarks,
             Err(error) => {
@@ -665,6 +734,11 @@ impl Broker {
                     .map(|partition| {
                         let result = if partition.partition_index < 0 {
                             Err(ResponseError::UnknownTopicOrPartition)
+                        } else if !self.config.topology.is_local_owner(TopicPartition::new(
+                            topic_id,
+                            LogicalPartitionId::new(partition.partition_index as u32),
+                        )) {
+                            Err(ResponseError::NotLeaderOrFollower)
                         } else {
                             self.engine
                                 .watermarks(TopicPartition::new(
@@ -943,6 +1017,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cluster_metadata_distributes_partition_leaders() {
+        let temp = TempDir::new();
+        let engine = Arc::new(
+            StreamEngine::open(EngineConfig {
+                data_dir: temp.0.clone(),
+                object_store_dir: None,
+                shard_count: 2,
+                replication_factor: 1,
+                min_in_sync_replicas: 1,
+                queue_slots_per_shard: 64,
+                queue_bytes_per_shard: 2 * 1024 * 1024,
+                target_pack_bytes: 1024 * 1024,
+                max_batch_bytes: 1024 * 1024,
+                max_fetch_bytes: 1024 * 1024,
+                append_linger: std::time::Duration::from_millis(1),
+            })
+            .expect("engine"),
+        );
+        let id = topic_id("orders");
+        engine
+            .create_topic(TopicConfig {
+                topic_id: id,
+                partitions: 64,
+                shards: None,
+            })
+            .expect("topic");
+        let topology = Arc::new(
+            StaticTopology::new(
+                0,
+                (0..3)
+                    .map(|node_id| shard_stream_core::ClusterNode {
+                        node_id,
+                        internal_rest: format!("http://node-{node_id}:7420"),
+                        advertised_rest: format!("http://node-{node_id}:7420"),
+                        advertised_grpc: format!("http://node-{node_id}:7421"),
+                        kafka_host: format!("node-{node_id}"),
+                        kafka_port: 9092,
+                    })
+                    .collect(),
+            )
+            .expect("topology"),
+        );
+        let broker = Broker {
+            engine: Arc::clone(&engine),
+            config: KafkaConfig {
+                topology: Arc::clone(&topology),
+                max_frame_bytes: 4 * 1024 * 1024,
+                max_fetch_bytes: 1024 * 1024,
+            },
+            topic_admin: Arc::new(LocalTopicAdmin {
+                engine: Arc::clone(&engine),
+            }),
+            known_topics: KnownTopics::spawn().expect("topics"),
+            next_request_id: AtomicU64::new(1),
+        };
+        let metadata = broker.metadata_topic("orders".into());
+        let leaders = metadata
+            .partitions
+            .iter()
+            .map(|partition| partition.leader_id.0)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(leaders, BTreeSet::from([0, 1, 2]));
+
+        let remote_partition = (0..64)
+            .find(|partition| {
+                !topology
+                    .is_local_owner(TopicPartition::new(id, LogicalPartitionId::new(*partition)))
+            })
+            .expect("remote partition");
+        let response = broker.fetch_partition(id, remote_partition as i32, 0, 1024);
+        assert_eq!(
+            response.error_code,
+            ResponseError::NotLeaderOrFollower.code()
+        );
+    }
+
     #[tokio::test]
     async fn handoff_reader_preserves_fragmented_and_pipelined_frames() {
         let (mut client, mut server) = tokio::io::duplex(64);
@@ -993,14 +1144,26 @@ mod tests {
         let address = listener.local_addr().expect("address");
         let (shutdown_sender, shutdown_receiver) = watch::channel(false);
         let server_engine = Arc::clone(&engine);
+        let topology = Arc::new(
+            StaticTopology::new(
+                0,
+                vec![shard_stream_core::ClusterNode {
+                    node_id: 0,
+                    internal_rest: "http://127.0.0.1:7420".into(),
+                    advertised_rest: "http://127.0.0.1:7420".into(),
+                    advertised_grpc: "http://127.0.0.1:7421".into(),
+                    kafka_host: "127.0.0.1".into(),
+                    kafka_port: address.port(),
+                }],
+            )
+            .expect("topology"),
+        );
         let server = tokio::spawn(async move {
             serve(
                 listener,
                 server_engine,
                 KafkaConfig {
-                    advertised_host: "127.0.0.1".into(),
-                    advertised_port: address.port(),
-                    node_id: 0,
+                    topology,
                     max_frame_bytes: 4 * 1024 * 1024,
                     max_fetch_bytes: 1024 * 1024,
                 },

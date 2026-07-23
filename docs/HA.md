@@ -59,7 +59,10 @@ same epoch.
 
 The lease state machine, certificate boundary, refresh behavior, engine fence,
 restart persistence, transfer fencing, and fail-closed checks are implemented
-and tested. Replica copies currently run inside one broker process, so the
-repository does not yet claim multi-node HA. A concrete Blossom
+and tested. Static RF1 active-active operation now assigns disjoint logical
+partitions to parallel broker nodes, routes REST requests to owners, and
+advertises Kafka partition leaders. This adds multi-node capacity but not HA.
+Replica copies still run inside one broker process, so the repository does not
+claim multi-node failover or replicated durability. A concrete Blossom
 network/validator adapter and a remote replica protocol with replica-side epoch
 enforcement are required before enabling that claim.

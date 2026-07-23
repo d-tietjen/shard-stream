@@ -1,3 +1,5 @@
+mod cluster;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -9,7 +11,8 @@ use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::header::{CONTENT_TYPE, HeaderName};
-use axum::http::{HeaderValue, Response, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
+use axum::middleware;
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post, put};
 use clap::Parser;
@@ -17,15 +20,21 @@ use eden_logger::{LogAudience, LogContext, WriterConfig, log_error, log_info};
 use fast_telemetry::{Counter, PrometheusExport};
 use serde::{Deserialize, Serialize};
 use shard_stream_core::{
-    LogicalOffset, LogicalPartitionId, RingEpoch, ShardId, TopicId, TopicPartition,
+    ClusterNode, LogicalOffset, LogicalPartitionId, RingEpoch, ShardId, StaticTopology, TopicId,
+    TopicPartition,
 };
-use shard_stream_engine::{EngineConfig, EngineError, StreamEngine, TopicConfig};
+use shard_stream_engine::{EngineConfig, EngineError, StreamEngine};
 use shard_stream_protocol::{
     AppendRequest, Durability, FetchMode, FetchRequest, NativeFetchBatch, ProducerIdentity,
     WireError, encode_fetch_batches,
 };
 use tokio::net::TcpListener;
 use tokio::sync::watch;
+
+use crate::cluster::{
+    ClusterRuntime, ClusterTopicAdmin, ClusterTopicRequest, create_topic_local,
+    route_partition_owner,
+};
 
 const OPENAPI: &str = include_str!("../../../openapi/shard-stream-v1.json");
 const NATIVE_BATCH_CONTENT_TYPE: &str = "application/vnd.shard-stream.batch.v1";
@@ -43,8 +52,24 @@ struct Args {
     kafka_advertised_host: String,
     #[arg(long, default_value_t = 9092)]
     kafka_advertised_port: u16,
-    #[arg(long, default_value_t = 0)]
-    kafka_node_id: i32,
+    #[arg(long, env = "SHARD_STREAM_NODE_ID", default_value_t = 0)]
+    node_id: u32,
+    #[arg(
+        long,
+        env = "SHARD_STREAM_ADVERTISED_REST_URL",
+        default_value = "http://127.0.0.1:7420"
+    )]
+    advertised_rest_url: String,
+    #[arg(
+        long,
+        env = "SHARD_STREAM_ADVERTISED_GRPC_URL",
+        default_value = "http://127.0.0.1:7421"
+    )]
+    advertised_grpc_url: String,
+    #[arg(long, env = "SHARD_STREAM_CLUSTER_NODES", value_delimiter = ',')]
+    cluster_nodes: Vec<ClusterNode>,
+    #[arg(long, env = "SHARD_STREAM_CLUSTER_TOKEN", hide_env_values = true)]
+    cluster_token: Option<String>,
     #[arg(long)]
     h3_listen: Option<SocketAddr>,
     #[arg(long, requires = "h3_listen")]
@@ -92,6 +117,7 @@ struct Args {
 #[derive(Clone)]
 struct AppState {
     engine: Arc<StreamEngine>,
+    cluster: Arc<ClusterRuntime>,
     metrics: Arc<HttpMetrics>,
     next_request_id: Arc<AtomicU64>,
     max_fetch_bytes: usize,
@@ -158,6 +184,29 @@ async fn main() {
 
 async fn run(args: Args) -> Result<(), AppError> {
     validate_args(&args)?;
+    let topology = Arc::new(build_topology(&args)?);
+    if topology.is_multi_node() && args.replication_factor != 1 {
+        return Err(AppError::bad_request(
+            "static multi-node mode currently requires replication_factor=1; remote replication is not implemented yet",
+        ));
+    }
+    if topology.is_multi_node() && args.h3_listen.is_some() {
+        return Err(AppError::bad_request(
+            "HTTP/3 is not yet cluster-routed; use REST, gRPC direct ownership, or Kafka in multi-node mode",
+        ));
+    }
+    let cluster_token = args.cluster_token.clone().unwrap_or_default();
+    if topology.is_multi_node() && cluster_token.is_empty() {
+        return Err(AppError::bad_request(
+            "SHARD_STREAM_CLUSTER_TOKEN is required in multi-node mode",
+        ));
+    }
+    let cluster = Arc::new(ClusterRuntime::new(
+        Arc::clone(&topology),
+        cluster_token,
+        args.max_request_bytes,
+        args.max_fetch_bytes.saturating_add(1024 * 1024),
+    )?);
     let h3_config = match (
         args.h3_listen,
         args.h3_certificate.clone(),
@@ -195,6 +244,7 @@ async fn run(args: Args) -> Result<(), AppError> {
     let engine = Arc::new(StreamEngine::open(config).map_err(AppError::from)?);
     let state = AppState {
         engine,
+        cluster: Arc::clone(&cluster),
         metrics: Arc::new(HttpMetrics::default()),
         next_request_id: Arc::new(AtomicU64::new(1)),
         max_fetch_bytes: args.max_fetch_bytes,
@@ -203,8 +253,10 @@ async fn run(args: Args) -> Result<(), AppError> {
         .route("/healthz", get(health))
         .route("/readyz", get(health))
         .route("/metrics", get(metrics))
+        .route("/v1/topology", get(get_topology))
         .route("/openapi.json", get(openapi))
         .route("/v1/topics", post(create_topic))
+        .route("/internal/v1/topics", post(create_topic_internal))
         .route(
             "/v1/topics/{topic_id}/partitions/{partition_id}/ring",
             put(reconfigure_ring),
@@ -222,7 +274,11 @@ async fn run(args: Args) -> Result<(), AppError> {
             put(update_retention),
         )
         .layer(DefaultBodyLimit::max(args.max_request_bytes))
-        .with_state(state.clone());
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&cluster),
+            route_partition_owner,
+        ));
     let listener = TcpListener::bind(args.listen)
         .await
         .map_err(|error| AppError::internal(format!("failed to bind {}: {error}", args.listen)))?;
@@ -261,6 +317,7 @@ async fn run(args: Args) -> Result<(), AppError> {
     );
 
     let grpc_engine = Arc::clone(&state.engine);
+    let grpc_topology = Arc::clone(&topology);
     let grpc_max_response_bytes = args.max_fetch_bytes.saturating_add(1024 * 1024);
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
     let rest_shutdown = shutdown_receiver.clone();
@@ -277,6 +334,7 @@ async fn run(args: Args) -> Result<(), AppError> {
         shard_stream_grpc::serve(
             grpc_listener,
             grpc_engine,
+            grpc_topology,
             128,
             args.max_request_bytes,
             grpc_max_response_bytes,
@@ -287,16 +345,24 @@ async fn run(args: Args) -> Result<(), AppError> {
     });
     let kafka_engine = Arc::clone(&state.engine);
     let kafka_config = shard_stream_kafka::KafkaConfig {
-        advertised_host: args.kafka_advertised_host,
-        advertised_port: args.kafka_advertised_port,
-        node_id: args.kafka_node_id,
+        topology: Arc::clone(&topology),
         max_frame_bytes: args.max_request_bytes,
         max_fetch_bytes: args.max_fetch_bytes,
     };
+    let kafka_topic_admin = Arc::new(ClusterTopicAdmin::new(
+        Arc::clone(&state.engine),
+        Arc::clone(&cluster),
+    ));
     tasks.spawn(async move {
-        shard_stream_kafka::serve(kafka_listener, kafka_engine, kafka_config, kafka_shutdown)
-            .await
-            .map_err(|error| AppError::internal(format!("Kafka server failed: {error}")))
+        shard_stream_kafka::serve_with_admin(
+            kafka_listener,
+            kafka_engine,
+            kafka_config,
+            kafka_topic_admin,
+            kafka_shutdown,
+        )
+        .await
+        .map_err(|error| AppError::internal(format!("Kafka server failed: {error}")))
     });
     let h3_engine = Arc::clone(&state.engine);
     if let Some(config) = h3_config {
@@ -345,12 +411,32 @@ fn validate_args(args: &Args) -> Result<(), AppError> {
     Ok(())
 }
 
+fn build_topology(args: &Args) -> Result<StaticTopology, AppError> {
+    let nodes = if args.cluster_nodes.is_empty() {
+        vec![ClusterNode {
+            node_id: args.node_id,
+            internal_rest: args.advertised_rest_url.trim_end_matches('/').to_owned(),
+            advertised_rest: args.advertised_rest_url.trim_end_matches('/').to_owned(),
+            advertised_grpc: args.advertised_grpc_url.trim_end_matches('/').to_owned(),
+            kafka_host: args.kafka_advertised_host.clone(),
+            kafka_port: args.kafka_advertised_port,
+        }]
+    } else {
+        args.cluster_nodes.clone()
+    };
+    StaticTopology::new(args.node_id, nodes).map_err(AppError::bad_request)
+}
+
 async fn health() -> impl IntoResponse {
     (
         StatusCode::OK,
         [(CONTENT_TYPE, "application/json")],
         r#"{"status":"ok"}"#,
     )
+}
+
+async fn get_topology(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.cluster.snapshot())
 }
 
 async fn openapi() -> impl IntoResponse {
@@ -401,13 +487,6 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateTopicBody {
-    topic_id: String,
-    partitions: u32,
-    shards: Option<Vec<u32>>,
-}
-
 #[derive(Debug, Serialize)]
 struct TopicResponse {
     topic_id: String,
@@ -416,19 +495,18 @@ struct TopicResponse {
 
 async fn create_topic(
     State(state): State<AppState>,
-    Json(body): Json<CreateTopicBody>,
+    Json(body): Json<ClusterTopicRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     state.metrics.request();
     let topic_id = parse_topic_id(&body.topic_id)?;
-    let config = TopicConfig {
-        topic_id,
-        partitions: body.partitions,
-        shards: body
-            .shards
-            .map(|shards| shards.into_iter().map(ShardId::new).collect()),
-    };
     let engine = Arc::clone(&state.engine);
-    execute(move || engine.create_topic(config))
+    let local_body = body.clone();
+    execute(move || create_topic_local(&engine, &local_body))
+        .await
+        .inspect_err(|_| state.metrics.error())?;
+    state
+        .cluster
+        .fanout_topic(&body)
         .await
         .inspect_err(|_| state.metrics.error())?;
     Ok((
@@ -438,6 +516,17 @@ async fn create_topic(
             partitions: body.partitions,
         }),
     ))
+}
+
+async fn create_topic_internal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ClusterTopicRequest>,
+) -> Result<StatusCode, AppError> {
+    state.cluster.verify_internal_headers(&headers)?;
+    let engine = Arc::clone(&state.engine);
+    execute(move || create_topic_local(&engine, &body)).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Deserialize)]
@@ -805,6 +894,30 @@ impl AppError {
                 retryable: false,
             },
             retry_after_seconds: None,
+        }
+    }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            problem: ProblemBody {
+                code: "CLUSTER_AUTHENTICATION_FAILED",
+                message: message.into(),
+                retryable: false,
+            },
+            retry_after_seconds: None,
+        }
+    }
+
+    fn cluster_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            problem: ProblemBody {
+                code: "CLUSTER_UNAVAILABLE",
+                message: message.into(),
+                retryable: true,
+            },
+            retry_after_seconds: Some(1),
         }
     }
 }

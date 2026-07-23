@@ -48,17 +48,22 @@ protocol mock:
   `eden_logger` lifecycle/error logging, and a Rust client;
 - MPSC-owned Kafka topic discovery and a single-owner native producer sequence,
   leaving no shared runtime `Mutex` or `RwLock`;
-- Docker and Compose packaging; and
+- Docker and Compose packaging;
+- a static RF1 active-active multi-node profile with deterministic partition
+  ownership, any-node REST routing, Kafka broker metadata, and cluster-wide
+  topic creation; and
 - unit, restart-recovery, corruption, retention, object-tier, quorum, catch-up,
   and gRPC interoperability tests.
 
-This is still pre-production. Replica copies currently model the replication
-contract in one process and on one host; the concrete Blossom
+This is still pre-production. Static multi-node mode distributes disjoint
+logical partitions across active RF1 brokers, but replica copies still model
+the replication contract in one process and on one host. The concrete Blossom
 network/validator adapter, distributed replica transport, remote object-storage
 providers, Kafka consumer groups/transactions, and the broader Kafka
 administrative surface are not complete yet. The HTTP/3 adapter is experimental
-and disables TLS 0-RTT to prevent mutation replay. The server defaults to
-replication factor one so it never implies multi-node HA.
+and disables TLS 0-RTT to prevent mutation replay; it is disabled in multi-node
+mode until owner routing is implemented. The server defaults to replication
+factor one and does not imply multi-node HA.
 
 The on-disk format has no SHA compatibility mode. Hot-path idempotent-producer
 retry fingerprints use XXH3-128, immutable object-tier content identity uses
@@ -71,6 +76,8 @@ The implemented lease/fencing boundary and remaining distributed-HA work are
 in [`docs/HA.md`](docs/HA.md).
 The executable benchmark and gate workflow is documented in
 [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md).
+Static active-active deployment and its RF1 safety boundary are documented in
+[`docs/MULTI_NODE.md`](docs/MULTI_NODE.md).
 
 ## Build
 
@@ -133,6 +140,32 @@ export SHARD_STREAM_MAX_REQUEST_BYTES=4194304
 Docker Compose reads the broker variables from the shell or a local `.env`
 file. [`.env.example`](.env.example) contains the complete producer and broker
 set.
+
+## Multi-node
+
+Start three parallel RF1 brokers with:
+
+```shell
+export SHARD_STREAM_CLUSTER_TOKEN="$(openssl rand -hex 32)"
+docker compose -f compose.multi-node.yaml up --build --detach --wait
+```
+
+Create topics through any node and inspect ownership with:
+
+```shell
+curl -H 'content-type: application/json' \
+  -d '{"topic_id":"42","partitions":24}' \
+  http://127.0.0.1:17420/v1/topics
+
+curl http://127.0.0.1:17420/v1/topology
+```
+
+REST requests entering a non-owner are proxied once to the deterministic
+partition owner. Kafka clients can bootstrap from
+`127.0.0.1:19092,127.0.0.1:29092,127.0.0.1:39092`; metadata advertises all
+brokers and partition leaders. See [multi-node operation](docs/MULTI_NODE.md)
+for gRPC routing, topology syntax, the smoke test, and the explicit no-HA
+boundary.
 
 Create a topic and append one raw native batch:
 

@@ -1761,6 +1761,9 @@ dependencies = [
 [[package]]
 name = "shard-stream-core"
 version = "0.1.0"
+dependencies = [
+ "xxhash-rust",
+]
 
 [[package]]
 name = "shard-stream-engine"
@@ -1845,6 +1848,7 @@ dependencies = [
  "clap",
  "eden_logger",
  "fast-telemetry",
+ "reqwest",
  "serde",
  "serde_json",
  "shard-stream-core",
