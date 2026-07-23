@@ -1,5 +1,5 @@
 [package]
-name = "shard-stream-server"
+name = "shard-stream-h3"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,22 +7,25 @@ homepage.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Broker binary for shard-stream"
+description = "Native REST-compatible HTTP/3 adapter for shard-stream"
 publish = false
 
 [dependencies]
-axum.workspace = true
-clap.workspace = true
+bytes.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+http.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_urlencoded.workspace = true
 shard-stream-core.workspace = true
 shard-stream-engine.workspace = true
-shard-stream-grpc = { path = "../shard-stream-grpc", version = "0.1.0" }
-shard-stream-h3 = { path = "../shard-stream-h3", version = "0.1.0" }
 shard-stream-protocol.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

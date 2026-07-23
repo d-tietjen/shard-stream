@@ -5,12 +5,15 @@ services:
     command:
       - --listen
       - 0.0.0.0:7420
+      - --grpc-listen
+      - 0.0.0.0:7421
       - --data-dir
       - /var/lib/shard-stream
       - --shards
       - "4"
     ports:
       - "7420:7420"
+      - "7421:7421"
     volumes:
       - shard-stream-data:/var/lib/shard-stream
     healthcheck:

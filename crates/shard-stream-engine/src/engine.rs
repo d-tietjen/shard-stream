@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, RwLock};
 
-use sha2::{Digest, Sha256};
 use shard_stream_core::{
     BatchId, LogicalOffset, LogicalPartitionId, Placement, Reservation, RingEpoch, SequencerState,
     ShardId, TopicPartition, TopicSequencer,
@@ -11,7 +10,8 @@ use shard_stream_protocol::{
     AppendRequest, AppendResponse, Durability, FetchMode, FetchRequest, ProducerIdentity,
 };
 use shard_stream_storage::{
-    CoordinatorJournal, ExtentCatalogEntry, JournalEvent, ProducerSequence, StoredBatch,
+    CoordinatorJournal, DIGEST_BLAKE3, ExtentCatalogEntry, JournalEvent, ProducerSequence,
+    StoredBatch,
 };
 
 use crate::worker::ShardHandle;
@@ -59,17 +59,27 @@ struct ProducerCursor {
 
 #[derive(Debug, Clone, Copy)]
 struct DedupRecord {
+    digest_algorithm: u8,
     payload_digest: [u8; 32],
     record_count: u32,
     durable_replicas: u32,
+    object_durable: bool,
     response: AppendResponse,
 }
 
-type RecoveredBatch = (Reservation, Option<ProducerSequence>, BatchStatus, u32);
+type RecoveredBatch = (
+    Reservation,
+    Option<ProducerSequence>,
+    BatchStatus,
+    u32,
+    bool,
+);
+type RecoveredStatus = (BatchStatus, u32, bool);
 
 #[derive(Debug)]
 struct PartitionState {
     sequencer: TopicSequencer,
+    log_start: LogicalOffset,
     batches: BTreeMap<LogicalOffset, BatchRuntime>,
     producers: HashMap<u128, ProducerCursor>,
     dedup: HashMap<(u128, u32, u64), DedupRecord>,
@@ -79,6 +89,7 @@ impl PartitionState {
     fn empty(sequencer: TopicSequencer) -> Self {
         Self {
             sequencer,
+            log_start: LogicalOffset::new(0),
             batches: BTreeMap::new(),
             producers: HashMap::new(),
             dedup: HashMap::new(),
@@ -117,7 +128,7 @@ impl PartitionState {
         }
         let contiguous = LogicalOffset::new(contiguous_end);
         PartitionWatermarks {
-            log_start: LogicalOffset::new(0),
+            log_start: self.log_start,
             allocated_end: self.sequencer.next_offset(),
             contiguous_log_end: contiguous,
             replicated_high_watermark: LogicalOffset::new(replicated_end),
@@ -131,6 +142,7 @@ impl PartitionState {
             .values()
             .filter(|batch| {
                 batch.status == BatchStatus::Committed
+                    && batch.reservation.last_offset >= self.log_start
                     && (mode == FetchMode::AsAvailable
                         || batch.reservation.last_offset < ordered_end)
             })
@@ -152,10 +164,13 @@ impl StreamEngine {
         std::fs::create_dir_all(&config.data_dir)
             .map_err(shard_stream_storage::StorageError::from)?;
 
+        let (mut journal, recovered) =
+            CoordinatorJournal::open(config.data_dir.join("coordinator.ssj"))?;
+        let retained_log_starts = retention_hints(&recovered.events);
         let mut shards = Vec::with_capacity(config.shard_count as usize);
         let mut catalog = HashMap::new();
         for shard_id in config.shard_ids() {
-            let (handle, entries) = ShardHandle::spawn(&config, shard_id)?;
+            let (handle, entries) = ShardHandle::spawn(&config, shard_id, &retained_log_starts)?;
             for entry in entries {
                 let key = batch_key(&entry.reservation);
                 if catalog.insert(key, entry).is_some() {
@@ -168,15 +183,19 @@ impl StreamEngine {
             shards.push(handle);
         }
 
-        let (mut journal, recovered) =
-            CoordinatorJournal::open(config.data_dir.join("coordinator.ssj"))?;
         let partitions = recover_partitions(&config, &mut journal, &recovered.events, &catalog)?;
-        Ok(Self {
+        let engine = Self {
             config,
             shards,
             partitions: RwLock::new(partitions),
             journal: Mutex::new(journal),
-        })
+        };
+        for (topic_partition, log_start) in retained_log_starts {
+            if log_start.get() > 0 {
+                engine.collect_garbage(topic_partition, log_start)?;
+            }
+        }
+        Ok(engine)
     }
 
     pub fn create_topic(&self, topic: TopicConfig) -> EngineResult<()> {
@@ -256,9 +275,9 @@ impl StreamEngine {
     }
 
     pub fn append(&self, request: AppendRequest) -> EngineResult<AppendResponse> {
-        if request.durability == Durability::Object {
+        if request.durability == Durability::Object && self.config.object_store_dir.is_none() {
             return Err(EngineError::UnsupportedDurability(
-                "object acknowledgement is not enabled yet",
+                "object acknowledgement requires object_store_dir",
             ));
         }
         let record_count = request
@@ -268,7 +287,7 @@ impl StreamEngine {
             })?;
         let topic_partition = TopicPartition::new(request.topic_id, request.partition_id);
         let partition = self.partition(topic_partition)?;
-        let payload_digest: [u8; 32] = Sha256::digest(&request.payload).into();
+        let payload_digest = *blake3::hash(&request.payload).as_bytes();
 
         let reservation;
         {
@@ -291,6 +310,7 @@ impl StreamEngine {
                 producer_id: identity.producer_id,
                 epoch: identity.epoch,
                 first_sequence: identity.first_sequence,
+                digest_algorithm: DIGEST_BLAKE3,
                 payload_digest,
             });
             if let Err(error) = mutex_lock(&self.journal).append(
@@ -317,18 +337,22 @@ impl StreamEngine {
             );
         }
 
-        let append_result =
-            self.shard(reservation.placement.shard_id)?
-                .append(reservation, request.payload, true);
+        let append_result = self.shard(reservation.placement.shard_id)?.append(
+            reservation,
+            request.payload,
+            true,
+            request.durability == Durability::Object,
+        );
         let response = append_response(request.request_id, reservation);
         let mut state = mutex_lock(&partition);
         match append_result {
-            Ok(durable_replicas) => {
+            Ok(durability) => {
                 let journal_result = mutex_lock(&self.journal).append(
                     &JournalEvent::Commit {
                         topic_partition,
                         batch_id: reservation.batch_id,
-                        durable_replicas,
+                        durable_replicas: durability.durable_replicas,
+                        object_durable: durability.object_durable,
                     },
                     true,
                 );
@@ -336,7 +360,7 @@ impl StreamEngine {
                     &mut state,
                     reservation,
                     BatchStatus::Committed,
-                    durable_replicas,
+                    durability.durable_replicas,
                 )?;
                 if let Some(producer) = request.producer {
                     state.dedup.insert(
@@ -346,39 +370,50 @@ impl StreamEngine {
                             producer.first_sequence,
                         ),
                         DedupRecord {
+                            digest_algorithm: DIGEST_BLAKE3,
                             payload_digest,
                             record_count: record_count.get(),
-                            durable_replicas,
+                            durable_replicas: durability.durable_replicas,
+                            object_durable: durability.object_durable,
                             response,
                         },
                     );
                 }
                 journal_result?;
                 if request.durability == Durability::Quorum
-                    && durable_replicas < self.config.min_in_sync_replicas
+                    && durability.durable_replicas < self.config.min_in_sync_replicas
                 {
                     return Err(EngineError::DurabilityUnavailable {
                         required_replicas: self.config.min_in_sync_replicas,
-                        durable_replicas,
+                        durable_replicas: durability.durable_replicas,
                     });
+                }
+                if request.durability == Durability::Object && !durability.object_durable {
+                    return Err(EngineError::ObjectDurabilityUnavailable);
                 }
                 Ok(response)
             }
-            Err(error) => {
-                mutex_lock(&self.journal).append(
-                    &JournalEvent::Abort {
-                        topic_partition,
-                        batch_id: reservation.batch_id,
-                    },
-                    true,
-                )?;
-                mark_batch(&mut state, reservation, BatchStatus::Aborted, 0)?;
+            Err(failure) => {
                 if let Some(producer) = request.producer
                     && let Some(cursor) = state.producers.get_mut(&producer.producer_id)
                 {
                     cursor.failed = true;
                 }
-                Err(error)
+                if failure.definitely_not_written {
+                    mutex_lock(&self.journal).append(
+                        &JournalEvent::Abort {
+                            topic_partition,
+                            batch_id: reservation.batch_id,
+                        },
+                        true,
+                    )?;
+                    mark_batch(&mut state, reservation, BatchStatus::Aborted, 0)?;
+                }
+                // A storage or response-channel failure can occur after the
+                // extent reached disk. Leave that reservation pending so
+                // recovery can resolve it from the canonical extent instead
+                // of writing a contradictory Abort record.
+                Err(failure.error)
             }
         }
     }
@@ -397,7 +432,16 @@ impl StreamEngine {
         }
         let topic_partition = TopicPartition::new(request.topic_id, request.partition_id);
         let partition = self.partition(topic_partition)?;
-        let committed = mutex_lock(&partition).committed_offsets(request.mode);
+        let committed = {
+            let state = mutex_lock(&partition);
+            if request.start_offset < state.log_start {
+                return Err(EngineError::OffsetOutOfRange {
+                    requested: request.start_offset,
+                    log_start: state.log_start,
+                });
+            }
+            state.committed_offsets(request.mode)
+        };
 
         let mut receivers = Vec::with_capacity(self.shards.len());
         for shard in &self.shards {
@@ -422,6 +466,51 @@ impl StreamEngine {
         let partition = self.partition(topic_partition)?;
         let watermarks = mutex_lock(&partition).watermarks(self.config.min_in_sync_replicas);
         Ok(watermarks)
+    }
+
+    pub fn truncate_partition(
+        &self,
+        topic_partition: TopicPartition,
+        log_start: LogicalOffset,
+    ) -> EngineResult<PartitionWatermarks> {
+        let partition = self.partition(topic_partition)?;
+        let mut state = mutex_lock(&partition);
+        let watermarks = state.watermarks(self.config.min_in_sync_replicas);
+        if log_start < state.log_start {
+            return Err(EngineError::InvalidConfig(format!(
+                "log start cannot move backward from {} to {log_start}",
+                state.log_start
+            )));
+        }
+        if log_start > watermarks.contiguous_log_end {
+            return Err(EngineError::InvalidConfig(format!(
+                "log start {log_start} exceeds contiguous log end {}",
+                watermarks.contiguous_log_end
+            )));
+        }
+        if log_start != watermarks.contiguous_log_end
+            && log_start.get() != 0
+            && !state.batches.contains_key(&log_start)
+        {
+            return Err(EngineError::InvalidConfig(
+                "log start must align to a batch boundary".into(),
+            ));
+        }
+        if log_start == state.log_start {
+            return Ok(watermarks);
+        }
+        mutex_lock(&self.journal).append(
+            &JournalEvent::Truncate {
+                topic_partition,
+                log_start,
+            },
+            true,
+        )?;
+        state.log_start = log_start;
+        let updated = state.watermarks(self.config.min_in_sync_replicas);
+        drop(state);
+        self.collect_garbage(topic_partition, log_start)?;
+        Ok(updated)
     }
 
     pub fn sync(&self) -> EngineResult<()> {
@@ -451,6 +540,34 @@ impl StreamEngine {
             .filter(|shard| shard.shard_id == shard_id)
             .ok_or(EngineError::UnknownShard(shard_id))
     }
+
+    fn collect_garbage(
+        &self,
+        topic_partition: TopicPartition,
+        log_start: LogicalOffset,
+    ) -> EngineResult<()> {
+        for shard in &self.shards {
+            shard.garbage_collect(topic_partition, log_start)?;
+        }
+        Ok(())
+    }
+}
+
+fn retention_hints(events: &[JournalEvent]) -> HashMap<TopicPartition, LogicalOffset> {
+    let mut hints = HashMap::new();
+    for event in events {
+        if let JournalEvent::Truncate {
+            topic_partition,
+            log_start,
+        } = event
+        {
+            hints
+                .entry(*topic_partition)
+                .and_modify(|current: &mut LogicalOffset| *current = (*current).max(*log_start))
+                .or_insert(*log_start);
+        }
+    }
+    hints
 }
 
 fn recover_partitions(
@@ -460,11 +577,12 @@ fn recover_partitions(
     catalog: &HashMap<(TopicPartition, BatchId), ExtentCatalogEntry>,
 ) -> EngineResult<HashMap<TopicPartition, Arc<Mutex<PartitionState>>>> {
     let mut configurations: HashMap<TopicPartition, (RingEpoch, Vec<ShardId>)> = HashMap::new();
+    let mut log_starts: HashMap<TopicPartition, LogicalOffset> = HashMap::new();
     let mut reservations: HashMap<
         (TopicPartition, BatchId),
         (Reservation, Option<ProducerSequence>),
     > = HashMap::new();
-    let mut statuses: HashMap<(TopicPartition, BatchId), (BatchStatus, u32)> = HashMap::new();
+    let mut statuses: HashMap<(TopicPartition, BatchId), RecoveredStatus> = HashMap::new();
 
     for event in events {
         match event {
@@ -498,12 +616,13 @@ fn recover_partitions(
                         reservation.batch_id
                     )));
                 }
-                statuses.insert(key, (BatchStatus::Pending, 0));
+                statuses.insert(key, (BatchStatus::Pending, 0, false));
             }
             JournalEvent::Commit {
                 topic_partition,
                 batch_id,
                 durable_replicas,
+                object_durable,
             } => {
                 set_recovered_status(
                     &reservations,
@@ -511,6 +630,7 @@ fn recover_partitions(
                     (*topic_partition, *batch_id),
                     BatchStatus::Committed,
                     *durable_replicas,
+                    *object_durable,
                 )?;
             }
             JournalEvent::Abort {
@@ -523,7 +643,30 @@ fn recover_partitions(
                     (*topic_partition, *batch_id),
                     BatchStatus::Aborted,
                     0,
+                    false,
                 )?;
+            }
+            JournalEvent::Truncate {
+                topic_partition,
+                log_start,
+            } => {
+                if !configurations.contains_key(topic_partition) {
+                    return Err(EngineError::CorruptState(format!(
+                        "retention event for unconfigured partition {}/{}",
+                        topic_partition.topic_id, topic_partition.partition_id
+                    )));
+                }
+                let previous = log_starts
+                    .get(topic_partition)
+                    .copied()
+                    .unwrap_or(LogicalOffset::new(0));
+                if *log_start < previous {
+                    return Err(EngineError::CorruptState(format!(
+                        "log start moved backward for {}/{}",
+                        topic_partition.topic_id, topic_partition.partition_id
+                    )));
+                }
+                log_starts.insert(*topic_partition, *log_start);
             }
         }
     }
@@ -546,18 +689,22 @@ fn recover_partitions(
     for (key, (reservation, _)) in &reservations {
         let has_extent = catalog.contains_key(key);
         match (statuses.get(key).copied(), has_extent) {
-            (Some((BatchStatus::Pending, _)), true) => {
+            (Some((BatchStatus::Pending, _, _)), true) => {
                 journal.append(
                     &JournalEvent::Commit {
                         topic_partition: key.0,
                         batch_id: key.1,
                         durable_replicas: config.replication_factor,
+                        object_durable: false,
                     },
                     true,
                 )?;
-                statuses.insert(*key, (BatchStatus::Committed, config.replication_factor));
+                statuses.insert(
+                    *key,
+                    (BatchStatus::Committed, config.replication_factor, false),
+                );
             }
-            (Some((BatchStatus::Pending, _)), false) => {
+            (Some((BatchStatus::Pending, _, _)), false) => {
                 journal.append(
                     &JournalEvent::Abort {
                         topic_partition: key.0,
@@ -565,21 +712,25 @@ fn recover_partitions(
                     },
                     true,
                 )?;
-                statuses.insert(*key, (BatchStatus::Aborted, 0));
+                statuses.insert(*key, (BatchStatus::Aborted, 0, false));
             }
-            (Some((BatchStatus::Committed, _)), false) => {
+            (Some((BatchStatus::Committed, _, _)), false)
+                if log_starts
+                    .get(&key.0)
+                    .is_some_and(|log_start| reservation.last_offset < *log_start) => {}
+            (Some((BatchStatus::Committed, _, _)), false) => {
                 return Err(EngineError::CorruptState(format!(
                     "committed batch {} is missing its extent",
                     key.1
                 )));
             }
-            (Some((BatchStatus::Aborted, _)), true) => {
+            (Some((BatchStatus::Aborted, _, _)), true) => {
                 return Err(EngineError::CorruptState(format!(
                     "aborted batch {} has a canonical extent",
                     key.1
                 )));
             }
-            (Some((BatchStatus::Committed | BatchStatus::Aborted, _)), _) => {}
+            (Some((BatchStatus::Committed | BatchStatus::Aborted, _, _)), _) => {}
             (None, _) => {
                 return Err(EngineError::CorruptState(format!(
                     "batch {} has no lifecycle state",
@@ -596,17 +747,18 @@ fn recover_partitions(
             producer,
             statuses[&key].0,
             statuses[&key].1,
+            statuses[&key].2,
         ));
     }
 
     let mut result = HashMap::new();
     for (topic_partition, (ring_epoch, shards)) in configurations {
         let mut recovered_batches = by_partition.remove(&topic_partition).unwrap_or_default();
-        recovered_batches.sort_by_key(|(reservation, _, _, _)| reservation.first_offset);
+        recovered_batches.sort_by_key(|(reservation, _, _, _, _)| reservation.first_offset);
         let mut next_batch_id = 0u128;
         let mut next_offset = 0u128;
         let mut next_placement_sequence = 0u128;
-        for (reservation, _, _, _) in &recovered_batches {
+        for (reservation, _, _, _, _) in &recovered_batches {
             if reservation.first_offset.get() != next_offset {
                 return Err(EngineError::CorruptState(format!(
                     "reservation offset gap or overlap at batch {}",
@@ -651,7 +803,7 @@ fn recover_partitions(
             next_placement_sequence,
         })?;
         let mut state = PartitionState::empty(sequencer);
-        for (reservation, producer, status, durable_replicas) in recovered_batches {
+        for (reservation, producer, status, durable_replicas, object_durable) in recovered_batches {
             let durable_replicas = if status == BatchStatus::Committed {
                 durable_replicas.max(config.replication_factor)
             } else {
@@ -676,9 +828,11 @@ fn recover_partitions(
                         producer.first_sequence,
                     ),
                     DedupRecord {
+                        digest_algorithm: producer.digest_algorithm,
                         payload_digest: producer.payload_digest,
                         record_count: reservation.record_count.get(),
                         durable_replicas,
+                        object_durable,
                         response,
                     },
                 );
@@ -708,6 +862,24 @@ fn recover_partitions(
                 }
             }
         }
+        let recovered_log_start = log_starts
+            .get(&topic_partition)
+            .copied()
+            .unwrap_or(LogicalOffset::new(0));
+        let contiguous_end = state
+            .watermarks(config.min_in_sync_replicas)
+            .contiguous_log_end;
+        if recovered_log_start > contiguous_end
+            || (recovered_log_start != contiguous_end
+                && recovered_log_start.get() != 0
+                && !state.batches.contains_key(&recovered_log_start))
+        {
+            return Err(EngineError::CorruptState(format!(
+                "invalid recovered log start {recovered_log_start} for {}/{}",
+                topic_partition.topic_id, topic_partition.partition_id
+            )));
+        }
+        state.log_start = recovered_log_start;
         result.insert(topic_partition, Arc::new(Mutex::new(state)));
     }
     if let Some((topic_partition, _)) = by_partition.into_iter().next() {
@@ -745,9 +917,9 @@ fn check_producer(
                 producer.epoch,
                 producer.first_sequence,
             )) {
-                if record.payload_digest != payload_digest
-                    || record.record_count != record_count.get()
-                {
+                let digest_matches = record.digest_algorithm == DIGEST_BLAKE3
+                    && record.payload_digest == payload_digest;
+                if !digest_matches || record.record_count != record_count.get() {
                     return Err(EngineError::DuplicateSequenceMismatch(producer.producer_id));
                 }
                 if durability == Durability::Quorum
@@ -757,6 +929,9 @@ fn check_producer(
                         required_replicas: min_in_sync_replicas,
                         durable_replicas: record.durable_replicas,
                     });
+                }
+                if durability == Durability::Object && !record.object_durable {
+                    return Err(EngineError::ObjectDurabilityUnavailable);
                 }
                 return Ok(Some(AppendResponse {
                     request_id,
@@ -869,10 +1044,11 @@ fn mark_batch(
 
 fn set_recovered_status(
     reservations: &HashMap<(TopicPartition, BatchId), (Reservation, Option<ProducerSequence>)>,
-    statuses: &mut HashMap<(TopicPartition, BatchId), (BatchStatus, u32)>,
+    statuses: &mut HashMap<(TopicPartition, BatchId), RecoveredStatus>,
     key: (TopicPartition, BatchId),
     status: BatchStatus,
     durable_replicas: u32,
+    object_durable: bool,
 ) -> EngineResult<()> {
     if !reservations.contains_key(&key) {
         return Err(EngineError::CorruptState(format!(
@@ -880,7 +1056,9 @@ fn set_recovered_status(
             key.1
         )));
     }
-    if statuses.insert(key, (status, durable_replicas)) != Some((BatchStatus::Pending, 0)) {
+    if statuses.insert(key, (status, durable_replicas, object_durable))
+        != Some((BatchStatus::Pending, 0, false))
+    {
         return Err(EngineError::CorruptState(format!(
             "duplicate lifecycle completion for batch {}",
             key.1
@@ -978,6 +1156,7 @@ mod tests {
     fn config(path: &std::path::Path) -> EngineConfig {
         EngineConfig {
             data_dir: path.to_path_buf(),
+            object_store_dir: None,
             shard_count: 3,
             replication_factor: 3,
             min_in_sync_replicas: 2,
@@ -1268,5 +1447,140 @@ mod tests {
             .expect("open replica");
             assert_eq!(replica.catalog().len(), 1);
         }
+    }
+
+    #[test]
+    fn object_ack_seals_pack_publishes_manifest_and_survives_restart() {
+        let temp = TempDir::new("object-durable");
+        let mut engine_config = config(&temp.0.join("data"));
+        engine_config.object_store_dir = Some(temp.0.join("objects"));
+        let producer = ProducerIdentity {
+            producer_id: 77,
+            epoch: 0,
+            first_sequence: 0,
+        };
+        let response;
+        {
+            let engine = StreamEngine::open(engine_config.clone()).expect("open");
+            engine
+                .create_topic(TopicConfig {
+                    topic_id: TopicId::new(1),
+                    partitions: 1,
+                    shards: None,
+                })
+                .expect("create");
+            let mut request = append_request(1, b"object-durable", Some(producer));
+            request.durability = Durability::Object;
+            response = engine.append(request).expect("object append");
+        }
+
+        let tier = shard_stream_storage::LocalObjectTier::open(
+            engine_config
+                .object_store_dir
+                .as_ref()
+                .expect("object store"),
+            ShardId::new(0),
+        )
+        .expect("open tier");
+        assert_eq!(tier.manifest().generation, 1);
+        assert_eq!(tier.manifest().objects.len(), 1);
+        assert!(tier.manifest().objects[0].bytes > 0);
+
+        let engine = StreamEngine::open(engine_config).expect("reopen");
+        let mut retry = append_request(2, b"object-durable", Some(producer));
+        retry.durability = Durability::Object;
+        let duplicate = engine.append(retry).expect("deduplicated object append");
+        assert_eq!(duplicate.batch_id, response.batch_id);
+        assert_eq!(engine.fetch(fetch_request(0)).expect("fetch").len(), 1);
+    }
+
+    #[test]
+    fn retention_log_start_is_monotonic_batch_aligned_and_restart_durable() {
+        let temp = TempDir::new("retention");
+        let topic_partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        {
+            let engine = StreamEngine::open(config(&temp.0)).expect("open");
+            engine
+                .create_topic(TopicConfig {
+                    topic_id: TopicId::new(1),
+                    partitions: 1,
+                    shards: None,
+                })
+                .expect("create");
+            for request_id in 1..=3 {
+                engine
+                    .append(append_request(request_id, &[request_id as u8], None))
+                    .expect("append");
+            }
+            let watermarks = engine
+                .truncate_partition(topic_partition, LogicalOffset::new(2))
+                .expect("truncate");
+            assert_eq!(watermarks.log_start, LogicalOffset::new(2));
+            assert!(matches!(
+                engine.fetch(fetch_request(0)),
+                Err(EngineError::OffsetOutOfRange { .. })
+            ));
+            assert_eq!(
+                engine.fetch(fetch_request(2)).expect("retained fetch")[0].payload,
+                vec![3]
+            );
+            assert!(
+                engine
+                    .truncate_partition(topic_partition, LogicalOffset::new(1))
+                    .is_err()
+            );
+        }
+
+        let engine = StreamEngine::open(config(&temp.0)).expect("reopen");
+        assert_eq!(
+            engine
+                .watermarks(topic_partition)
+                .expect("watermarks")
+                .log_start,
+            LogicalOffset::new(2)
+        );
+        assert!(matches!(
+            engine.fetch(fetch_request(1)),
+            Err(EngineError::OffsetOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn retention_reclaims_only_fully_expired_sealed_packs() {
+        let temp = TempDir::new("retention-gc");
+        let mut engine_config = config(&temp.0.join("data"));
+        engine_config.object_store_dir = Some(temp.0.join("objects"));
+        engine_config.shard_count = 1;
+        engine_config.target_pack_bytes = 1;
+        let topic_partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        {
+            let engine = StreamEngine::open(engine_config.clone()).expect("open");
+            engine
+                .create_topic(TopicConfig {
+                    topic_id: TopicId::new(1),
+                    partitions: 1,
+                    shards: None,
+                })
+                .expect("create");
+            for request_id in 1..=3 {
+                let mut request = append_request(request_id, &[request_id as u8], None);
+                request.durability = Durability::Object;
+                engine.append(request).expect("object append");
+            }
+            engine
+                .truncate_partition(topic_partition, LogicalOffset::new(2))
+                .expect("truncate");
+        }
+
+        let primary = temp.0.join("data/shards/shard-0");
+        assert!(!primary.join("pack-00000000000000000000.sse").exists());
+        assert!(!primary.join("pack-00000000000000000001.sse").exists());
+        assert!(primary.join("pack-00000000000000000002.sse").exists());
+
+        let engine = StreamEngine::open(engine_config).expect("reopen after GC");
+        assert_eq!(
+            engine.fetch(fetch_request(2)).expect("retained fetch")[0].payload,
+            vec![3]
+        );
     }
 }

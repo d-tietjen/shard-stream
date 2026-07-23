@@ -55,6 +55,20 @@ pub struct ExtentCatalogEntry {
     pub payload_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedPack {
+    pub sequence: u64,
+    pub path: PathBuf,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GarbageCollectionStats {
+    pub packs_removed: u64,
+    pub extents_removed: u64,
+    pub bytes_removed: u64,
+}
+
 #[derive(Debug, Clone)]
 struct ExtentLocation {
     reservation: Reservation,
@@ -305,6 +319,79 @@ impl ShardStore {
         self.active.file.flush()?;
         self.active.file.sync_data()?;
         Ok(())
+    }
+
+    pub fn sealed_packs(&self) -> StorageResult<Vec<SealedPack>> {
+        let mut packs = Vec::new();
+        for (&sequence, path) in self.pack_paths.range(..self.active.sequence) {
+            let bytes = path.metadata()?.len();
+            if bytes > 0 {
+                packs.push(SealedPack {
+                    sequence,
+                    path: path.clone(),
+                    bytes,
+                });
+            }
+        }
+        Ok(packs)
+    }
+
+    pub fn seal_active(&mut self) -> StorageResult<Option<SealedPack>> {
+        if self.active.bytes == 0 {
+            return Ok(None);
+        }
+        let sealed = SealedPack {
+            sequence: self.active.sequence,
+            path: self.active_path().to_path_buf(),
+            bytes: self.active.bytes,
+        };
+        self.rotate()?;
+        Ok(Some(sealed))
+    }
+
+    pub fn garbage_collect(
+        &mut self,
+        log_starts: &HashMap<TopicPartition, LogicalOffset>,
+    ) -> StorageResult<GarbageCollectionStats> {
+        let removable = self
+            .pack_paths
+            .range(..self.active.sequence)
+            .filter_map(|(&sequence, path)| {
+                let locations = self
+                    .by_batch
+                    .values()
+                    .filter(|location| location.pack_sequence == sequence)
+                    .collect::<Vec<_>>();
+                (!locations.is_empty()
+                    && locations.iter().all(|location| {
+                        log_starts
+                            .get(&TopicPartition::new(
+                                location.reservation.topic_id,
+                                location.reservation.partition_id,
+                            ))
+                            .is_some_and(|log_start| location.reservation.last_offset < *log_start)
+                    }))
+                .then(|| (sequence, path.clone(), locations.len() as u64))
+            })
+            .collect::<Vec<_>>();
+
+        let mut stats = GarbageCollectionStats::default();
+        for (sequence, path, extents) in removable {
+            let bytes = path.metadata()?.len();
+            fs::remove_file(&path)?;
+            sync_directory(&self.config.directory)?;
+            self.pack_paths.remove(&sequence);
+            self.by_batch
+                .retain(|_, location| location.pack_sequence != sequence);
+            for locations in self.index.values_mut() {
+                locations.retain(|location| location.pack_sequence != sequence);
+            }
+            self.index.retain(|_, locations| !locations.is_empty());
+            stats.packs_removed = stats.packs_removed.saturating_add(1);
+            stats.extents_removed = stats.extents_removed.saturating_add(extents);
+            stats.bytes_removed = stats.bytes_removed.saturating_add(bytes);
+        }
+        Ok(stats)
     }
 
     #[must_use]
@@ -579,6 +666,11 @@ fn discover_packs(directory: &Path) -> StorageResult<BTreeMap<u64, PathBuf>> {
 
 fn pack_path(directory: &Path, sequence: u64) -> PathBuf {
     directory.join(format!("pack-{sequence:020}.sse"))
+}
+
+fn sync_directory(path: &Path) -> StorageResult<()> {
+    File::open(path)?.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -23,6 +23,7 @@ use shard_stream_protocol::{
     WireError, encode_fetch_batches,
 };
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -34,8 +35,18 @@ const NATIVE_BATCH_CONTENT_TYPE: &str = "application/vnd.shard-stream.batch.v1";
 struct Args {
     #[arg(long, default_value = "127.0.0.1:7420")]
     listen: SocketAddr,
+    #[arg(long, default_value = "127.0.0.1:7421")]
+    grpc_listen: SocketAddr,
+    #[arg(long)]
+    h3_listen: Option<SocketAddr>,
+    #[arg(long, requires = "h3_listen")]
+    h3_certificate: Option<PathBuf>,
+    #[arg(long, requires = "h3_listen")]
+    h3_private_key: Option<PathBuf>,
     #[arg(long, default_value = "./var/shard-stream")]
     data_dir: PathBuf,
+    #[arg(long)]
+    object_store_dir: Option<PathBuf>,
     #[arg(long, default_value_t = 4)]
     shards: u32,
     #[arg(long, default_value_t = 1)]
@@ -97,8 +108,30 @@ async fn main() {
 }
 
 async fn run(args: Args) -> Result<(), AppError> {
+    let h3_config = match (
+        args.h3_listen,
+        args.h3_certificate.clone(),
+        args.h3_private_key.clone(),
+    ) {
+        (None, None, None) => None,
+        (Some(listen), Some(certificate_path), Some(private_key_path)) => {
+            Some(shard_stream_h3::H3Config {
+                listen,
+                certificate_path,
+                private_key_path,
+                max_batch_bytes: args.max_batch_bytes,
+                max_fetch_bytes: args.max_fetch_bytes,
+            })
+        }
+        _ => {
+            return Err(AppError::bad_request(
+                "h3_listen, h3_certificate, and h3_private_key must be supplied together",
+            ));
+        }
+    };
     let config = EngineConfig {
         data_dir: args.data_dir,
+        object_store_dir: args.object_store_dir,
         shard_count: args.shards,
         replication_factor: args.replication_factor,
         min_in_sync_replicas: args.min_in_sync_replicas,
@@ -133,16 +166,85 @@ async fn run(args: Args) -> Result<(), AppError> {
             "/v1/topics/{topic_id}/partitions/{partition_id}/watermarks",
             get(watermarks),
         )
+        .route(
+            "/v1/topics/{topic_id}/partitions/{partition_id}/retention",
+            put(update_retention),
+        )
         .layer(DefaultBodyLimit::max(args.max_batch_bytes))
-        .with_state(state);
+        .with_state(state.clone());
     let listener = TcpListener::bind(args.listen)
         .await
         .map_err(|error| AppError::internal(format!("failed to bind {}: {error}", args.listen)))?;
+    let grpc_listener = TcpListener::bind(args.grpc_listen).await.map_err(|error| {
+        AppError::internal(format!(
+            "failed to bind gRPC listener {}: {error}",
+            args.grpc_listen
+        ))
+    })?;
     info!(address = %args.listen, "shard-stream REST listener ready");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+    info!(address = %args.grpc_listen, "shard-stream gRPC listener ready");
+
+    let grpc_engine = Arc::clone(&state.engine);
+    let grpc_max_message_bytes = args
+        .max_batch_bytes
+        .max(args.max_fetch_bytes)
+        .saturating_add(1024 * 1024);
+    let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+    let rest_shutdown = shutdown_receiver.clone();
+    let h3_shutdown = shutdown_receiver.clone();
+    let mut rest_task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(wait_for_shutdown(rest_shutdown))
+            .await
+            .map_err(|error| AppError::internal(format!("HTTP server failed: {error}")))
+    });
+    let mut grpc_task = tokio::spawn(async move {
+        shard_stream_grpc::serve(
+            grpc_listener,
+            grpc_engine,
+            128,
+            grpc_max_message_bytes,
+            shutdown_receiver,
+        )
         .await
-        .map_err(|error| AppError::internal(format!("HTTP server failed: {error}")))
+        .map_err(|error| AppError::internal(format!("gRPC server failed: {error}")))
+    });
+    let h3_engine = Arc::clone(&state.engine);
+    let mut h3_task = h3_config.map(|config| {
+        tokio::spawn(async move {
+            shard_stream_h3::serve(config, h3_engine, h3_shutdown)
+                .await
+                .map_err(|error| AppError::internal(format!("HTTP/3 server failed: {error}")))
+        })
+    });
+
+    tokio::select! {
+        result = &mut rest_task => {
+            let _ = shutdown_sender.send(true);
+            flatten_server_task("REST", result)?;
+            flatten_server_task("gRPC", grpc_task.await)?;
+            flatten_optional_server_task("HTTP/3", h3_task).await
+        }
+        result = &mut grpc_task => {
+            let _ = shutdown_sender.send(true);
+            flatten_server_task("gRPC", result)?;
+            flatten_server_task("REST", rest_task.await)?;
+            flatten_optional_server_task("HTTP/3", h3_task).await
+        }
+        result = wait_optional_server_task(&mut h3_task) => {
+            let _ = shutdown_sender.send(true);
+            flatten_server_task("HTTP/3", result)?;
+            flatten_server_task("REST", rest_task.await)?;
+            flatten_server_task("gRPC", grpc_task.await)
+        }
+        () = shutdown_signal() => {
+            let _ = shutdown_sender.send(true);
+            let (rest_result, grpc_result) = tokio::join!(rest_task, grpc_task);
+            flatten_server_task("REST", rest_result)?;
+            flatten_server_task("gRPC", grpc_result)?;
+            flatten_optional_server_task("HTTP/3", h3_task).await
+        }
+    }
 }
 
 async fn health() -> impl IntoResponse {
@@ -435,13 +537,40 @@ async fn watermarks(
     let watermarks = execute(move || engine.watermarks(topic_partition))
         .await
         .inspect_err(|_| state.metrics.error())?;
-    Ok(Json(WatermarksResponse {
+    Ok(Json(watermarks_response(watermarks)))
+}
+
+#[derive(Debug, Deserialize)]
+struct RetentionBody {
+    log_start: String,
+}
+
+async fn update_retention(
+    State(state): State<AppState>,
+    Path((topic_id, partition_id)): Path<(String, u32)>,
+    Json(body): Json<RetentionBody>,
+) -> Result<Json<WatermarksResponse>, AppError> {
+    state.metrics.request();
+    let topic_partition = TopicPartition::new(
+        parse_topic_id(&topic_id)?,
+        LogicalPartitionId::new(partition_id),
+    );
+    let log_start = LogicalOffset::new(parse_u128("log_start", &body.log_start)?);
+    let engine = Arc::clone(&state.engine);
+    let watermarks = execute(move || engine.truncate_partition(topic_partition, log_start))
+        .await
+        .inspect_err(|_| state.metrics.error())?;
+    Ok(Json(watermarks_response(watermarks)))
+}
+
+fn watermarks_response(watermarks: shard_stream_engine::PartitionWatermarks) -> WatermarksResponse {
+    WatermarksResponse {
         log_start: watermarks.log_start.to_string(),
         allocated_end: watermarks.allocated_end.to_string(),
         contiguous_log_end: watermarks.contiguous_log_end.to_string(),
         replicated_high_watermark: watermarks.replicated_high_watermark.to_string(),
         last_stable_offset: watermarks.last_stable_offset.to_string(),
-    }))
+    }
 }
 
 async fn execute<T, F>(operation: F) -> Result<T, AppError>
@@ -528,6 +657,38 @@ fn saturating_increment(counter: &AtomicU64, amount: u64) {
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     info!("shutdown signal received");
+}
+
+async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
+    if !*shutdown.borrow() {
+        let _ = shutdown.changed().await;
+    }
+}
+
+fn flatten_server_task(
+    name: &str,
+    result: Result<Result<(), AppError>, tokio::task::JoinError>,
+) -> Result<(), AppError> {
+    result.map_err(|error| AppError::internal(format!("{name} server task failed: {error}")))?
+}
+
+async fn wait_optional_server_task(
+    task: &mut Option<tokio::task::JoinHandle<Result<(), AppError>>>,
+) -> Result<Result<(), AppError>, tokio::task::JoinError> {
+    match task {
+        Some(task) => task.await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn flatten_optional_server_task(
+    name: &str,
+    task: Option<tokio::task::JoinHandle<Result<(), AppError>>>,
+) -> Result<(), AppError> {
+    match task {
+        Some(task) => flatten_server_task(name, task.await),
+        None => Ok(()),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -617,7 +778,8 @@ impl From<EngineError> for AppError {
                 },
                 retry_after_seconds: Some(1),
             },
-            EngineError::DurabilityUnavailable { .. } => Self {
+            EngineError::DurabilityUnavailable { .. }
+            | EngineError::ObjectDurabilityUnavailable => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 problem: ProblemBody {
                     code: "DURABILITY_UNAVAILABLE",
@@ -630,6 +792,15 @@ impl From<EngineError> for AppError {
                 status: StatusCode::NOT_IMPLEMENTED,
                 problem: ProblemBody {
                     code: "DURABILITY_UNAVAILABLE",
+                    message,
+                    retryable: false,
+                },
+                retry_after_seconds: None,
+            },
+            EngineError::OffsetOutOfRange { .. } => Self {
+                status: StatusCode::RANGE_NOT_SATISFIABLE,
+                problem: ProblemBody {
+                    code: "OFFSET_OUT_OF_RANGE",
                     message,
                     retryable: false,
                 },

@@ -11,8 +11,10 @@ description = "Crash-recoverable extent packs and coordinator journal for shard-
 publish = false
 
 [dependencies]
+blake3.workspace = true
 crc32fast.workspace = true
-sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 shard-stream-core.workspace = true
 
 [dev-dependencies]

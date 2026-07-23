@@ -9,6 +9,7 @@ pub(crate) const COMMAND_OVERHEAD_BYTES: usize = 256;
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub data_dir: PathBuf,
+    pub object_store_dir: Option<PathBuf>,
     pub shard_count: u32,
     pub replication_factor: u32,
     pub min_in_sync_replicas: u32,

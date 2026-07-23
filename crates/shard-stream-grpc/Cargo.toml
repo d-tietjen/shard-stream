@@ -1,5 +1,5 @@
 [package]
-name = "shard-stream-engine"
+name = "shard-stream-grpc"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,14 +7,22 @@ homepage.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Striped append and ordered fetch engine for shard-stream"
+description = "Standard gRPC/HTTP2 adapter for shard-stream"
 publish = false
+build = "build.rs"
 
 [dependencies]
-blake3.workspace = true
+prost.workspace = true
 shard-stream-core.workspace = true
+shard-stream-engine.workspace = true
 shard-stream-protocol.workspace = true
-shard-stream-storage.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build = "0.14"
 
 [lints]
 workspace = true

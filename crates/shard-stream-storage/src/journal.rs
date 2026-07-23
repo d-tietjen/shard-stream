@@ -22,12 +22,17 @@ const CONFIGURE_KIND: u8 = 1;
 const RESERVE_KIND: u8 = 2;
 const COMMIT_KIND: u8 = 3;
 const ABORT_KIND: u8 = 4;
+const COMMIT_V2_KIND: u8 = 5;
+const TRUNCATE_KIND: u8 = 6;
+
+pub const DIGEST_BLAKE3: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProducerSequence {
     pub producer_id: u128,
     pub epoch: u32,
     pub first_sequence: u64,
+    pub digest_algorithm: u8,
     pub payload_digest: [u8; 32],
 }
 
@@ -46,10 +51,15 @@ pub enum JournalEvent {
         topic_partition: TopicPartition,
         batch_id: BatchId,
         durable_replicas: u32,
+        object_durable: bool,
     },
     Abort {
         topic_partition: TopicPartition,
         batch_id: BatchId,
+    },
+    Truncate {
+        topic_partition: TopicPartition,
+        log_start: LogicalOffset,
     },
 }
 
@@ -205,6 +215,12 @@ fn encode_event(event: &JournalEvent) -> StorageResult<Vec<u8>> {
                     push_u128(&mut body, producer.producer_id);
                     push_u32(&mut body, producer.epoch);
                     push_u64(&mut body, producer.first_sequence);
+                    if producer.digest_algorithm != DIGEST_BLAKE3 {
+                        return Err(StorageError::InvalidInput(
+                            "unsupported producer payload digest algorithm".into(),
+                        ));
+                    }
+                    push_u8(&mut body, producer.digest_algorithm);
                     body.extend_from_slice(&producer.payload_digest);
                 }
                 None => push_u8(&mut body, 0),
@@ -215,6 +231,7 @@ fn encode_event(event: &JournalEvent) -> StorageResult<Vec<u8>> {
             topic_partition,
             batch_id,
             durable_replicas,
+            object_durable,
         } => {
             if *durable_replicas == 0 {
                 return Err(StorageError::InvalidInput(
@@ -225,7 +242,8 @@ fn encode_event(event: &JournalEvent) -> StorageResult<Vec<u8>> {
             push_topic_partition(&mut body, *topic_partition);
             push_u128(&mut body, batch_id.get());
             push_u32(&mut body, *durable_replicas);
-            (COMMIT_KIND, body)
+            push_u8(&mut body, u8::from(*object_durable));
+            (COMMIT_V2_KIND, body)
         }
         JournalEvent::Abort {
             topic_partition,
@@ -235,6 +253,15 @@ fn encode_event(event: &JournalEvent) -> StorageResult<Vec<u8>> {
             push_topic_partition(&mut body, *topic_partition);
             push_u128(&mut body, batch_id.get());
             (ABORT_KIND, body)
+        }
+        JournalEvent::Truncate {
+            topic_partition,
+            log_start,
+        } => {
+            let mut body = Vec::with_capacity(36);
+            push_topic_partition(&mut body, *topic_partition);
+            push_u128(&mut body, log_start.get());
+            (TRUNCATE_KIND, body)
         }
     };
     if body.len() > MAX_EVENT_BYTES {
@@ -294,14 +321,28 @@ fn decode_event(path: &Path, offset: u64, kind: u8, body: &[u8]) -> StorageResul
             let reservation = decode_reservation(&mut decoder)?;
             let producer = match decoder.u8()? {
                 0 => None,
-                1 => Some(ProducerSequence {
-                    producer_id: decoder.u128()?,
-                    epoch: decoder.u32()?,
-                    first_sequence: decoder.u64()?,
-                    payload_digest: decoder.take(32)?.try_into().map_err(|_| {
-                        StorageError::corrupt(path, offset, "invalid payload digest")
-                    })?,
-                }),
+                1 => {
+                    let producer_id = decoder.u128()?;
+                    let epoch = decoder.u32()?;
+                    let first_sequence = decoder.u64()?;
+                    let digest_algorithm = decoder.u8()?;
+                    if digest_algorithm != DIGEST_BLAKE3 {
+                        return Err(StorageError::corrupt(
+                            path,
+                            offset,
+                            "unsupported producer payload digest algorithm",
+                        ));
+                    }
+                    Some(ProducerSequence {
+                        producer_id,
+                        epoch,
+                        first_sequence,
+                        digest_algorithm,
+                        payload_digest: decoder.take(32)?.try_into().map_err(|_| {
+                            StorageError::corrupt(path, offset, "invalid payload digest")
+                        })?,
+                    })
+                }
                 _ => {
                     return Err(StorageError::corrupt(
                         path,
@@ -315,10 +356,10 @@ fn decode_event(path: &Path, offset: u64, kind: u8, body: &[u8]) -> StorageResul
                 producer,
             }
         }
-        COMMIT_KIND | ABORT_KIND => {
+        COMMIT_KIND | COMMIT_V2_KIND | ABORT_KIND => {
             let topic_partition = decode_topic_partition(&mut decoder)?;
             let batch_id = BatchId::new(decoder.u128()?);
-            if kind == COMMIT_KIND {
+            if kind == COMMIT_KIND || kind == COMMIT_V2_KIND {
                 let durable_replicas = decoder.u32()?;
                 if durable_replicas == 0 {
                     return Err(StorageError::corrupt(
@@ -327,10 +368,26 @@ fn decode_event(path: &Path, offset: u64, kind: u8, body: &[u8]) -> StorageResul
                         "committed batch has zero durable replicas",
                     ));
                 }
+                let object_durable = if kind == COMMIT_V2_KIND {
+                    match decoder.u8()? {
+                        0 => false,
+                        1 => true,
+                        _ => {
+                            return Err(StorageError::corrupt(
+                                path,
+                                offset,
+                                "invalid object durability flag",
+                            ));
+                        }
+                    }
+                } else {
+                    false
+                };
                 JournalEvent::Commit {
                     topic_partition,
                     batch_id,
                     durable_replicas,
+                    object_durable,
                 }
             } else {
                 JournalEvent::Abort {
@@ -339,6 +396,10 @@ fn decode_event(path: &Path, offset: u64, kind: u8, body: &[u8]) -> StorageResul
                 }
             }
         }
+        TRUNCATE_KIND => JournalEvent::Truncate {
+            topic_partition: decode_topic_partition(&mut decoder)?,
+            log_start: LogicalOffset::new(decoder.u128()?),
+        },
         _ => {
             return Err(StorageError::corrupt(
                 path,
@@ -466,7 +527,7 @@ pub fn summarize_events(
             } => {
                 states.insert((*topic_partition, *batch_id), "aborted");
             }
-            JournalEvent::Configure { .. } => {}
+            JournalEvent::Configure { .. } | JournalEvent::Truncate { .. } => {}
         }
     }
     states
@@ -530,6 +591,7 @@ mod tests {
                     producer_id: 3,
                     epoch: 2,
                     first_sequence: 99,
+                    digest_algorithm: DIGEST_BLAKE3,
                     payload_digest: [17; 32],
                 }),
             },
@@ -537,6 +599,11 @@ mod tests {
                 topic_partition: TopicPartition::new(TopicId::new(9), LogicalPartitionId::new(2)),
                 batch_id: BatchId::new(4),
                 durable_replicas: 2,
+                object_durable: true,
+            },
+            JournalEvent::Truncate {
+                topic_partition: TopicPartition::new(TopicId::new(9), LogicalPartitionId::new(2)),
+                log_start: LogicalOffset::new(13),
             },
         ];
         {

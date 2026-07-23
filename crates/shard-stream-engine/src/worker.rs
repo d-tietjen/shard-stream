@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
@@ -7,18 +8,40 @@ use shard_stream_core::{
     byte_bounded_channel,
 };
 use shard_stream_storage::{
-    ExtentCatalogEntry, ShardStore, ShardStoreConfig, StorageResult, StoredBatch,
+    ExtentCatalogEntry, LocalObjectTier, ShardStore, ShardStoreConfig, StorageResult, StoredBatch,
 };
 
 use crate::config::COMMAND_OVERHEAD_BYTES;
 use crate::{EngineConfig, EngineError, EngineResult};
+
+pub(crate) struct AppendFailure {
+    pub(crate) error: EngineError,
+    pub(crate) definitely_not_written: bool,
+}
+
+impl AppendFailure {
+    fn rejected(error: EngineError) -> Self {
+        Self {
+            error,
+            definitely_not_written: true,
+        }
+    }
+
+    fn ambiguous(error: EngineError) -> Self {
+        Self {
+            error,
+            definitely_not_written: false,
+        }
+    }
+}
 
 enum ShardCommand {
     Append {
         reservation: Reservation,
         payload: Vec<u8>,
         sync: bool,
-        response: SyncSender<StorageResult<u32>>,
+        object_durable: bool,
+        response: SyncSender<StorageResult<AppendDurability>>,
     },
     Fetch {
         topic_partition: TopicPartition,
@@ -27,6 +50,11 @@ enum ShardCommand {
         response: SyncSender<StorageResult<Vec<StoredBatch>>>,
     },
     Sync {
+        response: SyncSender<StorageResult<()>>,
+    },
+    GarbageCollect {
+        topic_partition: TopicPartition,
+        log_start: LogicalOffset,
         response: SyncSender<StorageResult<()>>,
     },
 }
@@ -41,6 +69,7 @@ impl ShardHandle {
     pub(crate) fn spawn(
         config: &EngineConfig,
         shard_id: ShardId,
+        retained_log_starts: &HashMap<TopicPartition, LogicalOffset>,
     ) -> EngineResult<(Self, Vec<ExtentCatalogEntry>)> {
         let directory = shard_directory(&config.data_dir, shard_id);
         let primary = ShardStore::open(ShardStoreConfig {
@@ -50,6 +79,14 @@ impl ShardHandle {
             max_batch_bytes: config.max_batch_bytes,
         })?;
         let catalog = primary.catalog();
+        let mut tier = config
+            .object_store_dir
+            .as_ref()
+            .map(|directory| LocalObjectTier::open(directory, shard_id))
+            .transpose()?;
+        if let Some(tier) = &mut tier {
+            offload_sealed_packs(&primary, tier)?;
+        }
         let mut replicas = Vec::with_capacity(config.replication_factor.saturating_sub(1) as usize);
         for replica_index in 1..config.replication_factor {
             let mut replica = ShardStore::open(ShardStoreConfig {
@@ -58,10 +95,14 @@ impl ShardHandle {
                 target_pack_bytes: config.target_pack_bytes,
                 max_batch_bytes: config.max_batch_bytes,
             })?;
-            catch_up_replica(&primary, &mut replica, &catalog)?;
+            catch_up_replica(&primary, &mut replica, &catalog, retained_log_starts)?;
             replicas.push(Some(replica));
         }
-        let stores = LaneStores { primary, replicas };
+        let stores = LaneStores {
+            primary,
+            replicas,
+            tier,
+        };
         let (sender, receiver) =
             byte_bounded_channel(config.queue_slots_per_shard, config.queue_bytes_per_shard)
                 .map_err(|error| EngineError::InvalidConfig(error.to_string()))?;
@@ -86,27 +127,33 @@ impl ShardHandle {
         reservation: Reservation,
         payload: Vec<u8>,
         sync: bool,
-    ) -> EngineResult<u32> {
+        object_durable: bool,
+    ) -> Result<AppendDurability, AppendFailure> {
         let (response, receiver) = sync_channel(1);
-        let charged_bytes = payload.len().checked_add(COMMAND_OVERHEAD_BYTES).ok_or(
-            EngineError::AdmissionLimited {
-                shard_id: self.shard_id,
-                reason: "append byte charge overflow",
-            },
-        )?;
+        let charged_bytes = payload
+            .len()
+            .checked_add(COMMAND_OVERHEAD_BYTES)
+            .ok_or_else(|| {
+                AppendFailure::rejected(EngineError::AdmissionLimited {
+                    shard_id: self.shard_id,
+                    reason: "append byte charge overflow",
+                })
+            })?;
         self.try_send(
             ShardCommand::Append {
                 reservation,
                 payload,
                 sync,
+                object_durable,
                 response,
             },
             charged_bytes,
-        )?;
-        let durable_replicas = receiver
+        )
+        .map_err(AppendFailure::rejected)?;
+        receiver
             .recv()
-            .map_err(|_| EngineError::WorkerStopped(self.shard_id))??;
-        Ok(durable_replicas)
+            .map_err(|_| AppendFailure::ambiguous(EngineError::WorkerStopped(self.shard_id)))?
+            .map_err(|error| AppendFailure::ambiguous(error.into()))
     }
 
     pub(crate) fn begin_fetch(
@@ -138,6 +185,26 @@ impl ShardHandle {
     pub(crate) fn sync(&self) -> EngineResult<()> {
         let (response, receiver) = sync_channel(1);
         self.try_send(ShardCommand::Sync { response }, COMMAND_OVERHEAD_BYTES)?;
+        receiver
+            .recv()
+            .map_err(|_| EngineError::WorkerStopped(self.shard_id))??;
+        Ok(())
+    }
+
+    pub(crate) fn garbage_collect(
+        &self,
+        topic_partition: TopicPartition,
+        log_start: LogicalOffset,
+    ) -> EngineResult<()> {
+        let (response, receiver) = sync_channel(1);
+        self.try_send(
+            ShardCommand::GarbageCollect {
+                topic_partition,
+                log_start,
+                response,
+            },
+            COMMAND_OVERHEAD_BYTES,
+        )?;
         receiver
             .recv()
             .map_err(|_| EngineError::WorkerStopped(self.shard_id))??;
@@ -187,9 +254,10 @@ fn run_worker(
                 reservation,
                 payload,
                 sync,
+                object_durable,
                 response,
             } => {
-                let result = stores.append(*reservation, payload, *sync);
+                let result = stores.append(*reservation, payload, *sync, *object_durable);
                 let _ = response.send(result);
             }
             ShardCommand::Fetch {
@@ -206,6 +274,13 @@ fn run_worker(
             }
             ShardCommand::Sync { response } => {
                 let _ = response.send(stores.sync());
+            }
+            ShardCommand::GarbageCollect {
+                topic_partition,
+                log_start,
+                response,
+            } => {
+                let _ = response.send(stores.garbage_collect(*topic_partition, *log_start));
             }
         }
     }
@@ -225,6 +300,13 @@ fn replica_directory(data_dir: &std::path::Path, replica_index: u32, shard_id: S
 struct LaneStores {
     primary: ShardStore,
     replicas: Vec<Option<ShardStore>>,
+    tier: Option<LocalObjectTier>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AppendDurability {
+    pub(crate) durable_replicas: u32,
+    pub(crate) object_durable: bool,
 }
 
 impl LaneStores {
@@ -233,7 +315,8 @@ impl LaneStores {
         reservation: Reservation,
         payload: &[u8],
         sync: bool,
-    ) -> StorageResult<u32> {
+        require_object_durability: bool,
+    ) -> StorageResult<AppendDurability> {
         self.primary.append(reservation, payload, sync)?;
         let mut durable_replicas = 1u32;
         for replica in &mut self.replicas {
@@ -245,7 +328,22 @@ impl LaneStores {
                 Err(_) => *replica = None,
             }
         }
-        Ok(durable_replicas)
+        let object_durable = match (&mut self.tier, require_object_durability) {
+            (Some(tier), true) => self
+                .primary
+                .seal_active()
+                .and_then(|_| offload_sealed_packs(&self.primary, tier))
+                .is_ok(),
+            (Some(tier), false) => {
+                let _ = offload_sealed_packs(&self.primary, tier);
+                false
+            }
+            (None, _) => false,
+        };
+        Ok(AppendDurability {
+            durable_replicas,
+            object_durable,
+        })
     }
 
     fn sync(&mut self) -> StorageResult<()> {
@@ -260,12 +358,38 @@ impl LaneStores {
         }
         Ok(())
     }
+
+    fn garbage_collect(
+        &mut self,
+        topic_partition: TopicPartition,
+        log_start: LogicalOffset,
+    ) -> StorageResult<()> {
+        let log_starts = HashMap::from([(topic_partition, log_start)]);
+        self.primary.garbage_collect(&log_starts)?;
+        for replica in &mut self.replicas {
+            let Some(store) = replica else {
+                continue;
+            };
+            if store.garbage_collect(&log_starts).is_err() {
+                *replica = None;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn offload_sealed_packs(store: &ShardStore, tier: &mut LocalObjectTier) -> StorageResult<()> {
+    for pack in store.sealed_packs()? {
+        tier.offload_pack(pack.sequence, &pack.path)?;
+    }
+    Ok(())
 }
 
 fn catch_up_replica(
     primary: &ShardStore,
     replica: &mut ShardStore,
     primary_catalog: &[ExtentCatalogEntry],
+    retained_log_starts: &HashMap<TopicPartition, LogicalOffset>,
 ) -> StorageResult<()> {
     let primary_batches = primary_catalog
         .iter()
@@ -284,7 +408,11 @@ fn catch_up_replica(
             TopicPartition::new(entry.reservation.topic_id, entry.reservation.partition_id),
             entry.reservation.batch_id,
         );
-        if primary_batches.get(&key) != Some(&entry.reservation) {
+        if primary_batches.get(&key) != Some(&entry.reservation)
+            && retained_log_starts
+                .get(&key.0)
+                .is_none_or(|log_start| entry.reservation.last_offset >= *log_start)
+        {
             return Err(shard_stream_storage::StorageError::InvalidInput(
                 "replica contains an extent absent or different on the primary".into(),
             ));

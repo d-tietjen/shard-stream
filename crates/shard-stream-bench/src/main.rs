@@ -61,6 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("queue byte configuration overflow")?;
     let engine = StreamEngine::open(EngineConfig {
         data_dir: data_dir.clone(),
+        object_store_dir: None,
         shard_count: args.shards,
         replication_factor: args.replication_factor,
         min_in_sync_replicas: args.min_in_sync_replicas,

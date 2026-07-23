@@ -3,7 +3,7 @@
   "info": {
     "title": "shard-stream native REST API",
     "version": "0.1.0",
-    "description": "Bootstrap REST control API and binary append/fetch data path."
+    "description": "Native control API and binary append/fetch data path."
   },
   "paths": {
     "/healthz": {
@@ -118,6 +118,53 @@
           }
         }
       }
+    },
+    "/v1/topics/{topic_id}/partitions/{partition_id}/watermarks": {
+      "get": {
+        "summary": "Read partition visibility and durability watermarks",
+        "responses": {
+          "200": {
+            "description": "Current partition watermarks",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Watermarks"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/topics/{topic_id}/partitions/{partition_id}/retention": {
+      "put": {
+        "summary": "Advance the retained log start at a batch boundary",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Retention"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Retention advanced and fully expired sealed packs reclaimed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Watermarks"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Offset is not monotonic or batch aligned"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -143,6 +190,45 @@
               "type": "integer",
               "minimum": 0
             }
+          }
+        }
+      },
+      "Retention": {
+        "type": "object",
+        "required": [
+          "log_start"
+        ],
+        "properties": {
+          "log_start": {
+            "type": "string",
+            "description": "Unsigned 128-bit decimal batch-boundary offset"
+          }
+        }
+      },
+      "Watermarks": {
+        "type": "object",
+        "required": [
+          "log_start",
+          "allocated_end",
+          "contiguous_log_end",
+          "replicated_high_watermark",
+          "last_stable_offset"
+        ],
+        "properties": {
+          "log_start": {
+            "type": "string"
+          },
+          "allocated_end": {
+            "type": "string"
+          },
+          "contiguous_log_end": {
+            "type": "string"
+          },
+          "replicated_high_watermark": {
+            "type": "string"
+          },
+          "last_stable_offset": {
+            "type": "string"
           }
         }
       }

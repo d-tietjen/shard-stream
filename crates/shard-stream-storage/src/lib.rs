@@ -4,9 +4,15 @@ mod codec;
 mod error;
 mod extent;
 mod journal;
+mod tier;
 
 pub use error::{StorageError, StorageResult};
-pub use extent::{ExtentCatalogEntry, ShardStore, ShardStoreConfig, StoredBatch};
-pub use journal::{
-    CoordinatorJournal, JournalEvent, ProducerSequence, RecoveredJournal, summarize_events,
+pub use extent::{
+    ExtentCatalogEntry, GarbageCollectionStats, SealedPack, ShardStore, ShardStoreConfig,
+    StoredBatch,
 };
+pub use journal::{
+    CoordinatorJournal, DIGEST_BLAKE3, JournalEvent, ProducerSequence, RecoveredJournal,
+    summarize_events,
+};
+pub use tier::{LocalObjectTier, TierManifest, TierObject};

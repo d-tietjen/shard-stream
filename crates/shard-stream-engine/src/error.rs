@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use shard_stream_core::{LogicalPartitionId, SequencerError, ShardId, TopicId};
+use shard_stream_core::{LogicalOffset, LogicalPartitionId, SequencerError, ShardId, TopicId};
 use shard_stream_storage::StorageError;
 
 pub type EngineResult<T> = Result<T, EngineError>;
@@ -24,6 +24,11 @@ pub enum EngineError {
     DurabilityUnavailable {
         required_replicas: u32,
         durable_replicas: u32,
+    },
+    ObjectDurabilityUnavailable,
+    OffsetOutOfRange {
+        requested: LogicalOffset,
+        log_start: LogicalOffset,
     },
     StaleProducerEpoch {
         producer_id: u128,
@@ -70,6 +75,19 @@ impl fmt::Display for EngineError {
             } => write!(
                 formatter,
                 "durability unavailable: required {required_replicas} replicas, reached {durable_replicas}"
+            ),
+            Self::ObjectDurabilityUnavailable => {
+                write!(
+                    formatter,
+                    "object-store durability is temporarily unavailable"
+                )
+            }
+            Self::OffsetOutOfRange {
+                requested,
+                log_start,
+            } => write!(
+                formatter,
+                "offset {requested} is below the retained log start {log_start}"
             ),
             Self::StaleProducerEpoch {
                 producer_id,

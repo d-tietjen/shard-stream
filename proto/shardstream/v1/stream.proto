@@ -68,6 +68,7 @@ message FetchBatch {
   UInt128 last_offset = 4;
   bytes payload = 5;
   Placement placement = 6;
+  uint32 record_count = 7;
 }
 
 service ProducerService {

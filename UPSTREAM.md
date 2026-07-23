@@ -20,6 +20,7 @@ here. Runtime dependencies on `shard-kv` crates are not allowed.
 | `docs/SHARD_STREAM_PLAN.md` | `docs/SHARD_STREAM_PLAN.md` on branch `shard-stream-plan` | Copied architecture plan |
 | `crates/shard-stream-core/src/channel.rs` | `crates/shardmap` bounded channel patterns | Clean-room stream-specific adaptation |
 | `crates/shard-stream-storage/src/extent.rs` | `crates/shardmap/src/persistence/wal.rs` | Adapted framing, checksum, rotation, and partial-tail recovery patterns |
+| `crates/shard-stream-storage/src/tier.rs` | `crates/shardmap/src/persistence/object_storage.rs` and `object_storage_manifest.rs` | Rewritten as immutable BLAKE3-addressed pack publication with atomic manifest generations |
 | `crates/shard-stream-engine/src/worker.rs` | `crates/shardmap/src/replication.rs` and `replication/*` | Clean-room append-only replica and catch-up foundation |
 
 The stream implementations are deliberately rewritten around immutable
