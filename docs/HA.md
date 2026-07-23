@@ -20,6 +20,12 @@ The `shard-stream-control` crate provides:
 - a `WriteFence` installed in the stream engine. When installed, every append
   must carry the exact current, unexpired leader epoch.
 
+Lease state is partitioned across a fixed pool of MPSC-owned workers using a
+stable topic/partition hash. The append-side fence check therefore has no
+shared map lock and unrelated partitions can validate concurrently. A separate
+control-plane owner serializes the infrequent durable lease-state replacement;
+payload appends never wait for a global append journal or Blossom finality.
+
 The `BlossomLeaseConsensus` implementation is a security boundary. Its
 `latest_lease` and `commit_lease` methods must verify validator signatures,
 validator-generation transitions, the trusted contiguous epoch chain, and

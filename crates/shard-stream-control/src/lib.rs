@@ -14,7 +14,10 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use shard_stream_core::TopicPartition;
@@ -25,6 +28,9 @@ const STATE_MAGIC: &[u8; 8] = b"SSLEASE1";
 const STATE_VERSION: u16 = 1;
 const STATE_CHECKSUM_BYTES: usize = 32;
 const MAX_STATE_BYTES: u64 = 64 * 1024 * 1024;
+const LEASE_QUEUE_SLOTS: usize = 4_096;
+const PERSISTENCE_QUEUE_SLOTS: usize = 256;
+const MAX_LEASE_WORKERS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ClusterId(pub u128);
@@ -155,9 +161,11 @@ pub struct FinalizedLease {
 }
 
 pub struct LeaseCoordinator {
-    config: LeaseCoordinatorConfig,
-    consensus: Arc<dyn BlossomLeaseConsensus>,
-    leases: Mutex<BTreeMap<TopicPartition, FinalizedLease>>,
+    config: Arc<LeaseCoordinatorConfig>,
+    workers: Vec<SyncSender<LeaseCommand>>,
+    worker_threads: Vec<JoinHandle<()>>,
+    persistence: Option<PersistenceOwner>,
+    lease_count: Arc<AtomicUsize>,
 }
 
 impl fmt::Debug for LeaseCoordinator {
@@ -165,9 +173,115 @@ impl fmt::Debug for LeaseCoordinator {
         formatter
             .debug_struct("LeaseCoordinator")
             .field("config", &self.config)
-            .field("lease_count", &lock(&self.leases).len())
+            .field("worker_count", &self.workers.len())
+            .field("lease_count", &self.lease_count.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
+}
+
+enum LeaseCommand {
+    AcquireOrRenew {
+        topic_partition: TopicPartition,
+        leader_epoch: u64,
+        expires_at_unix_ms: u64,
+        response: SyncSender<ControlResult<FinalizedLease>>,
+    },
+    Lease {
+        topic_partition: TopicPartition,
+        response: SyncSender<Option<FinalizedLease>>,
+    },
+    Refresh {
+        topic_partition: TopicPartition,
+        response: SyncSender<ControlResult<Option<FinalizedLease>>>,
+    },
+    CheckWrite {
+        topic_partition: TopicPartition,
+        leader_epoch: u64,
+        response: SyncSender<ControlResult<()>>,
+    },
+}
+
+enum PersistenceCommand {
+    Replace {
+        topic_partition: TopicPartition,
+        expected: Option<FinalizedLease>,
+        finalized: FinalizedLease,
+        response: SyncSender<ControlResult<()>>,
+    },
+}
+
+#[derive(Clone)]
+struct PersistenceHandle {
+    sender: SyncSender<PersistenceCommand>,
+}
+
+impl PersistenceHandle {
+    fn replace(
+        &self,
+        topic_partition: TopicPartition,
+        expected: Option<FinalizedLease>,
+        finalized: FinalizedLease,
+    ) -> ControlResult<()> {
+        let (response, receiver) = sync_channel(1);
+        self.sender
+            .send(PersistenceCommand::Replace {
+                topic_partition,
+                expected,
+                finalized,
+                response,
+            })
+            .map_err(|_| ControlError::CoordinatorStopped("lease persistence"))?;
+        receive_control(receiver, "lease persistence")
+    }
+}
+
+struct PersistenceOwner {
+    sender: Option<SyncSender<PersistenceCommand>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl PersistenceOwner {
+    fn spawn(
+        config: Arc<LeaseCoordinatorConfig>,
+        leases: BTreeMap<TopicPartition, FinalizedLease>,
+        lease_count: Arc<AtomicUsize>,
+    ) -> ControlResult<Self> {
+        let (sender, receiver) = sync_channel(PERSISTENCE_QUEUE_SLOTS);
+        let thread = thread::Builder::new()
+            .name("shard-stream-lease-persistence".into())
+            .spawn(move || run_persistence(config, leases, lease_count, receiver))
+            .map_err(ControlError::Io)?;
+        Ok(Self {
+            sender: Some(sender),
+            thread: Some(thread),
+        })
+    }
+
+    fn handle(&self) -> PersistenceHandle {
+        PersistenceHandle {
+            sender: self
+                .sender
+                .as_ref()
+                .expect("persistence owner is active")
+                .clone(),
+        }
+    }
+}
+
+impl Drop for PersistenceOwner {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct LeaseWorkerState {
+    config: Arc<LeaseCoordinatorConfig>,
+    consensus: Arc<dyn BlossomLeaseConsensus>,
+    leases: BTreeMap<TopicPartition, FinalizedLease>,
+    persistence: PersistenceHandle,
 }
 
 impl LeaseCoordinator {
@@ -177,10 +291,48 @@ impl LeaseCoordinator {
     ) -> ControlResult<Self> {
         config.validate()?;
         let leases = load_state(&config)?;
+        let lease_count = Arc::new(AtomicUsize::new(leases.len()));
+        let config = Arc::new(config);
+        let persistence = PersistenceOwner::spawn(
+            Arc::clone(&config),
+            leases.clone(),
+            Arc::clone(&lease_count),
+        )?;
+        let worker_count = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(MAX_LEASE_WORKERS)
+            .min(config.max_leases)
+            .max(1);
+        let mut worker_leases = (0..worker_count)
+            .map(|_| BTreeMap::new())
+            .collect::<Vec<_>>();
+        for (topic_partition, lease) in leases {
+            let index = lease_worker_index(topic_partition, worker_count);
+            worker_leases[index].insert(topic_partition, lease);
+        }
+        let mut workers = Vec::with_capacity(worker_count);
+        let mut worker_threads = Vec::with_capacity(worker_count);
+        for (index, leases) in worker_leases.into_iter().enumerate() {
+            let (sender, receiver) = sync_channel(LEASE_QUEUE_SLOTS);
+            let state = LeaseWorkerState {
+                config: Arc::clone(&config),
+                consensus: Arc::clone(&consensus),
+                leases,
+                persistence: persistence.handle(),
+            };
+            let thread = thread::Builder::new()
+                .name(format!("shard-stream-lease-{index}"))
+                .spawn(move || run_lease_worker(state, receiver))
+                .map_err(ControlError::Io)?;
+            workers.push(sender);
+            worker_threads.push(thread);
+        }
         Ok(Self {
             config,
-            consensus,
-            leases: Mutex::new(leases),
+            workers,
+            worker_threads,
+            persistence: Some(persistence),
+            lease_count,
         })
     }
 
@@ -207,46 +359,31 @@ impl LeaseCoordinator {
                 "lease expiry is elapsed or exceeds the configured maximum".into(),
             ));
         }
-
-        self.refresh(topic_partition)?;
-        let previous = lock(&self.leases).get(&topic_partition).cloned();
-        validate_epoch_transition(previous.as_ref(), self.config.node_id, leader_epoch)?;
-        let previous_epoch_hash = previous
-            .as_ref()
-            .map_or([0; 32], |lease| lease.certificate.epoch_hash);
-        let claim = LeaseClaim {
-            cluster_id: self.config.cluster_id,
+        let (response, receiver) = sync_channel(1);
+        self.send(
             topic_partition,
-            leader_id: self.config.node_id,
-            leader_epoch,
-            expires_at_unix_ms,
-            previous_epoch_hash,
-        };
-        let certificate = self.consensus.commit_lease(
-            claim.group_id(),
-            &claim,
-            self.config.consensus_deadline,
+            LeaseCommand::AcquireOrRenew {
+                topic_partition,
+                leader_epoch,
+                expires_at_unix_ms,
+                response,
+            },
         )?;
-        validate_certificate(&claim, previous.as_ref(), &certificate)?;
-        let finalized = FinalizedLease { claim, certificate };
-
-        let mut leases = lock(&self.leases);
-        if leases.get(&topic_partition) != previous.as_ref() {
-            return Err(ControlError::ConcurrentLeaseChange);
-        }
-        if previous.is_none() && leases.len() >= self.config.max_leases {
-            return Err(ControlError::LeaseLimitReached);
-        }
-        let mut next = leases.clone();
-        next.insert(topic_partition, finalized.clone());
-        persist_state(&self.config, &next)?;
-        *leases = next;
-        Ok(finalized)
+        receive_control(receiver, "lease coordinator")
     }
 
     #[must_use]
     pub fn lease(&self, topic_partition: TopicPartition) -> Option<FinalizedLease> {
-        lock(&self.leases).get(&topic_partition).cloned()
+        let (response, receiver) = sync_channel(1);
+        self.send(
+            topic_partition,
+            LeaseCommand::Lease {
+                topic_partition,
+                response,
+            },
+        )
+        .ok()?;
+        receiver.recv().ok().flatten()
     }
 
     /// Refresh a partition fence from the latest fully verified Blossom state.
@@ -258,67 +395,261 @@ impl LeaseCoordinator {
         &self,
         topic_partition: TopicPartition,
     ) -> ControlResult<Option<FinalizedLease>> {
-        let group_id = lease_group_id(self.config.cluster_id, topic_partition);
-        let observed = self
-            .consensus
-            .latest_lease(group_id, self.config.consensus_deadline)?;
-        let Some(observed) = observed else {
-            return Ok(lock(&self.leases).get(&topic_partition).cloned());
-        };
-        if observed.claim.cluster_id != self.config.cluster_id
-            || observed.claim.topic_partition != topic_partition
-            || observed.certificate.group_id != group_id
-        {
-            return Err(ControlError::InvalidCertificate(
-                "latest Blossom lease belongs to a different group".into(),
-            ));
-        }
-        validate_certificate_shape(&observed.claim, &observed.certificate)?;
+        let (response, receiver) = sync_channel(1);
+        self.send(
+            topic_partition,
+            LeaseCommand::Refresh {
+                topic_partition,
+                response,
+            },
+        )?;
+        receive_control(receiver, "lease coordinator")
+    }
 
-        let mut leases = lock(&self.leases);
-        if let Some(current) = leases.get(&topic_partition) {
-            if observed.certificate.epoch_nonce < current.certificate.epoch_nonce {
-                return Err(ControlError::InvalidCertificate(
-                    "Blossom adapter returned stale lease state".into(),
-                ));
-            }
-            if observed.certificate.epoch_nonce == current.certificate.epoch_nonce {
-                if &observed != current {
-                    return Err(ControlError::InvalidCertificate(
-                        "same Blossom epoch resolved to different lease state".into(),
-                    ));
-                }
-                return Ok(Some(current.clone()));
-            }
-        } else if leases.len() >= self.config.max_leases {
-            return Err(ControlError::LeaseLimitReached);
-        }
-        let mut next = leases.clone();
-        next.insert(topic_partition, observed.clone());
-        persist_state(&self.config, &next)?;
-        *leases = next;
-        Ok(Some(observed))
+    fn send(&self, topic_partition: TopicPartition, command: LeaseCommand) -> ControlResult<()> {
+        let index = lease_worker_index(topic_partition, self.workers.len());
+        self.workers[index]
+            .send(command)
+            .map_err(|_| ControlError::CoordinatorStopped("lease coordinator"))
     }
 }
 
 impl WriteFence for LeaseCoordinator {
     fn check_write(&self, topic_partition: TopicPartition, leader_epoch: u64) -> ControlResult<()> {
-        let leases = lock(&self.leases);
-        let lease = leases
-            .get(&topic_partition)
-            .ok_or(ControlError::NoLease(topic_partition))?;
-        if lease.claim.leader_id != self.config.node_id || lease.claim.leader_epoch != leader_epoch
-        {
-            return Err(ControlError::Fenced {
-                expected_epoch: lease.claim.leader_epoch,
-                received_epoch: leader_epoch,
-            });
-        }
-        if lease.claim.expires_at_unix_ms <= unix_time_ms()? {
-            return Err(ControlError::LeaseExpired);
-        }
-        Ok(())
+        let (response, receiver) = sync_channel(1);
+        self.send(
+            topic_partition,
+            LeaseCommand::CheckWrite {
+                topic_partition,
+                leader_epoch,
+                response,
+            },
+        )?;
+        receive_control(receiver, "lease coordinator")
     }
+}
+
+impl Drop for LeaseCoordinator {
+    fn drop(&mut self) {
+        self.workers.clear();
+        for thread in self.worker_threads.drain(..) {
+            let _ = thread.join();
+        }
+        self.persistence.take();
+    }
+}
+
+fn run_lease_worker(mut state: LeaseWorkerState, receiver: Receiver<LeaseCommand>) {
+    while let Ok(command) = receiver.recv() {
+        match command {
+            LeaseCommand::AcquireOrRenew {
+                topic_partition,
+                leader_epoch,
+                expires_at_unix_ms,
+                response,
+            } => {
+                let result = acquire_or_renew_owned(
+                    &mut state,
+                    topic_partition,
+                    leader_epoch,
+                    expires_at_unix_ms,
+                );
+                let _ = response.send(result);
+            }
+            LeaseCommand::Lease {
+                topic_partition,
+                response,
+            } => {
+                let _ = response.send(state.leases.get(&topic_partition).cloned());
+            }
+            LeaseCommand::Refresh {
+                topic_partition,
+                response,
+            } => {
+                let result = refresh_owned(&mut state, topic_partition);
+                let _ = response.send(result);
+            }
+            LeaseCommand::CheckWrite {
+                topic_partition,
+                leader_epoch,
+                response,
+            } => {
+                let result = check_write_owned(&state, topic_partition, leader_epoch);
+                let _ = response.send(result);
+            }
+        }
+    }
+}
+
+fn acquire_or_renew_owned(
+    state: &mut LeaseWorkerState,
+    topic_partition: TopicPartition,
+    leader_epoch: u64,
+    expires_at_unix_ms: u64,
+) -> ControlResult<FinalizedLease> {
+    refresh_owned(state, topic_partition)?;
+    let previous = state.leases.get(&topic_partition).cloned();
+    validate_epoch_transition(previous.as_ref(), state.config.node_id, leader_epoch)?;
+    let previous_epoch_hash = previous
+        .as_ref()
+        .map_or([0; 32], |lease| lease.certificate.epoch_hash);
+    let claim = LeaseClaim {
+        cluster_id: state.config.cluster_id,
+        topic_partition,
+        leader_id: state.config.node_id,
+        leader_epoch,
+        expires_at_unix_ms,
+        previous_epoch_hash,
+    };
+    let certificate =
+        state
+            .consensus
+            .commit_lease(claim.group_id(), &claim, state.config.consensus_deadline)?;
+    validate_certificate(&claim, previous.as_ref(), &certificate)?;
+    let finalized = FinalizedLease { claim, certificate };
+    state
+        .persistence
+        .replace(topic_partition, previous, finalized.clone())?;
+    state.leases.insert(topic_partition, finalized.clone());
+    Ok(finalized)
+}
+
+fn refresh_owned(
+    state: &mut LeaseWorkerState,
+    topic_partition: TopicPartition,
+) -> ControlResult<Option<FinalizedLease>> {
+    let group_id = lease_group_id(state.config.cluster_id, topic_partition);
+    let observed = state
+        .consensus
+        .latest_lease(group_id, state.config.consensus_deadline)?;
+    let Some(observed) = observed else {
+        return Ok(state.leases.get(&topic_partition).cloned());
+    };
+    if observed.claim.cluster_id != state.config.cluster_id
+        || observed.claim.topic_partition != topic_partition
+        || observed.certificate.group_id != group_id
+    {
+        return Err(ControlError::InvalidCertificate(
+            "latest Blossom lease belongs to a different group".into(),
+        ));
+    }
+    validate_certificate_shape(&observed.claim, &observed.certificate)?;
+
+    let previous = state.leases.get(&topic_partition).cloned();
+    if let Some(current) = &previous {
+        if observed.certificate.epoch_nonce < current.certificate.epoch_nonce {
+            return Err(ControlError::InvalidCertificate(
+                "Blossom adapter returned stale lease state".into(),
+            ));
+        }
+        if observed.certificate.epoch_nonce == current.certificate.epoch_nonce {
+            if &observed != current {
+                return Err(ControlError::InvalidCertificate(
+                    "same Blossom epoch resolved to different lease state".into(),
+                ));
+            }
+            return Ok(Some(current.clone()));
+        }
+    }
+    state
+        .persistence
+        .replace(topic_partition, previous, observed.clone())?;
+    state.leases.insert(topic_partition, observed.clone());
+    Ok(Some(observed))
+}
+
+fn check_write_owned(
+    state: &LeaseWorkerState,
+    topic_partition: TopicPartition,
+    leader_epoch: u64,
+) -> ControlResult<()> {
+    let lease = state
+        .leases
+        .get(&topic_partition)
+        .ok_or(ControlError::NoLease(topic_partition))?;
+    if lease.claim.leader_id != state.config.node_id || lease.claim.leader_epoch != leader_epoch {
+        return Err(ControlError::Fenced {
+            expected_epoch: lease.claim.leader_epoch,
+            received_epoch: leader_epoch,
+        });
+    }
+    if lease.claim.expires_at_unix_ms <= unix_time_ms()? {
+        return Err(ControlError::LeaseExpired);
+    }
+    Ok(())
+}
+
+fn run_persistence(
+    config: Arc<LeaseCoordinatorConfig>,
+    mut leases: BTreeMap<TopicPartition, FinalizedLease>,
+    lease_count: Arc<AtomicUsize>,
+    receiver: Receiver<PersistenceCommand>,
+) {
+    while let Ok(command) = receiver.recv() {
+        match command {
+            PersistenceCommand::Replace {
+                topic_partition,
+                expected,
+                finalized,
+                response,
+            } => {
+                let result = replace_persisted_lease(
+                    &config,
+                    &mut leases,
+                    topic_partition,
+                    expected.as_ref(),
+                    finalized,
+                );
+                if result.is_ok() {
+                    lease_count.store(leases.len(), Ordering::Relaxed);
+                }
+                let _ = response.send(result);
+            }
+        }
+    }
+}
+
+fn replace_persisted_lease(
+    config: &LeaseCoordinatorConfig,
+    leases: &mut BTreeMap<TopicPartition, FinalizedLease>,
+    topic_partition: TopicPartition,
+    expected: Option<&FinalizedLease>,
+    finalized: FinalizedLease,
+) -> ControlResult<()> {
+    if leases.get(&topic_partition) != expected {
+        return Err(ControlError::ConcurrentLeaseChange);
+    }
+    if expected.is_none() && leases.len() >= config.max_leases {
+        return Err(ControlError::LeaseLimitReached);
+    }
+    let mut next = leases.clone();
+    next.insert(topic_partition, finalized);
+    persist_state(config, &next)?;
+    *leases = next;
+    Ok(())
+}
+
+fn receive_control<T>(
+    receiver: Receiver<ControlResult<T>>,
+    component: &'static str,
+) -> ControlResult<T> {
+    receiver
+        .recv()
+        .map_err(|_| ControlError::CoordinatorStopped(component))?
+}
+
+fn lease_worker_index(topic_partition: TopicPartition, worker_count: usize) -> usize {
+    let topic = topic_partition.topic_id.get();
+    let folded =
+        (topic as u64) ^ ((topic >> 64) as u64) ^ u64::from(topic_partition.partition_id.get());
+    splitmix64(folded) as usize % worker_count
+}
+
+const fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 fn validate_epoch_transition(
@@ -559,12 +890,6 @@ fn duration_ms(duration: Duration) -> ControlResult<u64> {
         .map_err(|_| ControlError::InvalidConfig("maximum lease duration is too large".into()))
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 fn push_u16(bytes: &mut Vec<u8>, value: u16) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
@@ -646,6 +971,7 @@ pub enum ControlError {
     LeaseExpired,
     LeaseLimitReached,
     ConcurrentLeaseChange,
+    CoordinatorStopped(&'static str),
     Clock,
     State(String),
     Io(std::io::Error),
@@ -676,6 +1002,9 @@ impl fmt::Display for ControlError {
             Self::LeaseLimitReached => formatter.write_str("lease state capacity reached"),
             Self::ConcurrentLeaseChange => {
                 formatter.write_str("lease changed while finality was pending")
+            }
+            Self::CoordinatorStopped(component) => {
+                write!(formatter, "{component} stopped unexpectedly")
             }
             Self::Clock => formatter.write_str("system clock is before or exceeds Unix time"),
             Self::State(message) => write!(formatter, "invalid lease state: {message}"),
@@ -710,16 +1039,39 @@ mod tests {
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 
+    enum TestConsensusCommand {
+        Latest {
+            group_id: [u8; 32],
+            response: SyncSender<Option<FinalizedLease>>,
+        },
+        Commit {
+            group_id: [u8; 32],
+            claim: LeaseClaim,
+            response: SyncSender<ControlResult<BlossomLeaseCertificate>>,
+        },
+    }
+
     struct TestConsensus {
-        next_nonce: AtomicU64,
-        leases: Mutex<BTreeMap<[u8; 32], FinalizedLease>>,
+        sender: Option<SyncSender<TestConsensusCommand>>,
+        thread: Option<JoinHandle<()>>,
     }
 
     impl TestConsensus {
         fn new() -> Self {
+            let (sender, receiver) = sync_channel(64);
+            let thread = thread::spawn(move || run_test_consensus(receiver));
             Self {
-                next_nonce: AtomicU64::new(1),
-                leases: Mutex::new(BTreeMap::new()),
+                sender: Some(sender),
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for TestConsensus {
+        fn drop(&mut self) {
+            self.sender.take();
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
             }
         }
     }
@@ -730,7 +1082,15 @@ mod tests {
             group_id: [u8; 32],
             _deadline: Duration,
         ) -> ControlResult<Option<FinalizedLease>> {
-            Ok(lock(&self.leases).get(&group_id).cloned())
+            let (response, receiver) = sync_channel(1);
+            self.sender
+                .as_ref()
+                .expect("test consensus is active")
+                .send(TestConsensusCommand::Latest { group_id, response })
+                .map_err(|_| ControlError::Consensus("test consensus stopped".into()))?;
+            receiver
+                .recv()
+                .map_err(|_| ControlError::Consensus("test consensus stopped".into()))
         }
 
         fn commit_lease(
@@ -739,36 +1099,80 @@ mod tests {
             claim: &LeaseClaim,
             _deadline: Duration,
         ) -> ControlResult<BlossomLeaseCertificate> {
-            let previous = lock(&self.leases).get(&group_id).cloned();
-            let expected_previous = previous
+            let (response, receiver) = sync_channel(1);
+            self.sender
                 .as_ref()
-                .map_or([0; 32], |lease| lease.certificate.epoch_hash);
-            if claim.previous_epoch_hash != expected_previous {
-                return Err(ControlError::Consensus(
-                    "claim does not extend the finalized lease".into(),
-                ));
-            }
-            let nonce = self.next_nonce.fetch_add(1, Ordering::SeqCst);
-            let mut epoch = blake3::Hasher::new();
-            epoch.update(b"shard-stream.test-finalized-epoch.v1");
-            epoch.update(&nonce.to_le_bytes());
-            epoch.update(&claim.canonical_bytes());
-            let certificate = BlossomLeaseCertificate {
-                group_id,
-                epoch_nonce: nonce,
-                epoch_hash: *epoch.finalize().as_bytes(),
-                claim_digest: claim.digest(),
-                validator_generation: 1,
-            };
-            lock(&self.leases).insert(
-                group_id,
-                FinalizedLease {
+                .expect("test consensus is active")
+                .send(TestConsensusCommand::Commit {
+                    group_id,
                     claim: claim.clone(),
-                    certificate: certificate.clone(),
-                },
-            );
-            Ok(certificate)
+                    response,
+                })
+                .map_err(|_| ControlError::Consensus("test consensus stopped".into()))?;
+            receiver
+                .recv()
+                .map_err(|_| ControlError::Consensus("test consensus stopped".into()))?
         }
+    }
+
+    fn run_test_consensus(receiver: Receiver<TestConsensusCommand>) {
+        let mut next_nonce = 1u64;
+        let mut leases = BTreeMap::new();
+        while let Ok(command) = receiver.recv() {
+            match command {
+                TestConsensusCommand::Latest { group_id, response } => {
+                    let _ = response.send(leases.get(&group_id).cloned());
+                }
+                TestConsensusCommand::Commit {
+                    group_id,
+                    claim,
+                    response,
+                } => {
+                    let result = commit_test_lease(&mut leases, &mut next_nonce, group_id, &claim);
+                    let _ = response.send(result);
+                }
+            }
+        }
+    }
+
+    fn commit_test_lease(
+        leases: &mut BTreeMap<[u8; 32], FinalizedLease>,
+        next_nonce: &mut u64,
+        group_id: [u8; 32],
+        claim: &LeaseClaim,
+    ) -> ControlResult<BlossomLeaseCertificate> {
+        let previous = leases.get(&group_id).cloned();
+        let expected_previous = previous
+            .as_ref()
+            .map_or([0; 32], |lease| lease.certificate.epoch_hash);
+        if claim.previous_epoch_hash != expected_previous {
+            return Err(ControlError::Consensus(
+                "claim does not extend the finalized lease".into(),
+            ));
+        }
+        let nonce = *next_nonce;
+        *next_nonce = next_nonce
+            .checked_add(1)
+            .ok_or_else(|| ControlError::Consensus("test epoch exhausted".into()))?;
+        let mut epoch = blake3::Hasher::new();
+        epoch.update(b"shard-stream.test-finalized-epoch.v1");
+        epoch.update(&nonce.to_le_bytes());
+        epoch.update(&claim.canonical_bytes());
+        let certificate = BlossomLeaseCertificate {
+            group_id,
+            epoch_nonce: nonce,
+            epoch_hash: *epoch.finalize().as_bytes(),
+            claim_digest: claim.digest(),
+            validator_generation: 1,
+        };
+        leases.insert(
+            group_id,
+            FinalizedLease {
+                claim: claim.clone(),
+                certificate: certificate.clone(),
+            },
+        );
+        Ok(certificate)
     }
 
     struct TempState(PathBuf);

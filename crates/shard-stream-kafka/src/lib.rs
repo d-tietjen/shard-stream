@@ -9,8 +9,10 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::thread::{self, JoinHandle};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use kafka_protocol::ResponseError;
@@ -47,6 +49,7 @@ use tokio::sync::watch;
 use tracing::{error, info};
 
 const MAX_FRAME_HARD_LIMIT: usize = 128 * 1024 * 1024;
+const TOPIC_REGISTRY_QUEUE_SLOTS: usize = 1_024;
 const CLUSTER_ID: &str = "shard-stream";
 const API_VERSIONS: &[(ApiKey, i16, i16)] = &[
     (ApiKey::Produce, 3, 8),
@@ -90,8 +93,71 @@ impl KafkaConfig {
 struct Broker {
     engine: Arc<StreamEngine>,
     config: KafkaConfig,
-    known_topics: Mutex<BTreeSet<String>>,
+    known_topics: KnownTopics,
     next_request_id: AtomicU64,
+}
+
+enum TopicRegistryCommand {
+    Insert(String),
+    List(SyncSender<Vec<String>>),
+}
+
+struct KnownTopics {
+    sender: Option<SyncSender<TopicRegistryCommand>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl KnownTopics {
+    fn spawn() -> KafkaResult<Self> {
+        let (sender, receiver) = sync_channel(TOPIC_REGISTRY_QUEUE_SLOTS);
+        let thread = thread::Builder::new()
+            .name("shard-stream-kafka-topics".into())
+            .spawn(move || run_topic_registry(receiver))?;
+        Ok(Self {
+            sender: Some(sender),
+            thread: Some(thread),
+        })
+    }
+
+    fn insert(&self, name: String) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(TopicRegistryCommand::Insert(name));
+        }
+    }
+
+    fn list(&self) -> Vec<String> {
+        let (response, receiver) = sync_channel(1);
+        let Some(sender) = &self.sender else {
+            return Vec::new();
+        };
+        if sender.send(TopicRegistryCommand::List(response)).is_err() {
+            return Vec::new();
+        }
+        receiver.recv().unwrap_or_default()
+    }
+}
+
+impl Drop for KnownTopics {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn run_topic_registry(receiver: Receiver<TopicRegistryCommand>) {
+    let mut topics = BTreeSet::new();
+    while let Ok(command) = receiver.recv() {
+        match command {
+            TopicRegistryCommand::Insert(name) => {
+                topics.insert(name);
+            }
+            TopicRegistryCommand::List(response) => {
+                let _ = response.send(topics.iter().cloned().collect());
+            }
+        }
+    }
 }
 
 pub async fn serve(
@@ -105,7 +171,7 @@ pub async fn serve(
     let broker = Arc::new(Broker {
         engine,
         config,
-        known_topics: Mutex::new(BTreeSet::new()),
+        known_topics: KnownTopics::spawn()?,
         next_request_id: AtomicU64::new(1),
     });
     info!(%address, "shard-stream Kafka listener ready");
@@ -251,7 +317,7 @@ impl Broker {
                 .filter_map(|topic| topic.name)
                 .map(topic_string)
                 .collect::<Vec<_>>(),
-            None => lock(&self.known_topics).iter().cloned().collect(),
+            None => self.known_topics.list(),
         };
         let topics = names
             .into_iter()
@@ -270,7 +336,7 @@ impl Broker {
     }
 
     fn metadata_topic(&self, name: String) -> MetadataResponseTopic {
-        lock(&self.known_topics).insert(name.clone());
+        self.known_topics.insert(name.clone());
         let topic_id = topic_id(&name);
         let partitions = self.engine.topic_partitions(topic_id);
         let error_code = if partitions.is_empty() {
@@ -322,7 +388,7 @@ impl Broker {
                         .map_err(engine_error)
                 };
                 if result.is_ok() {
-                    lock(&self.known_topics).insert(name.clone());
+                    self.known_topics.insert(name.clone());
                 }
                 CreatableTopicResult::default()
                     .with_name(topic_name(name))
@@ -346,7 +412,7 @@ impl Broker {
             .into_iter()
             .map(|topic| {
                 let name = topic_string(topic.name);
-                lock(&self.known_topics).insert(name.clone());
+                self.known_topics.insert(name.clone());
                 let topic_id = topic_id(&name);
                 let partition_responses = topic
                     .partition_data
@@ -426,7 +492,7 @@ impl Broker {
             .into_iter()
             .map(|topic| {
                 let name = topic_string(topic.topic);
-                lock(&self.known_topics).insert(name.clone());
+                self.known_topics.insert(name.clone());
                 let topic_id = topic_id(&name);
                 let partitions = topic
                     .partitions
@@ -508,7 +574,7 @@ impl Broker {
             .into_iter()
             .map(|topic| {
                 let name = topic_string(topic.name);
-                lock(&self.known_topics).insert(name.clone());
+                self.known_topics.insert(name.clone());
                 let topic_id = topic_id(&name);
                 let partitions = topic
                     .partitions
@@ -679,12 +745,6 @@ fn engine_error(error: EngineError) -> ResponseError {
         EngineError::InvalidConfig(_) | EngineError::Sequencer(_) => ResponseError::InvalidRequest,
         EngineError::CorruptState(_) | EngineError::Storage(_) => ResponseError::UnknownServerError,
     }
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 pub type KafkaResult<T> = Result<T, KafkaError>;

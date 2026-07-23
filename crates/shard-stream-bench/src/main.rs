@@ -1,6 +1,6 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, ValueEnum};
@@ -146,25 +146,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let payload = Arc::new(vec![0x5a; args.payload_bytes]);
     let next_batch = AtomicU64::new(0);
-    let latencies = Mutex::new(Vec::with_capacity(
-        usize::try_from(args.batches).unwrap_or(usize::MAX),
-    ));
-    let first_offset = Mutex::new(None::<LogicalOffset>);
-    let failure = Mutex::new(None::<String>);
+    let failed = AtomicBool::new(false);
     let start = Instant::now();
-    std::thread::scope(|scope| {
+    let thread_results = std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(args.concurrency);
         for _ in 0..args.concurrency {
             let engine = Arc::clone(&engine);
             let payload = Arc::clone(&payload);
             let next_batch = &next_batch;
-            let latencies = &latencies;
-            let first_offset = &first_offset;
-            let failure = &failure;
-            scope.spawn(move || {
+            let failed = &failed;
+            workers.push(scope.spawn(move || {
                 let mut local_latencies = Vec::new();
                 let mut local_first = None;
                 loop {
-                    if lock(failure).is_some() {
+                    if failed.load(Ordering::Relaxed) {
                         break;
                     }
                     let batch = next_batch.fetch_add(1, Ordering::Relaxed);
@@ -192,25 +187,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                         }
                         Err(error) => {
-                            *lock(failure) = Some(error.to_string());
-                            break;
+                            failed.store(true, Ordering::Relaxed);
+                            return Err(error.to_string());
                         }
                     }
                 }
-                lock(latencies).extend(local_latencies);
-                if let Some(local_first) = local_first {
-                    let mut first = lock(first_offset);
-                    *first = Some(first.map_or(local_first, |current| current.min(local_first)));
-                }
-            });
+                Ok((local_latencies, local_first))
+            }));
         }
+        workers
+            .into_iter()
+            .map(std::thread::ScopedJoinHandle::join)
+            .collect::<Vec<_>>()
     });
-    if let Some(error) = lock(&failure).take() {
-        return Err(error.into());
+    let mut latencies = Vec::with_capacity(usize::try_from(args.batches).unwrap_or(usize::MAX));
+    let mut first_offset = None::<LogicalOffset>;
+    for result in thread_results {
+        let (mut local_latencies, local_first) =
+            result
+                .map_err(|_| "benchmark worker panicked")?
+                .map_err(|error| format!("benchmark append failed: {error}"))?;
+        latencies.append(&mut local_latencies);
+        if let Some(local_first) = local_first {
+            first_offset =
+                Some(first_offset.map_or(local_first, |current| current.min(local_first)));
+        }
     }
     engine.sync()?;
     let elapsed = start.elapsed();
-    let mut latencies = lock(&latencies);
     if latencies.len() != args.batches as usize {
         return Err(format!(
             "benchmark completed {} of {} batches",
@@ -264,7 +268,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         records_per_second: records as f64 / seconds,
         mebibytes_per_second,
         latency,
-        first_offset: lock(&first_offset).map_or_else(|| "0".into(), |offset| offset.to_string()),
+        first_offset: first_offset.map_or_else(|| "0".into(), |offset| offset.to_string()),
         allocated_end: watermarks.allocated_end.to_string(),
         gates: GateDocument {
             min_mib_per_second: args.min_mib_per_second,
@@ -273,7 +277,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
     println!("{}", serde_json::to_string_pretty(&result)?);
-    drop(latencies);
     drop(engine);
     if generated_data_dir && !args.keep_data {
         std::fs::remove_dir_all(&data_dir)?;
@@ -326,12 +329,6 @@ fn quantile(sorted: &[Duration], quantile: f64) -> Duration {
 
 fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn temporary_benchmark_dir() -> PathBuf {

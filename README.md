@@ -30,7 +30,7 @@ protocol mock:
 - grouped shard fsync, parallel local replica workers, quorum acknowledgement,
   replica catch-up, and replicated high watermarks;
 - stream-native Blossom lease claims, finality-certificate validation,
-  persistent leader epochs, and an engine write-fencing hook;
+  persistent leader epochs, and partition-hashed MPSC lease/fencing workers;
 - immutable BLAKE3-verified object-tier packs with atomic manifest generations;
 - durable, monotonic, batch-aligned retention and safe sealed-pack reclamation;
 - a versioned binary batch response format with CRC validation;
@@ -39,6 +39,8 @@ protocol mock:
 - a conservative Kafka wire adapter for topic creation, metadata, produce,
   fetch, offset lookup, and API negotiation;
 - an OpenAPI document, Prometheus endpoint, and Rust client;
+- MPSC-owned Kafka topic discovery and a single-owner native producer sequence,
+  leaving no shared runtime `Mutex` or `RwLock`;
 - Docker and Compose packaging; and
 - unit, restart-recovery, corruption, retention, object-tier, quorum, catch-up,
   and gRPC interoperability tests.

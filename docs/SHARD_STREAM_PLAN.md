@@ -1238,6 +1238,22 @@ The primary reproducible profile, `RPC-25`, is:
 `EDGE-8` uses three 8-vCPU nodes to reveal fixed overhead and avoid optimizing
 only for large servers.
 
+Before those distributed release profiles, `SINGLE-NVME` calibrates one Linux
+broker and one dedicated NVMe device. It sweeps RF1/leader and RF3/minimum-ISR-2
+quorum paths, but same-host RF3 is labeled replication-overhead calibration,
+not HA. The matrix crosses 100 B, 1 KiB, 10 KiB, and 1 MiB records with 32 KiB,
+64 KiB, 256 KiB, and 1 MiB target batches where valid; 1, 2, 4, 8, and 16
+lanes; concurrency from one through saturation; producer linger of 0, 1, 5,
+20, and 50 ms; matching consumer fetch sizes; and uncompressed, LZ4, and
+Zstandard Kafka RecordBatch profiles. Direct-engine results and Kafka, gRPC,
+and HTTP/3 wire results are separate.
+
+The calibration records sequential device bandwidth, fsync latency, NIC link
+speed, filesystem and mount options, CPU governor, page-cache state, TLS/SASL,
+and per-role CPU. It reports messages/s, batches/s, payload bytes/s, disk and
+network bytes/s, and latency together: a small-message message-rate win cannot
+be substituted for a large-batch byte-rate win.
+
 Steady-state latency gates are measured at 70% of the empirically observed
 maximum sustainable rate for that exact durability/workload profile.
 Sustainable means queues and memory remain bounded and no backlog grows over

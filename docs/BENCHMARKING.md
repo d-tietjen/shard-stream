@@ -32,6 +32,26 @@ Run the standard shard-scaling matrix with:
 ./bench/run-bench-matrix.sh bench/results
 ```
 
+The first single-node Linux calibration must sweep:
+
+- 1, 2, 4, 8, and 16 shards at RF1/leader durability and RF3/minimum-ISR-2
+  quorum durability;
+- 100 B, 1 KiB, 10 KiB, and 1 MiB records, with 32 KiB, 64 KiB, 256 KiB,
+  and 1 MiB target batches where the record size permits;
+- concurrency from 1 through saturation, reporting the full throughput/latency
+  curve rather than only its peak;
+- uncompressed, LZ4, and Zstandard Kafka RecordBatch profiles in the wire
+  benchmark; and
+- producer linger of 0, 1, 5, 20, and 50 ms plus matching consumer fetch-size
+  sweeps in the protocol benchmark.
+
+Record payload rate, message rate, batch rate, CPU, disk bandwidth/IOPS, and
+network traffic separately. Before interpreting a ceiling, record NVMe
+sequential throughput and fsync latency, NIC speed, filesystem/mount options,
+CPU governor, TLS/SASL state, and whether reads are served by page cache. A
+same-process or same-host RF3 run measures code-path overhead only and must not
+be described as fault-tolerant replication.
+
 The local harness is useful for regression detection. Comparative Kafka,
 Redpanda, AutoMQ, WarpStream, and other market results require the hardware,
 durability, warmup, duration, client, filesystem, network, and failure

@@ -15,7 +15,6 @@ use shard_stream_core::{
 use shard_stream_protocol::{
     Durability, FetchMode, NativeFetchBatch, ProducerIdentity, WireError, decode_fetch_batches,
 };
-use tokio::sync::Mutex;
 
 const DEFAULT_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024 + 4096;
 
@@ -119,7 +118,7 @@ impl Client {
             producer_id,
             epoch,
             leader_epoch: None,
-            next_sequence: Arc::new(Mutex::new(0)),
+            next_sequence: 0,
         }
     }
 
@@ -151,7 +150,7 @@ pub struct Producer {
     producer_id: u128,
     epoch: u32,
     leader_epoch: Option<u64>,
-    next_sequence: Arc<Mutex<u64>>,
+    next_sequence: u64,
 }
 
 impl Producer {
@@ -162,7 +161,7 @@ impl Producer {
     }
 
     pub async fn append(
-        &self,
+        &mut self,
         payload: impl Into<Vec<u8>>,
         record_count: u32,
         durability: Durability,
@@ -173,9 +172,9 @@ impl Producer {
             ));
         }
         let payload = payload.into();
-        let mut sequence = self.next_sequence.lock().await;
-        let first_sequence = *sequence;
-        let next_sequence = sequence
+        let first_sequence = self.next_sequence;
+        let next_sequence = self
+            .next_sequence
             .checked_add(u64::from(record_count))
             .ok_or_else(|| ClientError::InvalidConfig("producer sequence exhausted".into()))?;
         let request_id = self.client.next_request_id();
@@ -215,7 +214,7 @@ impl Producer {
                     .json::<AppendResponseBody>()
                     .await
                     .map_err(ClientError::Transport)?;
-                *sequence = next_sequence;
+                self.next_sequence = next_sequence;
                 return response.try_into();
             }
             if !matches!(
@@ -244,7 +243,7 @@ impl Producer {
             ));
         }
         self.epoch = epoch;
-        *self.next_sequence.lock().await = 0;
+        self.next_sequence = 0;
         Ok(())
     }
 
