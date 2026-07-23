@@ -93,10 +93,18 @@ pub struct BlossomLeaseCertificate {
 }
 
 pub trait BlossomLeaseConsensus: Send + Sync {
+    /// Return the latest lease after verifying the trusted Blossom epoch chain
+    /// and exact validator generation. Returning stale state is an error.
+    fn latest_lease(
+        &self,
+        group_id: [u8; 32],
+        deadline: Duration,
+    ) -> ControlResult<Option<FinalizedLease>>;
+
     fn commit_lease(
         &self,
         group_id: [u8; 32],
-        claim_payload: &[u8],
+        claim: &LeaseClaim,
         deadline: Duration,
     ) -> ControlResult<BlossomLeaseCertificate>;
 }
@@ -200,6 +208,7 @@ impl LeaseCoordinator {
             ));
         }
 
+        self.refresh(topic_partition)?;
         let previous = lock(&self.leases).get(&topic_partition).cloned();
         validate_epoch_transition(previous.as_ref(), self.config.node_id, leader_epoch)?;
         let previous_epoch_hash = previous
@@ -215,7 +224,7 @@ impl LeaseCoordinator {
         };
         let certificate = self.consensus.commit_lease(
             claim.group_id(),
-            &claim.canonical_bytes(),
+            &claim,
             self.config.consensus_deadline,
         )?;
         validate_certificate(&claim, previous.as_ref(), &certificate)?;
@@ -238,6 +247,57 @@ impl LeaseCoordinator {
     #[must_use]
     pub fn lease(&self, topic_partition: TopicPartition) -> Option<FinalizedLease> {
         lock(&self.leases).get(&topic_partition).cloned()
+    }
+
+    /// Refresh a partition fence from the latest fully verified Blossom state.
+    ///
+    /// HA deployments call this from the lease-renewal/control loop so a
+    /// former leader learns a newer fencing token before its local lease
+    /// expires. Data replicas must independently reject lower epochs.
+    pub fn refresh(
+        &self,
+        topic_partition: TopicPartition,
+    ) -> ControlResult<Option<FinalizedLease>> {
+        let group_id = lease_group_id(self.config.cluster_id, topic_partition);
+        let observed = self
+            .consensus
+            .latest_lease(group_id, self.config.consensus_deadline)?;
+        let Some(observed) = observed else {
+            return Ok(lock(&self.leases).get(&topic_partition).cloned());
+        };
+        if observed.claim.cluster_id != self.config.cluster_id
+            || observed.claim.topic_partition != topic_partition
+            || observed.certificate.group_id != group_id
+        {
+            return Err(ControlError::InvalidCertificate(
+                "latest Blossom lease belongs to a different group".into(),
+            ));
+        }
+        validate_certificate_shape(&observed.claim, &observed.certificate)?;
+
+        let mut leases = lock(&self.leases);
+        if let Some(current) = leases.get(&topic_partition) {
+            if observed.certificate.epoch_nonce < current.certificate.epoch_nonce {
+                return Err(ControlError::InvalidCertificate(
+                    "Blossom adapter returned stale lease state".into(),
+                ));
+            }
+            if observed.certificate.epoch_nonce == current.certificate.epoch_nonce {
+                if &observed != current {
+                    return Err(ControlError::InvalidCertificate(
+                        "same Blossom epoch resolved to different lease state".into(),
+                    ));
+                }
+                return Ok(Some(current.clone()));
+            }
+        } else if leases.len() >= self.config.max_leases {
+            return Err(ControlError::LeaseLimitReached);
+        }
+        let mut next = leases.clone();
+        next.insert(topic_partition, observed.clone());
+        persist_state(&self.config, &next)?;
+        *leases = next;
+        Ok(Some(observed))
     }
 }
 
@@ -288,16 +348,7 @@ fn validate_certificate(
     previous: Option<&FinalizedLease>,
     certificate: &BlossomLeaseCertificate,
 ) -> ControlResult<()> {
-    if certificate.group_id != claim.group_id()
-        || certificate.claim_digest != claim.digest()
-        || certificate.epoch_nonce == 0
-        || certificate.epoch_hash == [0; 32]
-        || certificate.validator_generation == 0
-    {
-        return Err(ControlError::InvalidCertificate(
-            "certificate does not finalize the exact lease claim".into(),
-        ));
-    }
+    validate_certificate_shape(claim, certificate)?;
     if let Some(previous) = previous {
         if claim.previous_epoch_hash != previous.certificate.epoch_hash
             || certificate.epoch_nonce <= previous.certificate.epoch_nonce
@@ -309,6 +360,23 @@ fn validate_certificate(
     } else if claim.previous_epoch_hash != [0; 32] {
         return Err(ControlError::InvalidCertificate(
             "first lease has a nonzero predecessor".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_certificate_shape(
+    claim: &LeaseClaim,
+    certificate: &BlossomLeaseCertificate,
+) -> ControlResult<()> {
+    if certificate.group_id != claim.group_id()
+        || certificate.claim_digest != claim.digest()
+        || certificate.epoch_nonce == 0
+        || certificate.epoch_hash == [0; 32]
+        || certificate.validator_generation == 0
+    {
+        return Err(ControlError::InvalidCertificate(
+            "certificate does not finalize the exact lease claim".into(),
         ));
     }
     Ok(())
@@ -417,20 +485,7 @@ fn load_state(
     let mut leases = BTreeMap::new();
     for _ in 0..count {
         let lease = decode_lease(&mut decoder, config.cluster_id)?;
-        validate_certificate(&lease.claim, None, &lease.certificate).or_else(|error| {
-            // On disk, a nonzero predecessor is expected after the first term.
-            if lease.claim.previous_epoch_hash != [0; 32]
-                && lease.certificate.group_id == lease.claim.group_id()
-                && lease.certificate.claim_digest == lease.claim.digest()
-                && lease.certificate.epoch_nonce > 0
-                && lease.certificate.epoch_hash != [0; 32]
-                && lease.certificate.validator_generation > 0
-            {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        })?;
+        validate_certificate_shape(&lease.claim, &lease.certificate)?;
         if leases.insert(lease.claim.topic_partition, lease).is_some() {
             return Err(ControlError::State(
                 "lease state contains a duplicate partition".into(),
@@ -657,35 +712,62 @@ mod tests {
 
     struct TestConsensus {
         next_nonce: AtomicU64,
+        leases: Mutex<BTreeMap<[u8; 32], FinalizedLease>>,
     }
 
     impl TestConsensus {
         fn new() -> Self {
             Self {
                 next_nonce: AtomicU64::new(1),
+                leases: Mutex::new(BTreeMap::new()),
             }
         }
     }
 
     impl BlossomLeaseConsensus for TestConsensus {
+        fn latest_lease(
+            &self,
+            group_id: [u8; 32],
+            _deadline: Duration,
+        ) -> ControlResult<Option<FinalizedLease>> {
+            Ok(lock(&self.leases).get(&group_id).cloned())
+        }
+
         fn commit_lease(
             &self,
             group_id: [u8; 32],
-            claim_payload: &[u8],
+            claim: &LeaseClaim,
             _deadline: Duration,
         ) -> ControlResult<BlossomLeaseCertificate> {
+            let previous = lock(&self.leases).get(&group_id).cloned();
+            let expected_previous = previous
+                .as_ref()
+                .map_or([0; 32], |lease| lease.certificate.epoch_hash);
+            if claim.previous_epoch_hash != expected_previous {
+                return Err(ControlError::Consensus(
+                    "claim does not extend the finalized lease".into(),
+                ));
+            }
             let nonce = self.next_nonce.fetch_add(1, Ordering::SeqCst);
             let mut epoch = blake3::Hasher::new();
             epoch.update(b"shard-stream.test-finalized-epoch.v1");
             epoch.update(&nonce.to_le_bytes());
-            epoch.update(claim_payload);
-            Ok(BlossomLeaseCertificate {
+            epoch.update(&claim.canonical_bytes());
+            let certificate = BlossomLeaseCertificate {
                 group_id,
                 epoch_nonce: nonce,
                 epoch_hash: *epoch.finalize().as_bytes(),
-                claim_digest: *blake3::hash(claim_payload).as_bytes(),
+                claim_digest: claim.digest(),
                 validator_generation: 1,
-            })
+            };
+            lock(&self.leases).insert(
+                group_id,
+                FinalizedLease {
+                    claim: claim.clone(),
+                    certificate: certificate.clone(),
+                },
+            );
+            Ok(certificate)
         }
     }
 
@@ -779,6 +861,32 @@ mod tests {
         assert!(matches!(
             coordinator.acquire_or_renew(partition(), 1, future_expiry()),
             Err(ControlError::InvalidClaim(_))
+        ));
+    }
+
+    #[test]
+    fn a_new_node_imports_latest_finality_and_fences_the_old_node() {
+        let first_state = TempState::new();
+        let second_state = TempState::new();
+        let consensus: Arc<dyn BlossomLeaseConsensus> = Arc::new(TestConsensus::new());
+        let first = LeaseCoordinator::open(config(first_state.0.clone()), Arc::clone(&consensus))
+            .expect("first coordinator");
+        first
+            .acquire_or_renew(partition(), 1, future_expiry())
+            .expect("first lease");
+
+        let mut second_config = config(second_state.0.clone());
+        second_config.node_id = NodeId(10);
+        let second = LeaseCoordinator::open(second_config, Arc::clone(&consensus)).expect("second");
+        second
+            .acquire_or_renew(partition(), 2, future_expiry())
+            .expect("transferred lease");
+        second.check_write(partition(), 2).expect("new leader");
+
+        first.refresh(partition()).expect("refresh old leader");
+        assert!(matches!(
+            first.check_write(partition(), 1),
+            Err(ControlError::Fenced { .. })
         ));
     }
 

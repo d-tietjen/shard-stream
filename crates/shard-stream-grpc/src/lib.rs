@@ -287,6 +287,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires local TCP sockets, which are unavailable in some sandboxes"]
     async fn standard_grpc_clients_append_and_fetch() {
         let temp = TempDir::new();
         let engine = Arc::new(

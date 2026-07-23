@@ -9,7 +9,7 @@ implemented and tested by this repository.
 | API | Versions | Current behavior |
 | --- | ---: | --- |
 | Produce | 3–8 | `acks=0/1/-1`, record-batch validation, idempotent producer metadata, leader/quorum durability |
-| Fetch | 4–11 | Ordered reads with rewritten Kafka offsets and stream-engine watermarks |
+| Fetch | 4–6 | Ordered reads with rewritten Kafka offsets and stream-engine watermarks; fetch sessions are not advertised |
 | ListOffsets | 1–5 | Earliest (`-2`) and latest (`-1`) offsets |
 | Metadata | 0–8 | Single-broker metadata for named topics |
 | ApiVersions | 0–3 | Exact capability negotiation |

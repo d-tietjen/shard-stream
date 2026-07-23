@@ -42,12 +42,12 @@ protocol mock:
   and gRPC interoperability tests.
 
 This is still pre-production. Replica copies currently model the replication
-contract in one process and on one host; distributed replica transport,
-The concrete Blossom network/validator adapter, distributed replica transport,
-remote object-storage providers, Kafka consumer groups/transactions, and the
-broader Kafka administrative surface are not complete yet. The HTTP/3 adapter
-is experimental and disables TLS 0-RTT to prevent mutation replay. The server
-defaults to replication factor one so it never implies multi-node HA.
+contract in one process and on one host; the concrete Blossom
+network/validator adapter, distributed replica transport, remote object-storage
+providers, Kafka consumer groups/transactions, and the broader Kafka
+administrative surface are not complete yet. The HTTP/3 adapter is experimental
+and disables TLS 0-RTT to prevent mutation replay. The server defaults to
+replication factor one so it never implies multi-node HA.
 
 The on-disk format has no SHA compatibility mode: immutable content identity
 uses BLAKE3 exclusively. CRC32 frame checks remain a separate, non-identity
@@ -55,6 +55,8 @@ corruption-detection mechanism.
 
 The reviewed architecture and performance contract are in
 [`docs/SHARD_STREAM_PLAN.md`](docs/SHARD_STREAM_PLAN.md).
+The implemented lease/fencing boundary and remaining distributed-HA work are
+in [`docs/HA.md`](docs/HA.md).
 The executable benchmark and gate workflow is documented in
 [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md).
 
@@ -64,6 +66,8 @@ The executable benchmark and gate workflow is documented in
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+# Runs real local TCP/UDP interoperability tests for gRPC, Kafka, and HTTP/3.
+cargo test --workspace -- --ignored
 ```
 
 ## Run

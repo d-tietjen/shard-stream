@@ -582,6 +582,16 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::net::UdpSocket;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use h3_quinn::quinn::crypto::rustls::QuicClientConfig;
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
+    use rustls::RootCertStore;
+    use shard_stream_engine::{EngineConfig, TopicConfig};
+    use shard_stream_protocol::decode_fetch_batches;
+
     use super::*;
 
     #[test]
@@ -596,5 +606,146 @@ mod tests {
             parse_durability(query.get("durability").map(String::as_str)).expect("durability"),
             Durability::Quorum
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local UDP sockets, which are unavailable in some sandboxes"]
+    async fn http3_append_and_fetch_use_the_shared_engine_contract() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("shard-stream-h3-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&directory).expect("temp directory");
+        let CertifiedKey { cert, key_pair } =
+            generate_simple_self_signed(vec!["localhost".into()]).expect("certificate");
+        let certificate_path = directory.join("certificate.der");
+        let key_path = directory.join("key.der");
+        fs::write(&certificate_path, cert.der()).expect("certificate file");
+        fs::write(&key_path, key_pair.serialize_der()).expect("key file");
+
+        let engine = Arc::new(
+            StreamEngine::open(EngineConfig {
+                data_dir: directory.join("data"),
+                object_store_dir: None,
+                shard_count: 2,
+                replication_factor: 1,
+                min_in_sync_replicas: 1,
+                queue_slots_per_shard: 64,
+                queue_bytes_per_shard: 2 * 1024 * 1024,
+                target_pack_bytes: 1024 * 1024,
+                max_batch_bytes: 1024 * 1024,
+                max_fetch_bytes: 1024 * 1024,
+            })
+            .expect("engine"),
+        );
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(17),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("topic");
+
+        let reservation = UdpSocket::bind("127.0.0.1:0").expect("reserve UDP port");
+        let address = reservation.local_addr().expect("address");
+        drop(reservation);
+        let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+        let server_engine = Arc::clone(&engine);
+        let server = tokio::spawn(async move {
+            serve(
+                H3Config {
+                    listen: address,
+                    certificate_path,
+                    private_key_path: key_path,
+                    max_batch_bytes: 1024 * 1024,
+                    max_fetch_bytes: 1024 * 1024,
+                },
+                server_engine,
+                shutdown_receiver,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.der().clone()).expect("root certificate");
+        let mut tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![ALPN.into()];
+        let client_config =
+            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).expect("QUIC TLS")));
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("client address"))
+            .expect("client endpoint");
+        endpoint.set_default_client_config(client_config);
+        let connection = endpoint
+            .connect(address, "localhost")
+            .expect("connect start")
+            .await
+            .expect("QUIC connect");
+        let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection))
+            .await
+            .expect("HTTP/3 client");
+        let driver_task = tokio::spawn(async move { driver.wait_idle().await });
+
+        let append_uri = format!(
+            "https://localhost:{}/v1/topics/17/partitions/0/records?record_count=1&durability=leader",
+            address.port()
+        );
+        let request = Request::post(append_uri).body(()).expect("append request");
+        let mut append_stream = sender.send_request(request).await.expect("send append");
+        append_stream
+            .send_data(Bytes::from_static(b"http3"))
+            .await
+            .expect("append body");
+        append_stream.finish().await.expect("finish append");
+        let response = append_stream
+            .recv_response()
+            .await
+            .expect("append response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let append_body = receive_body(&mut append_stream).await;
+        let append_json: serde_json::Value =
+            serde_json::from_slice(&append_body).expect("append JSON");
+        assert_eq!(append_json["first_offset"], "0");
+
+        let fetch_uri = format!(
+            "https://localhost:{}/v1/topics/17/partitions/0/records?start_offset=0&max_bytes=1048576",
+            address.port()
+        );
+        let request = Request::get(fetch_uri).body(()).expect("fetch request");
+        let mut fetch_stream = sender.send_request(request).await.expect("send fetch");
+        fetch_stream.finish().await.expect("finish fetch");
+        let response = fetch_stream.recv_response().await.expect("fetch response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let fetch_body = receive_body(&mut fetch_stream).await;
+        let batches = decode_fetch_batches(&fetch_body, 1024 * 1024).expect("native batches");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].payload, b"http3");
+
+        drop(sender);
+        endpoint.close(quinn::VarInt::from_u32(0), b"test complete");
+        let _ = shutdown_sender.send(true);
+        server.await.expect("server join").expect("server");
+        driver_task.abort();
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    async fn receive_body<C>(stream: &mut h3::client::RequestStream<C, Bytes>) -> Vec<u8>
+    where
+        C: h3::quic::BidiStream<Bytes>,
+    {
+        let mut body = Vec::new();
+        while let Some(mut chunk) = stream.recv_data().await.expect("response body") {
+            while chunk.has_remaining() {
+                let bytes = chunk.chunk();
+                body.extend_from_slice(bytes);
+                let length = bytes.len();
+                chunk.advance(length);
+            }
+        }
+        body
     }
 }
