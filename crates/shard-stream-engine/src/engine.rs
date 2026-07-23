@@ -90,6 +90,10 @@ impl StreamEngine {
         let journal = ControlJournal::spawn(journal)?;
         let coordinators =
             CoordinatorPool::spawn(config.shard_count as usize, recovered_states, &journal)?;
+        let replica_progress = coordinators.router();
+        for shard in &shards {
+            shard.install_replica_progress(replica_progress.clone())?;
+        }
         let engine = Self {
             config,
             shards,
@@ -167,10 +171,16 @@ impl StreamEngine {
             } => (reservation, producer),
         };
 
+        let required_replicas = if request.durability == Durability::Quorum {
+            self.config.min_in_sync_replicas
+        } else {
+            1
+        };
         let append_result = self.shard(reservation.placement.shard_id)?.append(
             reservation,
             producer,
             request.payload,
+            required_replicas,
             request.durability == Durability::Object,
         );
         let response = append_response(request.request_id, reservation);
@@ -681,6 +691,7 @@ mod tests {
         let watermarks = engine.watermarks(topic_partition).expect("watermarks");
         assert_eq!(watermarks.contiguous_log_end, LogicalOffset::new(1));
         assert_eq!(watermarks.replicated_high_watermark, LogicalOffset::new(1));
+        engine.sync().expect("replica drain");
         for replica_index in 1..3 {
             let path = temp
                 .0
@@ -690,6 +701,28 @@ mod tests {
                 .join("pack-00000000000000000000.sse");
             assert!(path.exists(), "missing local replica pack {path:?}");
         }
+    }
+
+    #[test]
+    fn leader_ack_replication_progress_advances_after_replica_drain() {
+        let temp = TempDir::new("leader-replication-progress");
+        let engine = StreamEngine::open(config(&temp.0)).expect("open");
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("create");
+        engine
+            .append(append_request(1, b"replicate-in-background", None))
+            .expect("leader append");
+        engine.sync().expect("replica drain");
+
+        let topic_partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        let watermarks = engine.watermarks(topic_partition).expect("watermarks");
+        assert_eq!(watermarks.contiguous_log_end, LogicalOffset::new(1));
+        assert_eq!(watermarks.replicated_high_watermark, LogicalOffset::new(1));
     }
 
     #[test]

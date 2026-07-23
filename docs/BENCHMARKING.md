@@ -32,6 +32,17 @@ Run the standard shard-scaling matrix with:
 ./bench/run-bench-matrix.sh bench/results
 ```
 
+Run the bounded first-pass Linux shard and concurrency calibration with:
+
+```shell
+SHARD_STREAM_BENCH_BATCHES=4096 \
+  ./bench/run-linux-calibration.sh bench/results/linux-calibration
+```
+
+It records the exact commit and host environment beside per-case JSON and
+`/usr/bin/time -v` output. Increase `SHARD_STREAM_BENCH_REPETITIONS` to three
+for reportable results; the default single repetition is only a calibration.
+
 The first single-node Linux calibration must sweep:
 
 - 1, 2, 4, 8, and 16 shards at RF1/leader durability and RF3/minimum-ISR-2

@@ -32,6 +32,7 @@ struct BatchRuntime {
     reservation: Reservation,
     status: BatchStatus,
     durable_replicas: u32,
+    replica_acks: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -257,6 +258,11 @@ enum CoordinatorCommand {
         completion: CompleteAppend,
         response: SyncSender<EngineResult<()>>,
     },
+    ReplicaDurable {
+        topic_partition: TopicPartition,
+        reservation: Reservation,
+        replica_index: u32,
+    },
     Fail {
         topic_partition: TopicPartition,
         reservation: Reservation,
@@ -309,6 +315,23 @@ impl Drop for CoordinatorWorker {
 
 pub(crate) struct CoordinatorPool {
     workers: Vec<CoordinatorWorker>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CoordinatorRouter {
+    senders: Vec<SyncSender<CoordinatorCommand>>,
+}
+
+impl CoordinatorRouter {
+    pub(crate) fn replica_durable(&self, reservation: Reservation, replica_index: u32) {
+        let topic_partition = TopicPartition::new(reservation.topic_id, reservation.partition_id);
+        let index = coordinator_index(topic_partition, self.senders.len());
+        let _ = self.senders[index].send(CoordinatorCommand::ReplicaDurable {
+            topic_partition,
+            reservation,
+            replica_index,
+        });
+    }
 }
 
 impl CoordinatorPool {
@@ -366,6 +389,16 @@ impl CoordinatorPool {
             receive(receiver)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn router(&self) -> CoordinatorRouter {
+        CoordinatorRouter {
+            senders: self
+                .workers
+                .iter()
+                .filter_map(|worker| worker.sender.clone())
+                .collect(),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -557,6 +590,14 @@ fn run_coordinator(
                 let result = create_partition(&mut states, &journal, topic_partition, shards);
                 let _ = response.send(result);
             }
+            CoordinatorCommand::ReplicaDurable {
+                topic_partition,
+                reservation,
+                replica_index,
+            } => {
+                let _ = state_mut(&mut states, topic_partition)
+                    .and_then(|state| replica_durable(state, reservation, replica_index));
+            }
             CoordinatorCommand::Reserve {
                 topic_partition,
                 request_id,
@@ -745,6 +786,7 @@ fn reserve(
             reservation,
             status: BatchStatus::Pending,
             durable_replicas: 0,
+            replica_acks: 0,
         },
     );
     Ok(ReserveOutcome::Reserved {
@@ -754,7 +796,7 @@ fn reserve(
 }
 
 fn complete(state: &mut PartitionState, completion: CompleteAppend) -> EngineResult<()> {
-    mark_batch(
+    let durable_replicas = mark_batch(
         state,
         completion.reservation,
         BatchStatus::Committed,
@@ -771,11 +813,47 @@ fn complete(state: &mut PartitionState, completion: CompleteAppend) -> EngineRes
                 digest_algorithm: DIGEST_BLAKE3,
                 payload_digest: completion.payload_digest,
                 record_count: completion.reservation.record_count.get(),
-                durable_replicas: completion.durable_replicas,
+                durable_replicas,
                 object_durable: completion.object_durable,
                 response: completion.response,
             },
         );
+    }
+    Ok(())
+}
+
+fn replica_durable(
+    state: &mut PartitionState,
+    reservation: Reservation,
+    replica_index: u32,
+) -> EngineResult<()> {
+    if replica_index >= 64 {
+        return Err(EngineError::CorruptState(
+            "replica index exceeds progress bitmap".into(),
+        ));
+    }
+    let batch = state
+        .batches
+        .get_mut(&reservation.first_offset)
+        .ok_or_else(|| {
+            EngineError::CorruptState(format!(
+                "replica progress references missing batch {}",
+                reservation.batch_id
+            ))
+        })?;
+    if batch.reservation != reservation || batch.status == BatchStatus::Aborted {
+        return Err(EngineError::CorruptState(format!(
+            "invalid replica progress for batch {}",
+            reservation.batch_id
+        )));
+    }
+    batch.replica_acks |= 1u64 << replica_index;
+    batch.durable_replicas = batch.durable_replicas.max(batch.replica_acks.count_ones());
+    let durable_replicas = batch.durable_replicas;
+    for record in state.dedup.values_mut() {
+        if record.response.batch_id == reservation.batch_id {
+            record.durable_replicas = record.durable_replicas.max(durable_replicas);
+        }
     }
     Ok(())
 }
@@ -943,7 +1021,7 @@ fn mark_batch(
     reservation: Reservation,
     status: BatchStatus,
     durable_replicas: u32,
-) -> EngineResult<()> {
+) -> EngineResult<u32> {
     let batch = state
         .batches
         .get_mut(&reservation.first_offset)
@@ -960,8 +1038,17 @@ fn mark_batch(
         )));
     }
     batch.status = status;
-    batch.durable_replicas = durable_replicas;
-    Ok(())
+    if status == BatchStatus::Committed {
+        batch.replica_acks |= 1;
+        batch.durable_replicas = batch
+            .durable_replicas
+            .max(durable_replicas)
+            .max(batch.replica_acks.count_ones());
+    } else {
+        batch.durable_replicas = 0;
+        batch.replica_acks = 0;
+    }
+    Ok(batch.durable_replicas)
 }
 
 pub(crate) fn retention_hints(events: &[JournalEvent]) -> HashMap<TopicPartition, LogicalOffset> {
@@ -1104,6 +1191,7 @@ pub(crate) fn recover_partition_states(
                         reservation,
                         status: BatchStatus::Committed,
                         durable_replicas: config.replication_factor,
+                        replica_acks: replica_mask(config.replication_factor),
                     },
                 )
                 .is_some()
@@ -1267,11 +1355,20 @@ fn append_recovered_aborts(
                 reservation,
                 status: BatchStatus::Aborted,
                 durable_replicas: 0,
+                replica_acks: 0,
             },
         );
         offset = last_offset + 1;
     }
     Ok(())
+}
+
+const fn replica_mask(replication_factor: u32) -> u64 {
+    if replication_factor >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << replication_factor) - 1
+    }
 }
 
 fn restore_producer(

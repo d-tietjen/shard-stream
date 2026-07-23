@@ -32,6 +32,11 @@ impl EngineConfig {
                 "replication_factor must be nonzero".into(),
             ));
         }
+        if self.replication_factor > 64 {
+            return Err(EngineError::InvalidConfig(
+                "replication_factor cannot exceed 64".into(),
+            ));
+        }
         if self.min_in_sync_replicas == 0 || self.min_in_sync_replicas > self.replication_factor {
             return Err(EngineError::InvalidConfig(
                 "min_in_sync_replicas must be between one and replication_factor".into(),

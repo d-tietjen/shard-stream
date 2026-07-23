@@ -16,6 +16,7 @@ use shard_stream_storage::{
 };
 
 use crate::config::COMMAND_OVERHEAD_BYTES;
+use crate::coordinator::CoordinatorRouter;
 use crate::{EngineConfig, EngineError, EngineResult};
 
 const MAX_APPEND_GROUP: usize = 64;
@@ -46,6 +47,7 @@ struct AppendCommand {
     reservation: Reservation,
     producer: Option<ProducerSequence>,
     payload: Arc<[u8]>,
+    required_replicas: u32,
     object_durable: bool,
     response: SyncSender<StorageResult<AppendDurability>>,
 }
@@ -65,6 +67,10 @@ enum ShardCommand {
         topic_partition: TopicPartition,
         log_start: LogicalOffset,
         response: SyncSender<StorageResult<()>>,
+    },
+    InstallReplicaProgress {
+        router: CoordinatorRouter,
+        response: SyncSender<EngineResult<()>>,
     },
 }
 
@@ -151,6 +157,7 @@ impl ShardHandle {
         reservation: Reservation,
         producer: Option<ProducerSequence>,
         payload: Vec<u8>,
+        required_replicas: u32,
         object_durable: bool,
     ) -> Result<AppendDurability, AppendFailure> {
         let (response, receiver) = sync_channel(1);
@@ -168,6 +175,7 @@ impl ShardHandle {
                 reservation,
                 producer,
                 payload: Arc::from(payload),
+                required_replicas,
                 object_durable,
                 response,
             }),
@@ -233,6 +241,17 @@ impl ShardHandle {
             .recv()
             .map_err(|_| EngineError::WorkerStopped(self.shard_id))??;
         Ok(())
+    }
+
+    pub(crate) fn install_replica_progress(&self, router: CoordinatorRouter) -> EngineResult<()> {
+        let (response, receiver) = sync_channel(1);
+        self.try_send(
+            ShardCommand::InstallReplicaProgress { router, response },
+            COMMAND_OVERHEAD_BYTES,
+        )?;
+        receiver
+            .recv()
+            .map_err(|_| EngineError::WorkerStopped(self.shard_id))?
     }
 
     fn try_send(&self, command: ShardCommand, bytes: usize) -> EngineResult<()> {
@@ -328,6 +347,9 @@ fn run_worker(
             } => {
                 let _ = response.send(stores.garbage_collect(topic_partition, log_start));
             }
+            ShardCommand::InstallReplicaProgress { router, response } => {
+                let _ = response.send(stores.install_replica_progress(router));
+            }
         }
     }
 }
@@ -353,10 +375,15 @@ struct ReplicaAppend {
 enum ReplicaCommand {
     AppendGroup {
         appends: Vec<ReplicaAppend>,
-        response: SyncSender<StorageResult<()>>,
+        replica_index: u32,
+        response: SyncSender<(u32, StorageResult<()>)>,
     },
     Sync {
         response: SyncSender<StorageResult<()>>,
+    },
+    InstallProgress {
+        router: CoordinatorRouter,
+        response: SyncSender<()>,
     },
     GarbageCollect {
         topic_partition: TopicPartition,
@@ -379,11 +406,16 @@ impl ReplicaHandle {
                 "shard-stream-replica-{replica_index}-shard-{shard_id}"
             ))
             .spawn(move || {
+                let mut progress = None::<CoordinatorRouter>;
                 while let Ok(command) = receiver.recv() {
                     match command {
-                        ReplicaCommand::AppendGroup { appends, response } => {
+                        ReplicaCommand::AppendGroup {
+                            appends,
+                            replica_index,
+                            response,
+                        } => {
                             let result = (|| {
-                                for append in appends {
+                                for append in &appends {
                                     store.append(
                                         append.reservation,
                                         append.producer,
@@ -393,7 +425,18 @@ impl ReplicaHandle {
                                 }
                                 store.sync()
                             })();
-                            let _ = response.send(result);
+                            if result.is_ok()
+                                && let Some(progress) = &progress
+                            {
+                                for append in &appends {
+                                    progress.replica_durable(append.reservation, replica_index);
+                                }
+                            }
+                            let failed = result.is_err();
+                            let _ = response.send((replica_index, result));
+                            if failed {
+                                break;
+                            }
                         }
                         ReplicaCommand::Sync { response } => {
                             let _ = response.send(store.sync());
@@ -405,6 +448,10 @@ impl ReplicaHandle {
                         } => {
                             let starts = HashMap::from([(topic_partition, log_start)]);
                             let _ = response.send(store.garbage_collect(&starts).map(|_| ()));
+                        }
+                        ReplicaCommand::InstallProgress { router, response } => {
+                            progress = Some(router);
+                            let _ = response.send(());
                         }
                     }
                 }
@@ -422,10 +469,14 @@ impl ReplicaHandle {
     fn begin_append_group(
         &self,
         appends: Vec<ReplicaAppend>,
-    ) -> EngineResult<Receiver<StorageResult<()>>> {
-        let (response, receiver) = sync_channel(1);
-        self.send(ReplicaCommand::AppendGroup { appends, response })?;
-        Ok(receiver)
+        replica_index: u32,
+        response: SyncSender<(u32, StorageResult<()>)>,
+    ) -> EngineResult<()> {
+        self.send(ReplicaCommand::AppendGroup {
+            appends,
+            replica_index,
+            response,
+        })
     }
 
     fn begin_sync(&self) -> EngineResult<Receiver<StorageResult<()>>> {
@@ -446,6 +497,14 @@ impl ReplicaHandle {
             response,
         })?;
         Ok(receiver)
+    }
+
+    fn install_progress(&self, router: CoordinatorRouter) -> EngineResult<()> {
+        let (response, receiver) = sync_channel(1);
+        self.send(ReplicaCommand::InstallProgress { router, response })?;
+        receiver
+            .recv()
+            .map_err(|_| EngineError::WorkerStopped(self.shard_id))
     }
 
     fn send(&self, command: ReplicaCommand) -> EngineResult<()> {
@@ -479,6 +538,13 @@ pub(crate) struct AppendDurability {
 }
 
 impl LaneStores {
+    fn install_replica_progress(&self, router: CoordinatorRouter) -> EngineResult<()> {
+        for replica in self.replicas.iter().flatten() {
+            replica.install_progress(router.clone())?;
+        }
+        Ok(())
+    }
+
     fn append_group(&mut self, appends: &[AppendCommand]) -> Vec<StorageResult<AppendDurability>> {
         let mut outcomes = (0..appends.len())
             .map(|_| {
@@ -531,26 +597,57 @@ impl LaneStores {
                 payload: Arc::clone(&append.payload),
             })
             .collect::<Vec<_>>();
-        let mut replica_receivers = Vec::new();
-        for (index, replica) in self.replicas.iter().enumerate() {
-            let Some(replica) = replica else {
+        let (replica_response, replica_receiver) = sync_channel(self.replicas.len().max(1));
+        let mut submitted_replicas = 0usize;
+        for index in 0..self.replicas.len() {
+            let Some(replica) = self.replicas[index].as_ref() else {
                 continue;
             };
-            match replica.begin_append_group(replica_appends.clone()) {
-                Ok(receiver) => replica_receivers.push((index, Some(receiver))),
-                Err(_) => replica_receivers.push((index, None)),
+            let replica_index = u32::try_from(index)
+                .expect("replica vector fits u32")
+                .saturating_add(1);
+            if replica
+                .begin_append_group(
+                    replica_appends.clone(),
+                    replica_index,
+                    replica_response.clone(),
+                )
+                .is_ok()
+            {
+                submitted_replicas += 1;
+            } else {
+                self.replicas[index] = None;
             }
         }
-        for (index, receiver) in replica_receivers {
-            let replica_ok = receiver.is_some_and(|receiver| matches!(receiver.recv(), Ok(Ok(()))));
-            if replica_ok {
+        drop(replica_response);
+
+        let required_replicas = appends
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| primary_written[*index])
+            .map(|(_, append)| append.required_replicas)
+            .max()
+            .unwrap_or(1);
+        let required_followers = required_replicas.saturating_sub(1);
+        let mut durable_followers = 0u32;
+        let mut completed_replicas = 0usize;
+        while durable_followers < required_followers && completed_replicas < submitted_replicas {
+            let Ok((replica_index, result)) = replica_receiver.recv() else {
+                break;
+            };
+            completed_replicas += 1;
+            if result.is_ok() {
+                durable_followers = durable_followers.saturating_add(1);
                 for (batch_index, written) in primary_written.iter().enumerate() {
                     if *written && let Ok(durability) = &mut outcomes[batch_index] {
                         durability.durable_replicas = durability.durable_replicas.saturating_add(1);
                     }
                 }
             } else {
-                self.replicas[index] = None;
+                let index = replica_index.saturating_sub(1) as usize;
+                if index < self.replicas.len() {
+                    self.replicas[index] = None;
+                }
             }
         }
 

@@ -286,8 +286,12 @@ The append path is:
 5. The single lane owner drains a bounded group, appends each self-describing
    extent once, and performs one shard-local fsync for the group.
 6. Persistent replica workers copy the same reference-counted payload and
-   flush followers concurrently. No payload or completion waits for a global
-   journal order.
+   flush followers concurrently. Leader durability replies after the lane
+   fsync; quorum durability replies after the configured number of distinct
+   replica fsyncs, without waiting for surplus followers. Later follower
+   completions update replicated watermarks through partition-routed MPSC
+   progress messages. No payload or completion waits for a global journal
+   order.
 7. Completion returns to the partition owner, advances any contiguous watermarks,
    updates derived in-memory directories, and resolves the producer reply when
    its requested durability has been met.
