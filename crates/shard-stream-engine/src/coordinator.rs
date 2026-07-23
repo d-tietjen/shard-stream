@@ -396,7 +396,13 @@ impl CoordinatorPool {
             senders: self
                 .workers
                 .iter()
-                .filter_map(|worker| worker.sender.clone())
+                .map(|worker| {
+                    worker
+                        .sender
+                        .as_ref()
+                        .expect("coordinator pool is active")
+                        .clone()
+                })
                 .collect(),
         }
     }
