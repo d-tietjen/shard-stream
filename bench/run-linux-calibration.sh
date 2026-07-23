@@ -15,11 +15,17 @@ mkdir -p "${results_dir}"
   cargo --version
   rustc --version
   git rev-parse HEAD
-  command -v lscpu >/dev/null && lscpu
-  command -v lsblk >/dev/null && lsblk -o NAME,TYPE,SIZE,ROTA,MODEL,FSTYPE,MOUNTPOINTS
+  if command -v lscpu >/dev/null; then
+    lscpu
+  fi
+  if command -v lsblk >/dev/null; then
+    lsblk -o NAME,TYPE,SIZE,ROTA,MODEL,FSTYPE,MOUNTPOINTS
+  fi
   df -h .
   mount
-  command -v ip >/dev/null && ip -brief link
+  if command -v ip >/dev/null; then
+    ip -brief link
+  fi
 } > "${results_dir}/environment.txt"
 
 run_case() {
