@@ -4,13 +4,14 @@ use std::num::NonZeroU32;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 
+use ordered_segment_map::DenseOrderedMap;
 use shard_stream_core::{
     BatchId, LogicalOffset, LogicalPartitionId, Placement, PlacementSequence, Reservation,
     RingEpoch, SequencerState, ShardId, TopicId, TopicPartition, TopicSequencer,
 };
-use shard_stream_protocol::{AppendResponse, Durability, FetchMode, ProducerIdentity};
+use shard_stream_protocol::{AppendResponse, Durability, ProducerIdentity};
 use shard_stream_storage::{
-    CoordinatorJournal, DIGEST_BLAKE3, ExtentCatalogEntry, JournalEvent, ProducerSequence,
+    CoordinatorJournal, DIGEST_XXH3_128, ExtentCatalogEntry, JournalEvent, ProducerSequence,
     StorageError,
 };
 
@@ -45,7 +46,7 @@ struct ProducerCursor {
 #[derive(Debug, Clone, Copy)]
 struct DedupRecord {
     digest_algorithm: u8,
-    payload_digest: [u8; 32],
+    payload_digest: [u8; 16],
     record_count: u32,
     durable_replicas: u32,
     object_durable: bool,
@@ -53,78 +54,219 @@ struct DedupRecord {
 }
 
 #[derive(Debug)]
+pub(crate) struct CommittedBatchSet {
+    first_batch_id: u128,
+    len: usize,
+    words: Vec<u64>,
+}
+
+impl CommittedBatchSet {
+    fn new(first_batch_id: u128, len: usize) -> Self {
+        Self {
+            first_batch_id,
+            len,
+            words: vec![0; len.div_ceil(u64::BITS as usize)],
+        }
+    }
+
+    fn insert(&mut self, batch_id: BatchId) {
+        let Some(relative) = batch_id.get().checked_sub(self.first_batch_id) else {
+            return;
+        };
+        let Ok(relative) = usize::try_from(relative) else {
+            return;
+        };
+        if relative >= self.len {
+            return;
+        }
+        self.words[relative / u64::BITS as usize] |= 1u64 << (relative % u64::BITS as usize);
+    }
+
+    pub(crate) fn contains(&self, batch_id: BatchId) -> bool {
+        let Some(relative) = batch_id.get().checked_sub(self.first_batch_id) else {
+            return false;
+        };
+        let Ok(relative) = usize::try_from(relative) else {
+            return false;
+        };
+        relative < self.len
+            && self.words[relative / u64::BITS as usize] & (1u64 << (relative % u64::BITS as usize))
+                != 0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FetchBounds {
+    pub(crate) ordered_end: LogicalOffset,
+}
+
+#[derive(Debug)]
 pub(crate) struct PartitionState {
     sequencer: TopicSequencer,
     log_start: LogicalOffset,
-    batches: BTreeMap<LogicalOffset, BatchRuntime>,
+    batches: DenseOrderedMap<BatchRuntime>,
+    min_in_sync_replicas: u32,
+    next_contiguous_batch: u128,
+    contiguous_log_end: LogicalOffset,
+    next_replicated_batch: u128,
+    replicated_high_watermark: LogicalOffset,
     producers: HashMap<u128, ProducerCursor>,
     dedup: HashMap<(u128, u32, u64), DedupRecord>,
 }
 
 impl PartitionState {
-    fn empty(sequencer: TopicSequencer) -> Self {
+    fn empty(sequencer: TopicSequencer, min_in_sync_replicas: u32) -> Self {
         Self {
             sequencer,
             log_start: LogicalOffset::new(0),
-            batches: BTreeMap::new(),
+            batches: DenseOrderedMap::new(0),
+            min_in_sync_replicas,
+            next_contiguous_batch: 0,
+            contiguous_log_end: LogicalOffset::new(0),
+            next_replicated_batch: 0,
+            replicated_high_watermark: LogicalOffset::new(0),
             producers: HashMap::new(),
             dedup: HashMap::new(),
         }
     }
 
     fn watermarks(&self, min_in_sync_replicas: u32) -> PartitionWatermarks {
-        let mut contiguous_end = 0u128;
-        for (first_offset, batch) in &self.batches {
-            if first_offset.get() != contiguous_end || batch.status == BatchStatus::Pending {
-                break;
-            }
-            contiguous_end = batch
-                .reservation
-                .last_offset
-                .get()
-                .checked_add(1)
-                .expect("sequencer never allocates an unrepresentable end offset");
-        }
-        let mut replicated_end = 0u128;
-        for (first_offset, batch) in &self.batches {
-            if first_offset.get() != replicated_end || batch.status == BatchStatus::Pending {
-                break;
-            }
-            if batch.status == BatchStatus::Committed
-                && batch.durable_replicas < min_in_sync_replicas
-            {
-                break;
-            }
-            replicated_end = batch
-                .reservation
-                .last_offset
-                .get()
-                .checked_add(1)
-                .expect("sequencer never allocates an unrepresentable end offset");
-        }
-        let contiguous = LogicalOffset::new(contiguous_end);
+        let replicated_high_watermark = if min_in_sync_replicas == self.min_in_sync_replicas {
+            self.replicated_high_watermark
+        } else {
+            self.compute_replicated_high_watermark(min_in_sync_replicas)
+        };
         PartitionWatermarks {
             log_start: self.log_start,
             allocated_end: self.sequencer.next_offset(),
-            contiguous_log_end: contiguous,
-            replicated_high_watermark: LogicalOffset::new(replicated_end),
-            last_stable_offset: contiguous,
+            contiguous_log_end: self.contiguous_log_end,
+            replicated_high_watermark,
+            last_stable_offset: self.contiguous_log_end,
         }
     }
 
-    fn committed_offsets(&self, mode: FetchMode) -> HashSet<BatchId> {
-        let ordered_end = self.watermarks(1).contiguous_log_end;
-        self.batches
-            .values()
-            .filter(|batch| {
-                batch.status == BatchStatus::Committed
-                    && batch.reservation.last_offset >= self.log_start
-                    && (mode == FetchMode::AsAvailable
-                        || batch.reservation.last_offset < ordered_end)
-            })
-            .map(|batch| batch.reservation.batch_id)
-            .collect()
+    fn fetch_bounds(&self, start_offset: LogicalOffset) -> EngineResult<FetchBounds> {
+        if start_offset < self.log_start {
+            return Err(EngineError::OffsetOutOfRange {
+                requested: start_offset,
+                log_start: self.log_start,
+            });
+        }
+        Ok(FetchBounds {
+            ordered_end: self.contiguous_log_end,
+        })
     }
+
+    fn committed_candidates(&self, candidates: &[BatchId]) -> EngineResult<CommittedBatchSet> {
+        let Some(first) = candidates.iter().map(|batch_id| batch_id.get()).min() else {
+            return Ok(CommittedBatchSet::new(0, 0));
+        };
+        let last = candidates
+            .iter()
+            .map(|batch_id| batch_id.get())
+            .max()
+            .expect("nonempty candidates have a maximum");
+        let len = last
+            .checked_sub(first)
+            .and_then(|span| span.checked_add(1))
+            .and_then(|span| usize::try_from(span).ok())
+            .ok_or_else(|| {
+                EngineError::InvalidConfig("fetch candidate window exceeds usize".into())
+            })?;
+        let mut committed = CommittedBatchSet::new(first, len);
+        for batch_id in candidates {
+            if self
+                .batches
+                .get(batch_id.get())
+                .is_some_and(|batch| batch.status == BatchStatus::Committed)
+            {
+                committed.insert(*batch_id);
+            }
+        }
+        Ok(committed)
+    }
+
+    fn advance_cached_watermarks(&mut self) {
+        while let Some(batch) = self.batches.get(self.next_contiguous_batch) {
+            if batch.reservation.first_offset != self.contiguous_log_end
+                || batch.status == BatchStatus::Pending
+            {
+                break;
+            }
+            self.contiguous_log_end = next_offset(batch.reservation);
+            self.next_contiguous_batch = self
+                .next_contiguous_batch
+                .checked_add(1)
+                .expect("sequencer never exhausts the batch ID space");
+        }
+
+        while let Some(batch) = self.batches.get(self.next_replicated_batch) {
+            if batch.reservation.first_offset != self.replicated_high_watermark
+                || batch.status == BatchStatus::Pending
+                || (batch.status == BatchStatus::Committed
+                    && batch.durable_replicas < self.min_in_sync_replicas)
+            {
+                break;
+            }
+            self.replicated_high_watermark = next_offset(batch.reservation);
+            self.next_replicated_batch = self
+                .next_replicated_batch
+                .checked_add(1)
+                .expect("sequencer never exhausts the batch ID space");
+        }
+    }
+
+    fn reset_cached_watermarks_after_truncate(&mut self) {
+        self.next_contiguous_batch = self.batches.first_key();
+        self.contiguous_log_end = self.log_start;
+        self.next_replicated_batch = self.batches.first_key();
+        self.replicated_high_watermark = self.log_start;
+        self.advance_cached_watermarks();
+    }
+
+    fn compute_replicated_high_watermark(&self, min_in_sync_replicas: u32) -> LogicalOffset {
+        let first_visible = self.first_batch_with_last_at_or_after(self.log_start);
+        let mut replicated_end = self.log_start;
+        for batch in self.batches.values_from(first_visible) {
+            if batch.reservation.first_offset != replicated_end
+                || batch.status == BatchStatus::Pending
+                || (batch.status == BatchStatus::Committed
+                    && batch.durable_replicas < min_in_sync_replicas)
+            {
+                break;
+            }
+            replicated_end = next_offset(batch.reservation);
+        }
+        replicated_end
+    }
+
+    fn first_batch_with_last_at_or_after(&self, offset: LogicalOffset) -> u128 {
+        self.batches
+            .binary_search_by(|_, batch| {
+                if batch.reservation.last_offset < offset {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            })
+            .unwrap_or_else(|key| key)
+    }
+
+    fn batch_key_at_first_offset(&self, offset: LogicalOffset) -> Option<u128> {
+        self.batches
+            .binary_search_by(|_, batch| batch.reservation.first_offset.cmp(&offset))
+            .ok()
+    }
+}
+
+fn next_offset(reservation: Reservation) -> LogicalOffset {
+    LogicalOffset::new(
+        reservation
+            .last_offset
+            .get()
+            .checked_add(1)
+            .expect("sequencer never allocates an unrepresentable end offset"),
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -140,7 +282,7 @@ pub(crate) enum ReserveOutcome {
 pub(crate) struct CompleteAppend {
     pub reservation: Reservation,
     pub producer: Option<ProducerIdentity>,
-    pub payload_digest: [u8; 32],
+    pub payload_digest: [u8; 16],
     pub durable_replicas: u32,
     pub object_durable: bool,
     pub response: AppendResponse,
@@ -241,6 +383,7 @@ enum CoordinatorCommand {
     Create {
         topic_partition: TopicPartition,
         shards: Vec<ShardId>,
+        min_in_sync_replicas: u32,
         response: SyncSender<EngineResult<()>>,
     },
     Reserve {
@@ -248,7 +391,7 @@ enum CoordinatorCommand {
         request_id: u128,
         producer: Option<ProducerIdentity>,
         record_count: NonZeroU32,
-        payload_digest: [u8; 32],
+        payload_digest: [u8; 16],
         durability: Durability,
         min_in_sync_replicas: u32,
         response: SyncSender<EngineResult<ReserveOutcome>>,
@@ -273,8 +416,12 @@ enum CoordinatorCommand {
     FetchSnapshot {
         topic_partition: TopicPartition,
         start_offset: LogicalOffset,
-        mode: FetchMode,
-        response: SyncSender<EngineResult<HashSet<BatchId>>>,
+        response: SyncSender<EngineResult<FetchBounds>>,
+    },
+    CommittedCandidates {
+        topic_partition: TopicPartition,
+        candidates: Vec<BatchId>,
+        response: SyncSender<EngineResult<CommittedBatchSet>>,
     },
     Watermarks {
         topic_partition: TopicPartition,
@@ -373,6 +520,7 @@ impl CoordinatorPool {
         &self,
         topic: TopicConfig,
         shards: Vec<ShardId>,
+        min_in_sync_replicas: u32,
     ) -> EngineResult<()> {
         for partition_id in 0..topic.partitions {
             let topic_partition =
@@ -383,6 +531,7 @@ impl CoordinatorPool {
                 CoordinatorCommand::Create {
                     topic_partition,
                     shards: shards.clone(),
+                    min_in_sync_replicas,
                     response,
                 },
             )?;
@@ -414,7 +563,7 @@ impl CoordinatorPool {
         request_id: u128,
         producer: Option<ProducerIdentity>,
         record_count: NonZeroU32,
-        payload_digest: [u8; 32],
+        payload_digest: [u8; 16],
         durability: Durability,
         min_in_sync_replicas: u32,
     ) -> EngineResult<ReserveOutcome> {
@@ -477,15 +626,30 @@ impl CoordinatorPool {
         &self,
         topic_partition: TopicPartition,
         start_offset: LogicalOffset,
-        mode: FetchMode,
-    ) -> EngineResult<HashSet<BatchId>> {
+    ) -> EngineResult<FetchBounds> {
         let (response, receiver) = sync_channel(1);
         self.send(
             topic_partition,
             CoordinatorCommand::FetchSnapshot {
                 topic_partition,
                 start_offset,
-                mode,
+                response,
+            },
+        )?;
+        receive(receiver)
+    }
+
+    pub(crate) fn committed_candidates(
+        &self,
+        topic_partition: TopicPartition,
+        candidates: Vec<BatchId>,
+    ) -> EngineResult<CommittedBatchSet> {
+        let (response, receiver) = sync_channel(1);
+        self.send(
+            topic_partition,
+            CoordinatorCommand::CommittedCandidates {
+                topic_partition,
+                candidates,
                 response,
             },
         )?;
@@ -591,9 +755,16 @@ fn run_coordinator(
             CoordinatorCommand::Create {
                 topic_partition,
                 shards,
+                min_in_sync_replicas,
                 response,
             } => {
-                let result = create_partition(&mut states, &journal, topic_partition, shards);
+                let result = create_partition(
+                    &mut states,
+                    &journal,
+                    topic_partition,
+                    shards,
+                    min_in_sync_replicas,
+                );
                 let _ = response.send(result);
             }
             CoordinatorCommand::ReplicaDurable {
@@ -650,18 +821,19 @@ fn run_coordinator(
             CoordinatorCommand::FetchSnapshot {
                 topic_partition,
                 start_offset,
-                mode,
                 response,
             } => {
-                let result = state(&states, topic_partition).and_then(|state| {
-                    if start_offset < state.log_start {
-                        return Err(EngineError::OffsetOutOfRange {
-                            requested: start_offset,
-                            log_start: state.log_start,
-                        });
-                    }
-                    Ok(state.committed_offsets(mode))
-                });
+                let result = state(&states, topic_partition)
+                    .and_then(|state| state.fetch_bounds(start_offset));
+                let _ = response.send(result);
+            }
+            CoordinatorCommand::CommittedCandidates {
+                topic_partition,
+                candidates,
+                response,
+            } => {
+                let result = state(&states, topic_partition)
+                    .and_then(|state| state.committed_candidates(&candidates));
                 let _ = response.send(result);
             }
             CoordinatorCommand::Watermarks {
@@ -726,6 +898,7 @@ fn create_partition(
     journal: &ControlJournalHandle,
     topic_partition: TopicPartition,
     shards: Vec<ShardId>,
+    min_in_sync_replicas: u32,
 ) -> EngineResult<()> {
     if let Some(existing) = states.get(&topic_partition) {
         let existing = existing.sequencer.state();
@@ -745,7 +918,10 @@ fn create_partition(
         ring_epoch: RingEpoch::new(1),
         shards,
     })?;
-    states.insert(topic_partition, PartitionState::empty(sequencer));
+    states.insert(
+        topic_partition,
+        PartitionState::empty(sequencer, min_in_sync_replicas),
+    );
     Ok(())
 }
 
@@ -755,7 +931,7 @@ fn reserve(
     request_id: u128,
     producer: Option<ProducerIdentity>,
     record_count: NonZeroU32,
-    payload_digest: [u8; 32],
+    payload_digest: [u8; 16],
     durability: Durability,
     min_in_sync_replicas: u32,
 ) -> EngineResult<ReserveOutcome> {
@@ -783,18 +959,18 @@ fn reserve(
         producer_id: identity.producer_id,
         epoch: identity.epoch,
         first_sequence: identity.first_sequence,
-        digest_algorithm: DIGEST_BLAKE3,
+        digest_algorithm: DIGEST_XXH3_128,
         payload_digest,
     });
-    state.batches.insert(
-        reservation.first_offset,
+    append_batch_runtime(
+        state,
         BatchRuntime {
             reservation,
             status: BatchStatus::Pending,
             durable_replicas: 0,
             replica_acks: 0,
         },
-    );
+    )?;
     Ok(ReserveOutcome::Reserved {
         reservation,
         producer,
@@ -816,7 +992,7 @@ fn complete(state: &mut PartitionState, completion: CompleteAppend) -> EngineRes
                 producer.first_sequence,
             ),
             DedupRecord {
-                digest_algorithm: DIGEST_BLAKE3,
+                digest_algorithm: DIGEST_XXH3_128,
                 payload_digest: completion.payload_digest,
                 record_count: completion.reservation.record_count.get(),
                 durable_replicas,
@@ -838,24 +1014,27 @@ fn replica_durable(
             "replica index exceeds progress bitmap".into(),
         ));
     }
-    let batch = state
-        .batches
-        .get_mut(&reservation.first_offset)
-        .ok_or_else(|| {
-            EngineError::CorruptState(format!(
-                "replica progress references missing batch {}",
+    let durable_replicas = {
+        let batch = state
+            .batches
+            .get_mut(reservation.batch_id.get())
+            .ok_or_else(|| {
+                EngineError::CorruptState(format!(
+                    "replica progress references missing batch {}",
+                    reservation.batch_id
+                ))
+            })?;
+        if batch.reservation != reservation || batch.status == BatchStatus::Aborted {
+            return Err(EngineError::CorruptState(format!(
+                "invalid replica progress for batch {}",
                 reservation.batch_id
-            ))
-        })?;
-    if batch.reservation != reservation || batch.status == BatchStatus::Aborted {
-        return Err(EngineError::CorruptState(format!(
-            "invalid replica progress for batch {}",
-            reservation.batch_id
-        )));
-    }
-    batch.replica_acks |= 1u64 << replica_index;
-    batch.durable_replicas = batch.durable_replicas.max(batch.replica_acks.count_ones());
-    let durable_replicas = batch.durable_replicas;
+            )));
+        }
+        batch.replica_acks |= 1u64 << replica_index;
+        batch.durable_replicas = batch.durable_replicas.max(batch.replica_acks.count_ones());
+        batch.durable_replicas
+    };
+    state.advance_cached_watermarks();
     for record in state.dedup.values_mut() {
         if record.response.batch_id == reservation.batch_id {
             record.durable_replicas = record.durable_replicas.max(durable_replicas);
@@ -901,14 +1080,13 @@ fn truncate(
             watermarks.contiguous_log_end
         )));
     }
-    if log_start != watermarks.contiguous_log_end
-        && log_start.get() != 0
-        && !state.batches.contains_key(&log_start)
-    {
-        return Err(EngineError::InvalidConfig(
-            "log start must align to a batch boundary".into(),
-        ));
-    }
+    let first_retained = if log_start == watermarks.contiguous_log_end {
+        state.batches.next_key()
+    } else {
+        state.batch_key_at_first_offset(log_start).ok_or_else(|| {
+            EngineError::InvalidConfig("log start must align to a batch boundary".into())
+        })?
+    };
     if log_start == state.log_start {
         return Ok(watermarks);
     }
@@ -917,6 +1095,8 @@ fn truncate(
         log_start,
     })?;
     state.log_start = log_start;
+    state.batches.truncate_before(first_retained);
+    state.reset_cached_watermarks_after_truncate();
     Ok(state.watermarks(min_in_sync_replicas))
 }
 
@@ -925,7 +1105,7 @@ fn check_producer(
     request_id: u128,
     producer: Option<ProducerIdentity>,
     record_count: NonZeroU32,
-    payload_digest: [u8; 32],
+    payload_digest: [u8; 16],
     durability: Durability,
     min_in_sync_replicas: u32,
 ) -> EngineResult<Option<AppendResponse>> {
@@ -946,7 +1126,7 @@ fn check_producer(
                 producer.epoch,
                 producer.first_sequence,
             )) {
-                let digest_matches = record.digest_algorithm == DIGEST_BLAKE3
+                let digest_matches = record.digest_algorithm == DIGEST_XXH3_128
                     && record.payload_digest == payload_digest;
                 if !digest_matches || record.record_count != record_count.get() {
                     return Err(EngineError::DuplicateSequenceMismatch(producer.producer_id));
@@ -1022,39 +1202,54 @@ fn advance_producer(
     Ok(())
 }
 
+fn append_batch_runtime(state: &mut PartitionState, batch: BatchRuntime) -> EngineResult<()> {
+    let batch_id = batch.reservation.batch_id;
+    state.batches.push(batch_id.get(), batch).map_err(|error| {
+        EngineError::CorruptState(format!(
+            "batch {batch_id} violates dense index ordering: {error}"
+        ))
+    })?;
+    state.advance_cached_watermarks();
+    Ok(())
+}
+
 fn mark_batch(
     state: &mut PartitionState,
     reservation: Reservation,
     status: BatchStatus,
     durable_replicas: u32,
 ) -> EngineResult<u32> {
-    let batch = state
-        .batches
-        .get_mut(&reservation.first_offset)
-        .ok_or_else(|| {
-            EngineError::CorruptState(format!(
-                "batch {} is missing from runtime state",
+    let durable_replicas = {
+        let batch = state
+            .batches
+            .get_mut(reservation.batch_id.get())
+            .ok_or_else(|| {
+                EngineError::CorruptState(format!(
+                    "batch {} is missing from runtime state",
+                    reservation.batch_id
+                ))
+            })?;
+        if batch.reservation != reservation || batch.status != BatchStatus::Pending {
+            return Err(EngineError::CorruptState(format!(
+                "invalid lifecycle transition for batch {}",
                 reservation.batch_id
-            ))
-        })?;
-    if batch.reservation != reservation || batch.status != BatchStatus::Pending {
-        return Err(EngineError::CorruptState(format!(
-            "invalid lifecycle transition for batch {}",
-            reservation.batch_id
-        )));
-    }
-    batch.status = status;
-    if status == BatchStatus::Committed {
-        batch.replica_acks |= 1;
-        batch.durable_replicas = batch
-            .durable_replicas
-            .max(durable_replicas)
-            .max(batch.replica_acks.count_ones());
-    } else {
-        batch.durable_replicas = 0;
-        batch.replica_acks = 0;
-    }
-    Ok(batch.durable_replicas)
+            )));
+        }
+        batch.status = status;
+        if status == BatchStatus::Committed {
+            batch.replica_acks |= 1;
+            batch.durable_replicas = batch
+                .durable_replicas
+                .max(durable_replicas)
+                .max(batch.replica_acks.count_ones());
+        } else {
+            batch.durable_replicas = 0;
+            batch.replica_acks = 0;
+        }
+        batch.durable_replicas
+    };
+    state.advance_cached_watermarks();
+    Ok(durable_replicas)
 }
 
 pub(crate) fn retention_hints(events: &[JournalEvent]) -> HashMap<TopicPartition, LogicalOffset> {
@@ -1147,12 +1342,15 @@ pub(crate) fn recover_partition_states(
             .expect("configured partition has a ring");
         let mut entries = by_partition.remove(&topic_partition).unwrap_or_default();
         entries.sort_by_key(|entry| entry.reservation.first_offset);
-        let mut state = PartitionState::empty(TopicSequencer::new(
-            topic_partition.topic_id,
-            topic_partition.partition_id,
-            ring_epoch,
-            shards.clone(),
-        )?);
+        let mut state = PartitionState::empty(
+            TopicSequencer::new(
+                topic_partition.topic_id,
+                topic_partition.partition_id,
+                ring_epoch,
+                shards.clone(),
+            )?,
+            config.min_in_sync_replicas,
+        );
         let mut next_batch_id = 0u128;
         let mut next_offset = 0u128;
         let mut next_placement_sequence = 0u128;
@@ -1189,24 +1387,15 @@ pub(crate) fn recover_partition_states(
                 missing_records,
                 reservation.placement.ring_epoch,
             )?;
-            if state
-                .batches
-                .insert(
-                    reservation.first_offset,
-                    BatchRuntime {
-                        reservation,
-                        status: BatchStatus::Committed,
-                        durable_replicas: config.replication_factor,
-                        replica_acks: replica_mask(config.replication_factor),
-                    },
-                )
-                .is_some()
-            {
-                return Err(EngineError::CorruptState(format!(
-                    "duplicate extent offset at batch {}",
-                    reservation.batch_id
-                )));
-            }
+            append_batch_runtime(
+                &mut state,
+                BatchRuntime {
+                    reservation,
+                    status: BatchStatus::Committed,
+                    durable_replicas: config.replication_factor,
+                    replica_acks: replica_mask(config.replication_factor),
+                },
+            )?;
             restore_producer(
                 &mut state,
                 reservation,
@@ -1248,17 +1437,22 @@ pub(crate) fn recover_partition_states(
         let contiguous_end = state
             .watermarks(config.min_in_sync_replicas)
             .contiguous_log_end;
-        if recovered_log_start > contiguous_end
-            || (recovered_log_start != contiguous_end
-                && recovered_log_start.get() != 0
-                && !state.batches.contains_key(&recovered_log_start))
-        {
+        let first_retained = if recovered_log_start == contiguous_end {
+            Some(state.batches.next_key())
+        } else {
+            state.batch_key_at_first_offset(recovered_log_start)
+        };
+        if recovered_log_start > contiguous_end || first_retained.is_none() {
             return Err(EngineError::CorruptState(format!(
                 "invalid recovered log start {recovered_log_start} for {}/{}",
                 topic_partition.topic_id, topic_partition.partition_id
             )));
         }
         state.log_start = recovered_log_start;
+        state
+            .batches
+            .truncate_before(first_retained.expect("validated retained batch key"));
+        state.reset_cached_watermarks_after_truncate();
         result.insert(topic_partition, state);
     }
     Ok(result)
@@ -1355,15 +1549,15 @@ fn append_recovered_aborts(
                 sequence: PlacementSequence::new(sequence),
             },
         };
-        state.batches.insert(
-            reservation.first_offset,
+        append_batch_runtime(
+            state,
             BatchRuntime {
                 reservation,
                 status: BatchStatus::Aborted,
                 durable_replicas: 0,
                 replica_acks: 0,
             },
-        );
+        )?;
         offset = last_offset + 1;
     }
     Ok(())

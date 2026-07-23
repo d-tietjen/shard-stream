@@ -30,7 +30,8 @@ pub async fn serve(
     listener: TcpListener,
     engine: Arc<StreamEngine>,
     stream_capacity: usize,
-    max_message_bytes: usize,
+    max_request_bytes: usize,
+    max_response_bytes: usize,
     shutdown: watch::Receiver<bool>,
 ) -> Result<(), tonic::transport::Error> {
     let service = GrpcService {
@@ -38,11 +39,11 @@ pub async fn serve(
         stream_capacity,
     };
     let producer = ProducerServiceServer::new(service.clone())
-        .max_decoding_message_size(max_message_bytes)
-        .max_encoding_message_size(max_message_bytes);
+        .max_decoding_message_size(max_request_bytes)
+        .max_encoding_message_size(max_response_bytes);
     let consumer = ConsumerServiceServer::new(service)
-        .max_decoding_message_size(max_message_bytes)
-        .max_encoding_message_size(max_message_bytes);
+        .max_decoding_message_size(max_request_bytes)
+        .max_encoding_message_size(max_response_bytes);
     tonic::transport::Server::builder()
         .add_service(producer)
         .add_service(consumer)
@@ -145,7 +146,7 @@ fn decode_append(request: v1::AppendRequest) -> Result<EngineAppendRequest, Stat
         topic_id: TopicId::new(decode_u128(request.topic_id, "topic_id")?),
         partition_id: LogicalPartitionId::new(request.partition_id),
         record_count: request.record_count,
-        payload: request.payload,
+        payload: request.payload.into(),
         durability: match v1::Durability::try_from(request.durability) {
             Ok(v1::Durability::Leader) => EngineDurability::Leader,
             Ok(v1::Durability::Quorum) => EngineDurability::Quorum,
@@ -192,7 +193,7 @@ fn encode_fetch_batch(request_id: u128, batch: FetchedBatch) -> v1::FetchBatch {
         batch_id: Some(encode_u128(batch.batch_id.get())),
         first_offset: Some(encode_u128(batch.first_offset.get())),
         last_offset: Some(encode_u128(batch.last_offset.get())),
-        payload: batch.payload,
+        payload: batch.payload.to_vec(),
         placement: Some(v1::Placement {
             shard_id: batch.placement.shard_id.get(),
             ring_epoch: batch.placement.ring_epoch.get(),
@@ -302,6 +303,7 @@ mod tests {
                 target_pack_bytes: 1024,
                 max_batch_bytes: 64 * 1024,
                 max_fetch_bytes: 1024 * 1024,
+                append_linger: std::time::Duration::from_millis(1),
             })
             .expect("engine"),
         );
@@ -318,7 +320,15 @@ mod tests {
         let (shutdown_sender, shutdown_receiver) = watch::channel(false);
         let server_engine = Arc::clone(&engine);
         let server = tokio::spawn(async move {
-            serve(listener, server_engine, 8, 1024 * 1024, shutdown_receiver).await
+            serve(
+                listener,
+                server_engine,
+                8,
+                1024 * 1024,
+                1024 * 1024,
+                shutdown_receiver,
+            )
+            .await
         });
 
         let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))

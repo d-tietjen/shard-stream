@@ -1,9 +1,9 @@
-use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -13,6 +13,8 @@ use axum::http::{HeaderValue, Response, StatusCode};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post, put};
 use clap::Parser;
+use eden_logger::{LogAudience, LogContext, WriterConfig, log_error, log_info};
+use fast_telemetry::{Counter, PrometheusExport};
 use serde::{Deserialize, Serialize};
 use shard_stream_core::{
     LogicalOffset, LogicalPartitionId, RingEpoch, ShardId, TopicId, TopicPartition,
@@ -24,8 +26,6 @@ use shard_stream_protocol::{
 };
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tracing::{error, info};
-use tracing_subscriber::EnvFilter;
 
 const OPENAPI: &str = include_str!("../../../openapi/shard-stream-v1.json");
 const NATIVE_BATCH_CONTENT_TYPE: &str = "application/vnd.shard-stream.batch.v1";
@@ -67,9 +67,25 @@ struct Args {
     queue_bytes_per_shard: usize,
     #[arg(long, default_value_t = 256 * 1024 * 1024)]
     target_pack_bytes: u64,
-    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    #[arg(
+        long,
+        env = "SHARD_STREAM_MAX_BATCH_BYTES",
+        default_value_t = 16 * 1024 * 1024
+    )]
     max_batch_bytes: usize,
-    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    #[arg(
+        long,
+        env = "SHARD_STREAM_MAX_REQUEST_BYTES",
+        default_value_t = 32 * 1024 * 1024
+    )]
+    max_request_bytes: usize,
+    #[arg(long, env = "SHARD_STREAM_APPEND_LINGER_MS", default_value_t = 1)]
+    append_linger_ms: u64,
+    #[arg(
+        long,
+        env = "SHARD_STREAM_MAX_FETCH_BYTES",
+        default_value_t = 64 * 1024 * 1024
+    )]
     max_fetch_bytes: usize,
 }
 
@@ -81,41 +97,67 @@ struct AppState {
     max_fetch_bytes: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct HttpMetrics {
-    requests: AtomicU64,
-    errors: AtomicU64,
-    appended_batches: AtomicU64,
-    appended_bytes: AtomicU64,
-    fetched_batches: AtomicU64,
-    fetched_bytes: AtomicU64,
+    requests: Counter,
+    errors: Counter,
+    appended_batches: Counter,
+    appended_bytes: Counter,
+    fetched_batches: Counter,
+    fetched_bytes: Counter,
+}
+
+impl Default for HttpMetrics {
+    fn default() -> Self {
+        Self {
+            requests: Counter::new(64),
+            errors: Counter::new(64),
+            appended_batches: Counter::new(64),
+            appended_bytes: Counter::new(64),
+            fetched_batches: Counter::new(64),
+            fetched_bytes: Counter::new(64),
+        }
+    }
 }
 
 impl HttpMetrics {
     fn request(&self) {
-        saturating_increment(&self.requests, 1);
+        self.requests.inc();
     }
 
     fn error(&self) {
-        saturating_increment(&self.errors, 1);
+        self.errors.inc();
+    }
+
+    fn appended(&self, bytes: u64) {
+        self.appended_batches.inc();
+        self.appended_bytes.add(counter_value(bytes));
+    }
+
+    fn fetched(&self, batches: usize, bytes: u64) {
+        self.fetched_batches.add(counter_value(batches as u64));
+        self.fetched_bytes.add(counter_value(bytes));
     }
 }
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    eden_logger::init(WriterConfig::default());
+    eden_logger::init_from_env();
     let args = Args::parse();
     if let Err(error) = run(args).await {
-        error!(%error, "shard-stream server stopped");
+        log_error!(
+            LogContext::<()>::new().with_feature("server"),
+            "shard-stream server stopped",
+            audience = LogAudience::Internal,
+            error = error
+        );
         std::process::exit(1);
     }
 }
 
 async fn run(args: Args) -> Result<(), AppError> {
+    validate_args(&args)?;
     let h3_config = match (
         args.h3_listen,
         args.h3_certificate.clone(),
@@ -148,6 +190,7 @@ async fn run(args: Args) -> Result<(), AppError> {
         target_pack_bytes: args.target_pack_bytes,
         max_batch_bytes: args.max_batch_bytes,
         max_fetch_bytes: args.max_fetch_bytes,
+        append_linger: Duration::from_millis(args.append_linger_ms),
     };
     let engine = Arc::new(StreamEngine::open(config).map_err(AppError::from)?);
     let state = AppState {
@@ -178,7 +221,7 @@ async fn run(args: Args) -> Result<(), AppError> {
             "/v1/topics/{topic_id}/partitions/{partition_id}/retention",
             put(update_retention),
         )
-        .layer(DefaultBodyLimit::max(args.max_batch_bytes))
+        .layer(DefaultBodyLimit::max(args.max_request_bytes))
         .with_state(state.clone());
     let listener = TcpListener::bind(args.listen)
         .await
@@ -197,15 +240,28 @@ async fn run(args: Args) -> Result<(), AppError> {
                 args.kafka_listen
             ))
         })?;
-    info!(address = %args.listen, "shard-stream REST listener ready");
-    info!(address = %args.grpc_listen, "shard-stream gRPC listener ready");
-    info!(address = %args.kafka_listen, "shard-stream Kafka listener ready");
+    let log_context = LogContext::<()>::new().with_feature("server");
+    log_info!(
+        log_context.clone(),
+        "shard-stream REST listener ready",
+        audience = LogAudience::Internal,
+        address = args.listen
+    );
+    log_info!(
+        log_context.clone(),
+        "shard-stream gRPC listener ready",
+        audience = LogAudience::Internal,
+        address = args.grpc_listen
+    );
+    log_info!(
+        log_context,
+        "shard-stream Kafka listener ready",
+        audience = LogAudience::Internal,
+        address = args.kafka_listen
+    );
 
     let grpc_engine = Arc::clone(&state.engine);
-    let grpc_max_message_bytes = args
-        .max_batch_bytes
-        .max(args.max_fetch_bytes)
-        .saturating_add(1024 * 1024);
+    let grpc_max_response_bytes = args.max_fetch_bytes.saturating_add(1024 * 1024);
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
     let rest_shutdown = shutdown_receiver.clone();
     let h3_shutdown = shutdown_receiver.clone();
@@ -222,7 +278,8 @@ async fn run(args: Args) -> Result<(), AppError> {
             grpc_listener,
             grpc_engine,
             128,
-            grpc_max_message_bytes,
+            args.max_request_bytes,
+            grpc_max_response_bytes,
             shutdown_receiver,
         )
         .await
@@ -233,10 +290,7 @@ async fn run(args: Args) -> Result<(), AppError> {
         advertised_host: args.kafka_advertised_host,
         advertised_port: args.kafka_advertised_port,
         node_id: args.kafka_node_id,
-        max_frame_bytes: args
-            .max_batch_bytes
-            .saturating_mul(2)
-            .clamp(1024 * 1024, 128 * 1024 * 1024),
+        max_frame_bytes: args.max_request_bytes,
         max_fetch_bytes: args.max_fetch_bytes,
     };
     tasks.spawn(async move {
@@ -272,6 +326,25 @@ async fn run(args: Args) -> Result<(), AppError> {
     }
 }
 
+fn validate_args(args: &Args) -> Result<(), AppError> {
+    if args.max_request_bytes < args.max_batch_bytes {
+        return Err(AppError::bad_request(
+            "max_request_bytes must be at least max_batch_bytes",
+        ));
+    }
+    if args.max_request_bytes > 128 * 1024 * 1024 {
+        return Err(AppError::bad_request(
+            "max_request_bytes cannot exceed the Kafka adapter's 128 MiB hard limit",
+        ));
+    }
+    if args.append_linger_ms > 60_000 {
+        return Err(AppError::bad_request(
+            "append_linger_ms cannot exceed 60000",
+        ));
+    }
+    Ok(())
+}
+
 async fn health() -> impl IntoResponse {
     (
         StatusCode::OK,
@@ -291,42 +364,36 @@ async fn openapi() -> impl IntoResponse {
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     let metrics = &state.metrics;
     let mut body = String::new();
-    for (name, help, value) in [
-        (
-            "shard_stream_http_requests_total",
-            "HTTP requests received",
-            metrics.requests.load(Ordering::Relaxed),
-        ),
-        (
-            "shard_stream_http_errors_total",
-            "HTTP requests returning errors",
-            metrics.errors.load(Ordering::Relaxed),
-        ),
-        (
-            "shard_stream_appended_batches_total",
-            "Successfully appended batches",
-            metrics.appended_batches.load(Ordering::Relaxed),
-        ),
-        (
-            "shard_stream_appended_bytes_total",
-            "Successfully appended payload bytes",
-            metrics.appended_bytes.load(Ordering::Relaxed),
-        ),
-        (
-            "shard_stream_fetched_batches_total",
-            "Fetched batches",
-            metrics.fetched_batches.load(Ordering::Relaxed),
-        ),
-        (
-            "shard_stream_fetched_bytes_total",
-            "Fetched payload bytes",
-            metrics.fetched_bytes.load(Ordering::Relaxed),
-        ),
-    ] {
-        let _ = writeln!(body, "# HELP {name} {help}");
-        let _ = writeln!(body, "# TYPE {name} counter");
-        let _ = writeln!(body, "{name} {value}");
-    }
+    metrics.requests.export_prometheus(
+        &mut body,
+        "shard_stream_http_requests_total",
+        "HTTP requests received",
+    );
+    metrics.errors.export_prometheus(
+        &mut body,
+        "shard_stream_http_errors_total",
+        "HTTP requests returning errors",
+    );
+    metrics.appended_batches.export_prometheus(
+        &mut body,
+        "shard_stream_appended_batches_total",
+        "Successfully appended batches",
+    );
+    metrics.appended_bytes.export_prometheus(
+        &mut body,
+        "shard_stream_appended_bytes_total",
+        "Successfully appended payload bytes",
+    );
+    metrics.fetched_batches.export_prometheus(
+        &mut body,
+        "shard_stream_fetched_batches_total",
+        "Fetched batches",
+    );
+    metrics.fetched_bytes.export_prometheus(
+        &mut body,
+        "shard_stream_fetched_bytes_total",
+        "Fetched payload bytes",
+    );
     (
         StatusCode::OK,
         [(CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -449,7 +516,7 @@ async fn append(
         topic_id: parse_topic_id(&topic_id)?,
         partition_id: LogicalPartitionId::new(partition_id),
         record_count: query.record_count,
-        payload: payload.to_vec(),
+        payload,
         durability,
         producer,
         leader_epoch: query.leader_epoch,
@@ -458,8 +525,7 @@ async fn append(
     let response = execute(move || engine.append(request))
         .await
         .inspect_err(|_| state.metrics.error())?;
-    saturating_increment(&state.metrics.appended_batches, 1);
-    saturating_increment(&state.metrics.appended_bytes, payload_len);
+    state.metrics.appended(payload_len);
     Ok(Json(AppendResponseBody {
         request_id: response.request_id.to_string(),
         batch_id: response.batch_id.to_string(),
@@ -525,8 +591,7 @@ async fn fetch(
         .max_fetch_bytes
         .saturating_add(native.len().saturating_mul(256));
     let encoded = encode_fetch_batches(&native, max_output).map_err(AppError::from)?;
-    saturating_increment(&state.metrics.fetched_batches, native.len() as u64);
-    saturating_increment(&state.metrics.fetched_bytes, payload_bytes);
+    state.metrics.fetched(native.len(), payload_bytes);
 
     let mut response = Response::new(Body::from(encoded));
     *response.status_mut() = StatusCode::OK;
@@ -675,15 +740,17 @@ fn default_fetch_mode() -> String {
     "ordered".into()
 }
 
-fn saturating_increment(counter: &AtomicU64, amount: u64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-        Some(value.saturating_add(amount))
-    });
+fn counter_value(value: u64) -> isize {
+    isize::try_from(value).unwrap_or(isize::MAX)
 }
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
-    info!("shutdown signal received");
+    log_info!(
+        LogContext::<()>::new().with_feature("server"),
+        "shutdown signal received",
+        audience = LogAudience::Internal
+    );
 }
 
 async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {

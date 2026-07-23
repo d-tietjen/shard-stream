@@ -177,8 +177,8 @@ types, assertions, recovery tests, and the on-disk format:
    Recovery merges extents by logical offset and infers interior abort ranges
    from later batch, placement, and offset sequences, so later ordered data
    cannot remain hidden behind an unexplained gap.
-6. A committed data extent, including optional producer identity and BLAKE3
-   payload identity, is sufficient to rebuild all
+6. A committed data extent, including optional producer identity and XXH3-128
+   payload retry fingerprint, is sufficient to rebuild all
    derived indexes after a crash.
 7. Ordered visibility advances only through contiguous committed or aborted
    ranges. Pipelined completion order is never confused with logical order.
@@ -269,6 +269,12 @@ This preserves its CRC, compression unit, producer sequencing, and
 transactional boundaries and enables zero-copy handoff. Native batches use an
 equivalent immutable framing contract.
 
+Use `Bytes` ownership through protocol, engine, storage, and replica dispatch
+so an admitted immutable batch is not recopied between layers. At asynchronous
+socket boundaries, `bytes-handoff` may retain incomplete input tails and queue
+bounded output frames while I/O progresses. It does not replace the
+byte-accounted shard command channels or their single-owner sequencing.
+
 ### 6.3 Admission and atomic recovery
 
 The append path is:
@@ -283,6 +289,14 @@ The append path is:
    mutex or disk operation.
 4. Enqueue an immutable, reference-counted `AppendBatch` to the lane's bounded
    MPSC append queue.
+
+Partition batch metadata uses the standalone MIT-licensed
+`ordered-segment-map` crate. Dense monotonic batch IDs map directly to
+segmented ordinals without hashing; the segments retain insertion/logical
+order and allow retention to discard complete prefixes without shifting live
+entries. Sparse identities use a separate prehashed `HashTable` to stable
+ordinals. The coordinator must not put dense batch IDs in a general-purpose
+`HashMap` or pointer-heavy ordered tree.
 5. The single lane owner drains a bounded group, appends each self-describing
    extent once, and performs one shard-local fsync for the group.
 6. Persistent replica workers copy the same reference-counted payload and
@@ -922,6 +936,13 @@ address repeated requests or failure modes across multiple products.
 - Export low-cardinality cluster/tenant/policy-class metrics by default.
   Per-topic, partition, producer, consumer, and lane drill-down is opt-in,
   time-bounded, and protected by a cardinality budget.
+- Back aggregate hot-path counters with sharded `fast-telemetry` cells and
+  export snapshots out of band. Metrics must not introduce a contended global
+  atomic or lock into append, replication, or fetch.
+- Route lifecycle, control-plane, and sampled error events through
+  `eden_logger` with compile-time level gating. Never synchronously log every
+  record or append; detailed hot-path visibility comes from bounded metrics and
+  sampling.
 - Add immutable named stream cuts: a consistent set of partition offsets and
   ring epochs that can reproduce a read, seed a consumer checkpoint, or pin
   retention. Pins consume an explicit storage quota and expire unless renewed.
@@ -933,7 +954,8 @@ address repeated requests or failure modes across multiple products.
   failover may redeliver but must not silently skip committed input.
 - Include an end-to-end trace identity and timestamps for admission,
   reservation, lane append, replication, visibility, tier upload, fetch, and
-  consumer delivery without requiring payload inspection.
+  consumer delivery without requiring payload inspection. Propagate that
+  identity into structured logs and protocol responses where safe.
 
 #### P1: delivery and contract features after the durable log
 
@@ -1245,12 +1267,14 @@ only for large servers.
 Before those distributed release profiles, `SINGLE-NVME` calibrates one Linux
 broker and one dedicated NVMe device. It sweeps RF1/leader and RF3/minimum-ISR-2
 quorum paths, but same-host RF3 is labeled replication-overhead calibration,
-not HA. The matrix crosses 100 B, 1 KiB, 10 KiB, and 1 MiB records with 32 KiB,
-64 KiB, 256 KiB, and 1 MiB target batches where valid; 1, 2, 4, 8, and 16
-lanes; concurrency from one through saturation; producer linger of 0, 1, 5,
-20, and 50 ms; matching consumer fetch sizes; and uncompressed, LZ4, and
-Zstandard Kafka RecordBatch profiles. Direct-engine results and Kafka, gRPC,
-and HTTP/3 wire results are separate.
+not HA. The matrix crosses 100 B, 1 KiB, 10 KiB, and 1 MiB records with 16 KiB,
+32 KiB, 64 KiB, 256 KiB, 1 MiB, and 2 MiB target batches where valid; 1, 2, 4,
+8, and 16 lanes; concurrency from one through saturation; producer linger of
+0, 1, 5, 20, and 50 ms; matching consumer fetch sizes; and uncompressed, LZ4,
+and Zstandard Kafka RecordBatch profiles. The 16 KiB case represents Kafka's
+default `batch.size`; 2 MiB is a tuned case requiring compatible producer,
+broker, and topic request limits. Direct-engine results and Kafka, gRPC, and
+HTTP/3 wire results are separate.
 
 The calibration records sequential device bandwidth, fsync latency, NIC link
 speed, filesystem and mount options, CPU governor, page-cache state, TLS/SASL,

@@ -17,6 +17,72 @@ use shard_stream_protocol::{
 };
 
 const DEFAULT_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024 + 4096;
+pub const BATCH_SIZE_ENV: &str = "SHARD_STREAM_BATCH_SIZE";
+pub const LINGER_MS_ENV: &str = "SHARD_STREAM_LINGER_MS";
+pub const MAX_REQUEST_SIZE_ENV: &str = "SHARD_STREAM_MAX_REQUEST_SIZE";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProducerTuning {
+    pub batch_size: usize,
+    pub linger: Duration,
+    pub max_request_size: usize,
+}
+
+impl Default for ProducerTuning {
+    fn default() -> Self {
+        Self {
+            batch_size: 16 * 1024,
+            linger: Duration::from_millis(5),
+            max_request_size: 1024 * 1024,
+        }
+    }
+}
+
+impl ProducerTuning {
+    pub fn from_env() -> Result<Self, ClientError> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self, ClientError> {
+        let defaults = Self::default();
+        let tuning = Self {
+            batch_size: parse_env_value(BATCH_SIZE_ENV, lookup(BATCH_SIZE_ENV))?
+                .unwrap_or(defaults.batch_size),
+            linger: Duration::from_millis(
+                parse_env_value(LINGER_MS_ENV, lookup(LINGER_MS_ENV))?
+                    .unwrap_or(defaults.linger.as_millis() as u64),
+            ),
+            max_request_size: parse_env_value(MAX_REQUEST_SIZE_ENV, lookup(MAX_REQUEST_SIZE_ENV))?
+                .unwrap_or(defaults.max_request_size),
+        };
+        tuning.validate()?;
+        Ok(tuning)
+    }
+
+    fn validate(self) -> Result<(), ClientError> {
+        if self.batch_size == 0 || self.max_request_size == 0 {
+            return Err(ClientError::InvalidConfig(
+                "producer batch and request sizes must be nonzero".into(),
+            ));
+        }
+        if self.batch_size > self.max_request_size {
+            return Err(ClientError::InvalidConfig(
+                "producer batch_size cannot exceed max_request_size".into(),
+            ));
+        }
+        if self.linger > Duration::from_secs(60) {
+            return Err(ClientError::InvalidConfig(
+                "producer linger cannot exceed 60 seconds".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn should_flush(self, buffered_payload_bytes: usize) -> bool {
+        buffered_payload_bytes >= self.batch_size
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -24,6 +90,7 @@ pub struct ClientConfig {
     pub request_timeout: Duration,
     pub max_retries: u32,
     pub max_frame_bytes: usize,
+    pub producer: ProducerTuning,
 }
 
 impl Default for ClientConfig {
@@ -33,7 +100,17 @@ impl Default for ClientConfig {
             request_timeout: Duration::from_secs(30),
             max_retries: 3,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            producer: ProducerTuning::default(),
         }
+    }
+}
+
+impl ClientConfig {
+    pub fn from_env() -> Result<Self, ClientError> {
+        Ok(Self {
+            producer: ProducerTuning::from_env()?,
+            ..Self::default()
+        })
     }
 }
 
@@ -47,6 +124,7 @@ struct ClientInner {
     http: reqwest::Client,
     max_retries: u32,
     max_frame_bytes: usize,
+    producer: ProducerTuning,
     next_request_id: AtomicU64,
 }
 
@@ -57,6 +135,7 @@ impl Client {
                 "max_frame_bytes must be nonzero".into(),
             ));
         }
+        config.producer.validate()?;
         let endpoint = Url::parse(config.endpoint.trim_end_matches('/'))
             .map_err(|error| ClientError::InvalidConfig(error.to_string()))?;
         if endpoint.scheme() != "http" && endpoint.scheme() != "https" {
@@ -74,6 +153,7 @@ impl Client {
                 http,
                 max_retries: config.max_retries,
                 max_frame_bytes: config.max_frame_bytes,
+                producer: config.producer,
                 next_request_id: AtomicU64::new(1),
             }),
         })
@@ -119,6 +199,7 @@ impl Client {
             epoch,
             leader_epoch: None,
             next_sequence: 0,
+            tuning: self.inner.producer,
         }
     }
 
@@ -151,6 +232,7 @@ pub struct Producer {
     epoch: u32,
     leader_epoch: Option<u64>,
     next_sequence: u64,
+    tuning: ProducerTuning,
 }
 
 impl Producer {
@@ -158,6 +240,11 @@ impl Producer {
     pub fn with_leader_epoch(mut self, leader_epoch: u64) -> Self {
         self.leader_epoch = Some(leader_epoch);
         self
+    }
+
+    #[must_use]
+    pub const fn tuning(&self) -> ProducerTuning {
+        self.tuning
     }
 
     pub async fn append(
@@ -172,6 +259,13 @@ impl Producer {
             ));
         }
         let payload = payload.into();
+        if payload.len() > self.tuning.max_request_size {
+            return Err(ClientError::InvalidConfig(format!(
+                "append payload has {} bytes, exceeding producer max_request_size {}",
+                payload.len(),
+                self.tuning.max_request_size
+            )));
+        }
         let first_sequence = self.next_sequence;
         let next_sequence = self
             .next_sequence
@@ -434,6 +528,19 @@ fn parse_response_u128(field: &str, value: &str) -> Result<u128, ClientError> {
     })
 }
 
+fn parse_env_value<T>(name: &str, value: Option<String>) -> Result<Option<T>, ClientError>
+where
+    T: std::str::FromStr,
+{
+    value
+        .map(|value| {
+            value.parse::<T>().map_err(|_| {
+                ClientError::InvalidConfig(format!("{name} must be a non-negative base-10 integer"))
+            })
+        })
+        .transpose()
+}
+
 const fn durability_name(durability: Durability) -> &'static str {
     match durability {
         Durability::Leader => "leader",
@@ -483,5 +590,50 @@ mod tests {
         let receipt = ProducerReceipt::try_from(response).expect("receipt");
         assert_eq!(receipt.request_id, u128::MAX);
         assert_eq!(receipt.placement.sequence, PlacementSequence::new(7));
+    }
+
+    #[test]
+    fn producer_tuning_uses_kafka_familiar_environment_names() {
+        let tuning = ProducerTuning::from_lookup(|name| match name {
+            BATCH_SIZE_ENV => Some("2097152".into()),
+            LINGER_MS_ENV => Some("20".into()),
+            MAX_REQUEST_SIZE_ENV => Some("4194304".into()),
+            _ => None,
+        })
+        .expect("producer tuning");
+        assert_eq!(tuning.batch_size, 2 * 1024 * 1024);
+        assert_eq!(tuning.linger, Duration::from_millis(20));
+        assert_eq!(tuning.max_request_size, 4 * 1024 * 1024);
+        assert!(tuning.should_flush(2 * 1024 * 1024));
+    }
+
+    #[test]
+    fn producer_tuning_rejects_a_batch_larger_than_the_request() {
+        let error = ProducerTuning::from_lookup(|name| match name {
+            BATCH_SIZE_ENV => Some("2097152".into()),
+            MAX_REQUEST_SIZE_ENV => Some("1048576".into()),
+            _ => None,
+        })
+        .expect_err("invalid producer tuning");
+        assert!(matches!(error, ClientError::InvalidConfig(_)));
+    }
+
+    #[tokio::test]
+    async fn producer_enforces_the_configured_request_limit_before_network_io() {
+        let client = Client::new(ClientConfig {
+            producer: ProducerTuning {
+                batch_size: 4,
+                linger: Duration::ZERO,
+                max_request_size: 4,
+            },
+            ..ClientConfig::default()
+        })
+        .expect("client");
+        let mut producer = client.producer(TopicId::new(1), LogicalPartitionId::new(0), 1, 0);
+        let error = producer
+            .append(vec![0; 5], 1, Durability::Leader)
+            .await
+            .expect_err("oversized request");
+        assert!(matches!(error, ClientError::InvalidConfig(_)));
     }
 }

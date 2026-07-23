@@ -11,11 +11,13 @@ description = "Striped append and ordered fetch engine for shard-stream"
 publish = false
 
 [dependencies]
-blake3.workspace = true
+bytes.workspace = true
+ordered-segment-map.workspace = true
 shard-stream-core.workspace = true
 shard-stream-control.workspace = true
 shard-stream-protocol.workspace = true
 shard-stream-storage.workspace = true
+xxhash-rust.workspace = true
 
 [lints]
 workspace = true

@@ -13,6 +13,8 @@ publish = false
 [dependencies]
 axum.workspace = true
 clap.workspace = true
+eden_logger.workspace = true
+fast-telemetry.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 shard-stream-core.workspace = true
@@ -22,8 +24,6 @@ shard-stream-h3 = { path = "../shard-stream-h3", version = "0.1.0" }
 shard-stream-kafka.workspace = true
 shard-stream-protocol.workspace = true
 tokio.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

@@ -11,6 +11,7 @@ description = "Transport-independent producer and consumer protocol types for sh
 publish = false
 
 [dependencies]
+bytes.workspace = true
 crc32fast.workspace = true
 shard-stream-core.workspace = true
 

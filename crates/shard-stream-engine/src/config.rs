@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use shard_stream_core::{ShardId, TopicId};
 
@@ -18,6 +19,7 @@ pub struct EngineConfig {
     pub target_pack_bytes: u64,
     pub max_batch_bytes: usize,
     pub max_fetch_bytes: usize,
+    pub append_linger: Duration,
 }
 
 impl EngineConfig {
@@ -50,6 +52,11 @@ impl EngineConfig {
         if self.target_pack_bytes == 0 || self.max_batch_bytes == 0 || self.max_fetch_bytes == 0 {
             return Err(EngineError::InvalidConfig(
                 "pack and request byte limits must be nonzero".into(),
+            ));
+        }
+        if self.append_linger > Duration::from_secs(60) {
+            return Err(EngineError::InvalidConfig(
+                "append_linger cannot exceed 60 seconds".into(),
             ));
         }
         if self

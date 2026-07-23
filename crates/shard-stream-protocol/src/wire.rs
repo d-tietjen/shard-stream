@@ -2,6 +2,7 @@ use std::error::Error;
 use std::fmt;
 use std::num::NonZeroU32;
 
+use bytes::Bytes;
 use shard_stream_core::{BatchId, LogicalOffset, Placement, PlacementSequence, RingEpoch, ShardId};
 
 const MAGIC: &[u8; 4] = b"SSB1";
@@ -19,7 +20,7 @@ pub struct NativeFetchBatch {
     pub last_offset: LogicalOffset,
     pub record_count: NonZeroU32,
     pub placement: Placement,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,11 +169,11 @@ pub fn decode_fetch_batches(
         {
             return Err(WireError::InvalidRecordRange);
         }
-        let payload = body
-            .get(BODY_FIXED_LEN..)
-            .filter(|payload| payload.len() == payload_len)
-            .ok_or(WireError::InvalidFrameLength)?
-            .to_vec();
+        let payload = Bytes::copy_from_slice(
+            body.get(BODY_FIXED_LEN..)
+                .filter(|payload| payload.len() == payload_len)
+                .ok_or(WireError::InvalidFrameLength)?,
+        );
         batches.push(NativeFetchBatch {
             request_id,
             batch_id,
@@ -243,7 +244,7 @@ mod tests {
                 ring_epoch: RingEpoch::new(4),
                 sequence: PlacementSequence::new(5),
             },
-            payload: payload.to_vec(),
+            payload: Bytes::copy_from_slice(payload),
         }
     }
 

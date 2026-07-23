@@ -6,6 +6,7 @@ use std::error::Error;
 use std::fmt;
 use std::num::NonZeroU32;
 
+use bytes::Bytes;
 use shard_stream_core::{BatchId, LogicalOffset, LogicalPartitionId, Placement, TopicId};
 
 pub use wire::{NativeFetchBatch, WireError, decode_fetch_batches, encode_fetch_batches};
@@ -38,7 +39,7 @@ pub struct AppendRequest {
     pub topic_id: TopicId,
     pub partition_id: LogicalPartitionId,
     pub record_count: u32,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     pub durability: Durability,
     pub producer: Option<ProducerIdentity>,
     /// Fencing token required when the engine has a write fence installed.
@@ -153,7 +154,7 @@ mod tests {
             topic_id: TopicId::new(2),
             partition_id: LogicalPartitionId::new(3),
             record_count,
-            payload: vec![0; payload_bytes],
+            payload: Bytes::from(vec![0; payload_bytes]),
             durability: Durability::Quorum,
             producer: None,
             leader_epoch: None,

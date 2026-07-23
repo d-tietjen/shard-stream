@@ -12,6 +12,7 @@ publish = false
 
 [dependencies]
 bytes.workspace = true
+eden_logger.workspace = true
 h3.workspace = true
 h3-quinn.workspace = true
 http.workspace = true
@@ -25,7 +26,6 @@ shard-stream-core.workspace = true
 shard-stream-engine.workspace = true
 shard-stream-protocol.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 
 [dev-dependencies]
 rcgen = "0.13"

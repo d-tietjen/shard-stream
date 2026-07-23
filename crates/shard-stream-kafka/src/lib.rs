@@ -15,6 +15,8 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes_handoff::{HandoffBuffer, HandoffBufferConfig, WriteHandoff, WriteHandoffConfig};
+use eden_logger::{LogAudience, LogContext, log_error, log_info};
 use kafka_protocol::ResponseError;
 use kafka_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
 use kafka_protocol::messages::create_topics_response::{
@@ -43,13 +45,16 @@ use kafka_protocol::records::{
 use shard_stream_core::{LogicalOffset, LogicalPartitionId, TopicId, TopicPartition};
 use shard_stream_engine::{EngineError, StreamEngine, TopicConfig};
 use shard_stream_protocol::{AppendRequest, Durability, FetchMode, FetchRequest, ProducerIdentity};
+use tokio::io::AsyncRead;
+#[cfg(test)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
-use tracing::{error, info};
 
 const MAX_FRAME_HARD_LIMIT: usize = 128 * 1024 * 1024;
 const TOPIC_REGISTRY_QUEUE_SLOTS: usize = 1_024;
+const CONNECTION_WRITE_QUEUE_SLOTS: usize = 256;
+const CONNECTION_READ_RESERVE: usize = 64 * 1024;
 const CLUSTER_ID: &str = "shard-stream";
 const API_VERSIONS: &[(ApiKey, i16, i16)] = &[
     (ApiKey::Produce, 3, 8),
@@ -174,7 +179,12 @@ pub async fn serve(
         known_topics: KnownTopics::spawn()?,
         next_request_id: AtomicU64::new(1),
     });
-    info!(%address, "shard-stream Kafka listener ready");
+    log_info!(
+        LogContext::<()>::new().with_feature("kafka"),
+        "shard-stream Kafka listener ready",
+        audience = LogAudience::Internal,
+        address = address
+    );
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -182,7 +192,13 @@ pub async fn serve(
                 let broker = Arc::clone(&broker);
                 tokio::spawn(async move {
                     if let Err(error) = handle_connection(stream, broker).await {
-                        error!(%peer, %error, "Kafka connection stopped");
+                        log_error!(
+                            LogContext::<()>::new().with_feature("kafka"),
+                            "Kafka connection stopped",
+                            audience = LogAudience::Internal,
+                            peer = peer,
+                            error = error
+                        );
                     }
                 });
             }
@@ -196,23 +212,36 @@ pub async fn serve(
     Ok(())
 }
 
-async fn handle_connection(mut stream: TcpStream, broker: Arc<Broker>) -> KafkaResult<()> {
+async fn handle_connection(stream: TcpStream, broker: Arc<Broker>) -> KafkaResult<()> {
+    let max_buffered_bytes = broker
+        .config
+        .max_frame_bytes
+        .checked_add(4)
+        .ok_or_else(|| KafkaError::Protocol("Kafka frame bound overflow".into()))?;
+    let mut input = HandoffBuffer::with_config(
+        HandoffBufferConfig::new(max_buffered_bytes).with_read_reserve(CONNECTION_READ_RESERVE),
+    );
+    let (mut reader, writer) = stream.into_split();
+    let output = WriteHandoff::spawn(
+        writer,
+        WriteHandoffConfig::new(
+            CONNECTION_WRITE_QUEUE_SLOTS,
+            broker
+                .config
+                .max_frame_bytes
+                .saturating_mul(2)
+                .max(CONNECTION_READ_RESERVE),
+        ),
+    );
     loop {
-        let frame_len = match stream.read_i32().await {
-            Ok(length) => length,
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(error) => return Err(error.into()),
+        let Some(mut bytes) =
+            read_kafka_frame(&mut reader, &mut input, broker.config.max_frame_bytes).await?
+        else {
+            output.drain().await.map_err(|error| {
+                KafkaError::Protocol(format!("Kafka write drain failed: {error}"))
+            })?;
+            return Ok(());
         };
-        let frame_len = usize::try_from(frame_len)
-            .map_err(|_| KafkaError::Protocol("negative Kafka frame length".into()))?;
-        if frame_len == 0 || frame_len > broker.config.max_frame_bytes {
-            return Err(KafkaError::Protocol(
-                "Kafka frame exceeds the configured bound".into(),
-            ));
-        }
-        let mut frame = vec![0; frame_len];
-        stream.read_exact(&mut frame).await?;
-        let mut bytes = Bytes::from(frame);
         let header = decode_request_header_from_buffer(&mut bytes)
             .map_err(|error| KafkaError::Protocol(error.to_string()))?;
         let api_key = ApiKey::try_from(header.request_api_key)
@@ -239,7 +268,61 @@ async fn handle_connection(mut stream: TcpStream, broker: Arc<Broker>) -> KafkaR
                 "Kafka response exceeds the configured frame bound".into(),
             ));
         }
-        stream.write_all(&encoded).await?;
+        output
+            .write_fire_and_forget(encoded.freeze())
+            .await
+            .map_err(|error| {
+                KafkaError::Protocol(format!("Kafka write handoff failed: {error}"))
+            })?;
+    }
+}
+
+async fn read_kafka_frame<R>(
+    reader: &mut R,
+    input: &mut HandoffBuffer,
+    max_frame_bytes: usize,
+) -> KafkaResult<Option<Bytes>>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        if input.len() >= 4 {
+            let frame_len = i32::from_be_bytes(
+                input.peek()[..4]
+                    .try_into()
+                    .expect("Kafka frame prefix width"),
+            );
+            let frame_len = usize::try_from(frame_len)
+                .map_err(|_| KafkaError::Protocol("negative Kafka frame length".into()))?;
+            if frame_len == 0 || frame_len > max_frame_bytes {
+                return Err(KafkaError::Protocol(
+                    "Kafka frame exceeds the configured bound".into(),
+                ));
+            }
+            let framed_len = frame_len
+                .checked_add(4)
+                .ok_or_else(|| KafkaError::Protocol("Kafka frame length overflow".into()))?;
+            if input.len() >= framed_len {
+                return input
+                    .split_prefix(framed_len)
+                    .map(|frame| Some(frame.slice(4..)))
+                    .map_err(|error| {
+                        KafkaError::Protocol(format!("Kafka read handoff failed: {error}"))
+                    });
+            }
+        }
+        let read = input
+            .read_available(reader)
+            .await
+            .map_err(|error| KafkaError::Protocol(format!("Kafka read failed: {error}")))?;
+        if read == 0 {
+            if input.is_empty() {
+                return Ok(None);
+            }
+            return Err(KafkaError::Protocol(
+                "Kafka connection closed with a partial frame".into(),
+            ));
+        }
     }
 }
 
@@ -477,7 +560,7 @@ impl Broker {
                 topic_id,
                 partition_id: LogicalPartitionId::new(partition),
                 record_count,
-                payload: records.to_vec(),
+                payload: records,
                 durability,
                 producer,
                 leader_epoch: None,
@@ -675,7 +758,7 @@ fn encode_fetched_records(
 ) -> Result<Bytes, ResponseError> {
     let mut encoded = BytesMut::new();
     for batch in batches {
-        let mut sets = decode_record_sets(Bytes::copy_from_slice(&batch.payload))?;
+        let mut sets = decode_record_sets(batch.payload.clone())?;
         let mut next_offset = offset_i64(batch.first_offset)?;
         for set in &mut sets {
             for record in &mut set.records {
@@ -842,7 +925,7 @@ mod tests {
             first_offset: LogicalOffset::new(11),
             last_offset: LogicalOffset::new(12),
             record_count: std::num::NonZeroU32::new(2).expect("count"),
-            payload: payload.to_vec(),
+            payload: payload.freeze(),
             placement: shard_stream_core::Placement {
                 shard_id: shard_stream_core::ShardId::new(0),
                 ring_epoch: shard_stream_core::RingEpoch::new(1),
@@ -861,6 +944,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handoff_reader_preserves_fragmented_and_pipelined_frames() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let writer = tokio::spawn(async move {
+            client.write_all(&[0, 0]).await.expect("fragment");
+            tokio::task::yield_now().await;
+            client
+                .write_all(&[0, 3, b'a', b'b', b'c', 0, 0, 0, 2, b'd', b'e'])
+                .await
+                .expect("frames");
+        });
+        let mut input =
+            HandoffBuffer::with_config(HandoffBufferConfig::new(64).with_read_reserve(8));
+        let first = read_kafka_frame(&mut server, &mut input, 60)
+            .await
+            .expect("first read")
+            .expect("first frame");
+        let second = read_kafka_frame(&mut server, &mut input, 60)
+            .await
+            .expect("second read")
+            .expect("second frame");
+        assert_eq!(first, b"abc"[..]);
+        assert_eq!(second, b"de"[..]);
+        writer.await.expect("writer");
+    }
+
+    #[tokio::test]
     #[ignore = "requires local TCP sockets, which are unavailable in some sandboxes"]
     async fn kafka_wire_create_produce_and_fetch_round_trip() {
         let temp = TempDir::new();
@@ -876,6 +985,7 @@ mod tests {
                 target_pack_bytes: 1024 * 1024,
                 max_batch_bytes: 1024 * 1024,
                 max_fetch_bytes: 1024 * 1024,
+                append_linger: std::time::Duration::from_millis(1),
             })
             .expect("engine"),
         );

@@ -1,21 +1,26 @@
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::sync::mpsc::channel;
 
+use bytes::Bytes;
 use shard_stream_control::WriteFence;
 use shard_stream_core::{
     BatchId, LogicalOffset, LogicalPartitionId, Placement, Reservation, RingEpoch, ShardId,
     TopicPartition,
 };
-use shard_stream_protocol::{AppendRequest, AppendResponse, Durability, FetchRequest};
-use shard_stream_storage::{CoordinatorJournal, StoredBatch};
+use shard_stream_protocol::{AppendRequest, AppendResponse, Durability, FetchMode, FetchRequest};
+use shard_stream_storage::{CoordinatorJournal, StoredBatch, StoredBatchMetadata};
 
 use crate::coordinator::{
-    CompleteAppend, ControlJournal, CoordinatorPool, ReserveOutcome, recover_partition_states,
-    retention_hints,
+    CommittedBatchSet, CompleteAppend, ControlJournal, CoordinatorPool, ReserveOutcome,
+    recover_partition_states, retention_hints,
 };
-use crate::worker::ShardHandle;
+use crate::worker::{FetchCompletion, ShardHandle};
 use crate::{EngineConfig, EngineError, EngineResult, TopicConfig};
+
+const MAX_FETCH_PLAN_BATCHES_PER_SHARD: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedBatch {
@@ -23,7 +28,7 @@ pub struct FetchedBatch {
     pub first_offset: LogicalOffset,
     pub last_offset: LogicalOffset,
     pub record_count: NonZeroU32,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     pub placement: Placement,
 }
 
@@ -120,7 +125,8 @@ impl StreamEngine {
             .clone()
             .unwrap_or_else(|| self.config.shard_ids());
         validate_ring(&self.config, &shards)?;
-        self.coordinators.create_topic(topic, shards)
+        self.coordinators
+            .create_topic(topic, shards, self.config.min_in_sync_replicas)
     }
 
     pub fn reconfigure_partition(
@@ -154,7 +160,9 @@ impl StreamEngine {
                 .check_write(topic_partition, leader_epoch)
                 .map_err(|error| EngineError::Fenced(error.to_string()))?;
         }
-        let payload_digest = *blake3::hash(&request.payload).as_bytes();
+        let payload_digest = request.producer.map_or([0; 16], |_| {
+            xxhash_rust::xxh3::xxh3_128(&request.payload).to_le_bytes()
+        });
         let (reservation, producer) = match self.coordinators.reserve(
             topic_partition,
             request.request_id,
@@ -235,29 +243,113 @@ impl StreamEngine {
             )));
         }
         let topic_partition = TopicPartition::new(request.topic_id, request.partition_id);
-        let committed = self.coordinators.fetch_snapshot(
-            topic_partition,
-            request.start_offset,
+        let bounds = self
+            .coordinators
+            .fetch_snapshot(topic_partition, request.start_offset)?;
+
+        let (completion, completions) = channel();
+        for (lane, shard) in self.shards.iter().enumerate() {
+            shard.begin_fetch_plan(
+                lane,
+                topic_partition,
+                request.start_offset,
+                max_bytes,
+                MAX_FETCH_PLAN_BATCHES_PER_SHARD,
+                completion.clone(),
+            )?;
+        }
+        let mut shard_plans = (0..self.shards.len())
+            .map(|_| Vec::new())
+            .collect::<Vec<_>>();
+        let mut planned_lanes = vec![false; self.shards.len()];
+        for _ in 0..self.shards.len() {
+            let received = completions.recv().map_err(|_| {
+                EngineError::CorruptState("fetch plan completion channel disconnected".into())
+            })?;
+            let FetchCompletion::Plan { lane, result } = received else {
+                return Err(EngineError::CorruptState(
+                    "received a fetch read completion during planning".into(),
+                ));
+            };
+            let Some(planned) = shard_plans.get_mut(lane) else {
+                return Err(EngineError::CorruptState(
+                    "fetch plan completion has an invalid lane".into(),
+                ));
+            };
+            let Some(seen) = planned_lanes.get_mut(lane) else {
+                return Err(EngineError::CorruptState(
+                    "fetch plan completion has an invalid lane".into(),
+                ));
+            };
+            if *seen {
+                return Err(EngineError::CorruptState(
+                    "fetch plan completed twice for one lane".into(),
+                ));
+            }
+            *seen = true;
+            *planned = result?;
+        }
+
+        let committed = if request.mode == FetchMode::AsAvailable {
+            let candidates = shard_plans
+                .iter()
+                .flatten()
+                .map(|metadata| metadata.reservation().batch_id)
+                .collect();
+            Some(
+                self.coordinators
+                    .committed_candidates(topic_partition, candidates)?,
+            )
+        } else {
+            None
+        };
+        let selection = select_fetch_plan(
+            &shard_plans,
             request.mode,
+            bounds.ordered_end,
+            committed.as_ref(),
+            max_bytes,
         )?;
 
-        let mut receivers = Vec::with_capacity(self.shards.len());
-        for shard in &self.shards {
-            receivers.push((
-                shard.shard_id,
-                shard.begin_fetch(topic_partition, request.start_offset, max_bytes)?,
-            ));
+        let mut pending_reads = 0usize;
+        for (lane, (shard, planned)) in self.shards.iter().zip(selection.by_shard).enumerate() {
+            if !planned.is_empty() {
+                shard.begin_fetch_read(lane, planned, completion.clone())?;
+                pending_reads += 1;
+            }
         }
-        let mut batches = Vec::new();
-        for (shard_id, receiver) in receivers {
-            let shard_batches = receiver
-                .recv()
-                .map_err(|_| EngineError::WorkerStopped(shard_id))??;
-            batches.extend(shard_batches);
+        let mut shard_batches = (0..self.shards.len())
+            .map(|_| VecDeque::new())
+            .collect::<Vec<_>>();
+        let mut read_lanes = vec![false; self.shards.len()];
+        for _ in 0..pending_reads {
+            let received = completions.recv().map_err(|_| {
+                EngineError::CorruptState("fetch read completion channel disconnected".into())
+            })?;
+            let FetchCompletion::Read { lane, result } = received else {
+                return Err(EngineError::CorruptState(
+                    "received a fetch plan completion during reading".into(),
+                ));
+            };
+            let Some(batches) = shard_batches.get_mut(lane) else {
+                return Err(EngineError::CorruptState(
+                    "fetch read completion has an invalid lane".into(),
+                ));
+            };
+            let Some(seen) = read_lanes.get_mut(lane) else {
+                return Err(EngineError::CorruptState(
+                    "fetch read completion has an invalid lane".into(),
+                ));
+            };
+            if *seen {
+                return Err(EngineError::CorruptState(
+                    "fetch read completed twice for one lane".into(),
+                ));
+            }
+            *seen = true;
+            *batches = VecDeque::from(result?);
         }
-        batches.retain(|batch| committed.contains(&batch.reservation.batch_id));
-        batches.sort_by_key(|batch| batch.reservation.first_offset);
-        Ok(limit_fetched_batches(batches, max_bytes))
+        materialize_fetched_batches(shard_batches, &selection.merge_order)
     }
 
     pub fn watermarks(&self, topic_partition: TopicPartition) -> EngineResult<PartitionWatermarks> {
@@ -314,15 +406,18 @@ impl StreamEngine {
     }
 }
 
-fn limit_fetched_batches(batches: Vec<StoredBatch>, max_bytes: usize) -> Vec<FetchedBatch> {
-    let mut result = Vec::new();
-    let mut used = 0usize;
-    for batch in batches {
-        let next = used.saturating_add(batch.payload.len());
-        if !result.is_empty() && next > max_bytes {
-            break;
-        }
-        used = next;
+fn materialize_fetched_batches(
+    mut lanes: Vec<VecDeque<StoredBatch>>,
+    merge_order: &[usize],
+) -> EngineResult<Vec<FetchedBatch>> {
+    let mut result = Vec::with_capacity(merge_order.len());
+    for &lane in merge_order {
+        let batch = lanes
+            .get_mut(lane)
+            .and_then(VecDeque::pop_front)
+            .ok_or_else(|| {
+                EngineError::CorruptState("fetch materialization did not match its plan".into())
+            })?;
         result.push(FetchedBatch {
             batch_id: batch.reservation.batch_id,
             first_offset: batch.reservation.first_offset,
@@ -332,7 +427,68 @@ fn limit_fetched_batches(batches: Vec<StoredBatch>, max_bytes: usize) -> Vec<Fet
             placement: batch.reservation.placement,
         });
     }
-    result
+    Ok(result)
+}
+
+struct FetchSelection {
+    by_shard: Vec<Vec<StoredBatchMetadata>>,
+    merge_order: Vec<usize>,
+}
+
+fn select_fetch_plan(
+    shard_plans: &[Vec<StoredBatchMetadata>],
+    mode: FetchMode,
+    ordered_end: LogicalOffset,
+    committed: Option<&CommittedBatchSet>,
+    max_bytes: usize,
+) -> EngineResult<FetchSelection> {
+    let mut positions = vec![0usize; shard_plans.len()];
+    let mut ready = BinaryHeap::with_capacity(shard_plans.len());
+    let mut selected = shard_plans.iter().map(|_| Vec::new()).collect::<Vec<_>>();
+    let mut merge_order = Vec::new();
+    for (lane, planned) in shard_plans.iter().enumerate() {
+        if let Some(metadata) = planned.first() {
+            ready.push(Reverse((metadata.reservation().first_offset, lane)));
+        }
+    }
+
+    let mut used = 0usize;
+    let mut selected_count = 0usize;
+    while let Some(Reverse((_, lane))) = ready.pop() {
+        let metadata = shard_plans[lane][positions[lane]];
+        positions[lane] += 1;
+        if let Some(next) = shard_plans[lane].get(positions[lane]) {
+            ready.push(Reverse((next.reservation().first_offset, lane)));
+        }
+
+        let visible = match mode {
+            FetchMode::Ordered => metadata.reservation().last_offset < ordered_end,
+            FetchMode::AsAvailable => committed
+                .expect("as-available planning has a committed snapshot")
+                .contains(metadata.reservation().batch_id),
+        };
+        if !visible {
+            if mode == FetchMode::Ordered {
+                break;
+            }
+            continue;
+        }
+
+        let next = used.checked_add(metadata.payload_len()).ok_or_else(|| {
+            EngineError::InvalidConfig("selected fetch byte count overflow".into())
+        })?;
+        if selected_count > 0 && next > max_bytes {
+            break;
+        }
+        used = next;
+        selected[lane].push(metadata);
+        merge_order.push(lane);
+        selected_count += 1;
+    }
+    Ok(FetchSelection {
+        by_shard: selected,
+        merge_order,
+    })
 }
 
 fn append_response(request_id: u128, reservation: Reservation) -> AppendResponse {
@@ -431,6 +587,7 @@ mod tests {
             target_pack_bytes: 1024,
             max_batch_bytes: 64 * 1024,
             max_fetch_bytes: 1024 * 1024,
+            append_linger: std::time::Duration::from_millis(1),
         }
     }
 
@@ -444,7 +601,7 @@ mod tests {
             topic_id: TopicId::new(1),
             partition_id: LogicalPartitionId::new(0),
             record_count: 1,
-            payload: payload.to_vec(),
+            payload: bytes::Bytes::copy_from_slice(payload),
             durability: Durability::Leader,
             producer,
             leader_epoch: None,
@@ -487,7 +644,7 @@ mod tests {
         assert_eq!(
             fetched
                 .iter()
-                .map(|batch| batch.payload.as_slice())
+                .map(|batch| batch.payload.as_ref())
                 .collect::<Vec<_>>(),
             vec![
                 b"zero".as_slice(),
@@ -506,6 +663,91 @@ mod tests {
                 .contiguous_log_end,
             LogicalOffset::new(4)
         );
+    }
+
+    #[test]
+    fn fetch_materializes_only_the_globally_selected_batches() {
+        let temp = TempDir::new("global-fetch-budget");
+        let mut engine_config = config(&temp.0);
+        engine_config.shard_count = 8;
+        engine_config.replication_factor = 1;
+        engine_config.min_in_sync_replicas = 1;
+        engine_config.target_pack_bytes = 8 * 1024 * 1024;
+        let engine = StreamEngine::open(engine_config).expect("open");
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("create topic");
+
+        let payload = vec![7u8; 32 * 1024];
+        for request_id in 0..64u128 {
+            engine
+                .append(append_request(request_id, &payload, None))
+                .expect("append");
+        }
+
+        let fetched = engine
+            .fetch(FetchRequest {
+                request_id: 1,
+                topic_id: TopicId::new(1),
+                partition_id: LogicalPartitionId::new(0),
+                start_offset: LogicalOffset::new(0),
+                max_bytes: 1024 * 1024,
+                mode: FetchMode::Ordered,
+            })
+            .expect("first fetch");
+        assert_eq!(fetched.len(), 32);
+        assert_eq!(
+            fetched
+                .iter()
+                .map(|batch| batch.batch_id.get())
+                .collect::<Vec<_>>(),
+            (0..32u128).collect::<Vec<_>>()
+        );
+
+        let fetched = engine
+            .fetch(FetchRequest {
+                request_id: 2,
+                topic_id: TopicId::new(1),
+                partition_id: LogicalPartitionId::new(0),
+                start_offset: LogicalOffset::new(32),
+                max_bytes: 1024 * 1024,
+                mode: FetchMode::Ordered,
+            })
+            .expect("second fetch");
+        assert_eq!(fetched.len(), 32);
+        assert_eq!(fetched[0].batch_id, BatchId::new(32));
+        assert_eq!(fetched[31].batch_id, BatchId::new(63));
+    }
+
+    #[test]
+    fn zero_length_batch_does_not_make_a_later_oversized_batch_free() {
+        let temp = TempDir::new("zero-length-budget");
+        let mut engine_config = config(&temp.0);
+        engine_config.shard_count = 1;
+        engine_config.replication_factor = 1;
+        engine_config.min_in_sync_replicas = 1;
+        let engine = StreamEngine::open(engine_config).expect("open");
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("create topic");
+        engine
+            .append(append_request(0, b"", None))
+            .expect("append empty batch");
+        engine
+            .append(append_request(1, &vec![1; 2 * 1024], None))
+            .expect("append oversized-for-fetch batch");
+
+        let fetched = engine.fetch(fetch_request(0)).expect("fetch");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].batch_id, BatchId::new(0));
     }
 
     #[test]
@@ -755,7 +997,9 @@ mod tests {
             LogicalOffset::new(1)
         );
         assert_eq!(
-            engine.fetch(fetch_request(0)).expect("fetch")[0].payload,
+            engine.fetch(fetch_request(0)).expect("fetch")[0]
+                .payload
+                .as_ref(),
             b"before-replication"
         );
 
@@ -872,6 +1116,53 @@ mod tests {
     }
 
     #[test]
+    fn dense_batch_index_crosses_segments_and_restarts_after_prefix_retention() {
+        let temp = TempDir::new("dense-index-segments");
+        let topic_partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        let mut engine_config = config(&temp.0);
+        engine_config.shard_count = 1;
+        engine_config.replication_factor = 1;
+        engine_config.min_in_sync_replicas = 1;
+        engine_config.target_pack_bytes = 8 * 1024 * 1024;
+
+        {
+            let engine = StreamEngine::open(engine_config.clone()).expect("open");
+            engine
+                .create_topic(TopicConfig {
+                    topic_id: TopicId::new(1),
+                    partitions: 1,
+                    shards: None,
+                })
+                .expect("create");
+            for request_id in 0..1_030u128 {
+                engine
+                    .append(append_request(request_id, &[request_id as u8], None))
+                    .expect("append across dense segments");
+            }
+
+            let fetched = engine.fetch(fetch_request(1_024)).expect("tail fetch");
+            assert_eq!(fetched.len(), 6);
+            assert_eq!(fetched[0].batch_id, BatchId::new(1_024));
+            assert_eq!(fetched[5].batch_id, BatchId::new(1_029));
+
+            let watermarks = engine
+                .truncate_partition(topic_partition, LogicalOffset::new(1_024))
+                .expect("truncate at segment boundary");
+            assert_eq!(watermarks.log_start, LogicalOffset::new(1_024));
+            assert_eq!(watermarks.contiguous_log_end, LogicalOffset::new(1_030));
+        }
+
+        let engine = StreamEngine::open(engine_config).expect("reopen");
+        assert!(matches!(
+            engine.fetch(fetch_request(1_023)),
+            Err(EngineError::OffsetOutOfRange { .. })
+        ));
+        let fetched = engine.fetch(fetch_request(1_024)).expect("retained fetch");
+        assert_eq!(fetched.len(), 6);
+        assert_eq!(fetched[0].batch_id, BatchId::new(1_024));
+    }
+
+    #[test]
     fn retention_reclaims_only_fully_expired_sealed_packs() {
         let temp = TempDir::new("retention-gc");
         let mut engine_config = config(&temp.0.join("data"));
@@ -940,6 +1231,14 @@ mod tests {
         let watermarks = engine.watermarks(topic_partition).expect("watermarks");
         assert_eq!(watermarks.allocated_end, LogicalOffset::new(256));
         assert_eq!(watermarks.contiguous_log_end, LogicalOffset::new(256));
+        let fetched = engine.fetch(fetch_request(0)).expect("live fetch");
+        assert_eq!(fetched.len(), 256);
+        assert!(
+            fetched
+                .iter()
+                .enumerate()
+                .all(|(offset, batch)| batch.first_offset == LogicalOffset::new(offset as u128))
+        );
         drop(engine);
 
         let (_, recovered_journal) =

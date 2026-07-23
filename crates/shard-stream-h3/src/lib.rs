@@ -7,7 +7,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
+use eden_logger::{LogAudience, LogContext, log_error, log_info};
 use h3::server::RequestResolver;
 use h3_quinn::quinn::{self, crypto::rustls::QuicServerConfig};
 use http::{Method, Request, Response, StatusCode};
@@ -20,7 +21,6 @@ use shard_stream_protocol::{
     encode_fetch_batches,
 };
 use tokio::sync::watch;
-use tracing::{error, info};
 
 const ALPN: &[u8] = b"h3";
 const NATIVE_BATCH_CONTENT_TYPE: &str = "application/vnd.shard-stream.batch.v1";
@@ -67,7 +67,12 @@ pub async fn serve(
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     let endpoint = quinn::Endpoint::server(server_config, config.listen)
         .map_err(display_error("failed to bind HTTP/3 endpoint"))?;
-    info!(address = %config.listen, "shard-stream HTTP/3 listener ready");
+    log_info!(
+        LogContext::<()>::new().with_feature("http3"),
+        "shard-stream HTTP/3 listener ready",
+        audience = LogAudience::Internal,
+        address = config.listen
+    );
 
     loop {
         tokio::select! {
@@ -81,10 +86,20 @@ pub async fn serve(
                     match incoming.await {
                         Ok(connection) => {
                             if let Err(error) = handle_connection(connection, engine, config).await {
-                                error!(%error, "HTTP/3 connection failed");
+                                log_error!(
+                                    LogContext::<()>::new().with_feature("http3"),
+                                    "HTTP/3 connection failed",
+                                    audience = LogAudience::Internal,
+                                    error = error
+                                );
                             }
                         }
-                        Err(error) => error!(%error, "HTTP/3 handshake failed"),
+                        Err(error) => log_error!(
+                            LogContext::<()>::new().with_feature("http3"),
+                            "HTTP/3 handshake failed",
+                            audience = LogAudience::Internal,
+                            error = error
+                        ),
                     }
                 });
             }
@@ -115,7 +130,12 @@ async fn handle_connection(
                 let config = config.clone();
                 tokio::spawn(async move {
                     if let Err(error) = handle_request(resolver, engine, config).await {
-                        error!(%error, "HTTP/3 request failed");
+                        log_error!(
+                            LogContext::<()>::new().with_feature("http3"),
+                            "HTTP/3 request failed",
+                            audience = LogAudience::Internal,
+                            error = error
+                        );
                     }
                 });
             }
@@ -291,11 +311,11 @@ where
 async fn read_body<C>(
     stream: &mut h3::server::RequestStream<C, Bytes>,
     max_bytes: usize,
-) -> Result<Vec<u8>, RouteError>
+) -> Result<Bytes, RouteError>
 where
     C: h3::quic::RecvStream,
 {
-    let mut body = Vec::new();
+    let mut body = BytesMut::new();
     while let Some(mut chunk) = stream
         .recv_data()
         .await
@@ -316,7 +336,7 @@ where
         }
         body.extend_from_slice(&chunk.copy_to_bytes(remaining));
     }
-    Ok(body)
+    Ok(body.freeze())
 }
 
 fn parse_records_path(path: &str) -> Result<(TopicId, LogicalPartitionId), RouteError> {
@@ -637,6 +657,7 @@ mod tests {
                 target_pack_bytes: 1024 * 1024,
                 max_batch_bytes: 1024 * 1024,
                 max_fetch_bytes: 1024 * 1024,
+                append_linger: std::time::Duration::from_millis(1),
             })
             .expect("engine"),
         );
@@ -723,7 +744,7 @@ mod tests {
         let fetch_body = receive_body(&mut fetch_stream).await;
         let batches = decode_fetch_batches(&fetch_body, 1024 * 1024).expect("native batches");
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].payload, b"http3");
+        assert_eq!(batches[0].payload.as_ref(), b"http3");
 
         drop(sender);
         endpoint.close(quinn::VarInt::from_u32(0), b"test complete");

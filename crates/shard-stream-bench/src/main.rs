@@ -3,11 +3,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use shard_stream_core::{LogicalOffset, LogicalPartitionId, TopicId};
 use shard_stream_engine::{EngineConfig, StreamEngine, TopicConfig};
-use shard_stream_protocol::{AppendRequest, Durability};
+use shard_stream_protocol::{AppendRequest, Durability, ProducerIdentity};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum DurabilityArg {
@@ -59,6 +60,12 @@ struct Args {
     object_store_dir: Option<PathBuf>,
     #[arg(long, default_value_t = false)]
     keep_data: bool,
+    /// Allow appending to an existing nonempty benchmark directory.
+    #[arg(long, default_value_t = false)]
+    reuse_data: bool,
+    /// Give each benchmark worker an independent idempotent producer sequence.
+    #[arg(long, default_value_t = false)]
+    idempotent_producers: bool,
     /// Fail the process when payload throughput is below this gate.
     #[arg(long)]
     min_mib_per_second: Option<f64>,
@@ -96,6 +103,7 @@ struct ResultDocument {
     payload_bytes: u64,
     batch_payload_bytes: usize,
     records_per_batch: u32,
+    idempotent_producers: bool,
     elapsed_seconds: f64,
     batches_per_second: f64,
     records_per_second: f64,
@@ -121,6 +129,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (DurabilityArg::Object, None) => Some(data_dir.with_extension("objects")),
         (_, directory) => directory,
     };
+    if !args.reuse_data {
+        require_empty_directory(&data_dir, "--data-dir")?;
+        if let Some(object_store_dir) = &object_store_dir {
+            require_empty_directory(object_store_dir, "--object-store-dir")?;
+        }
+    }
     let queue_bytes = args
         .payload_bytes
         .checked_mul(args.concurrency.max(64))
@@ -137,6 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         target_pack_bytes: 256 * 1024 * 1024,
         max_batch_bytes: args.payload_bytes,
         max_fetch_bytes: args.payload_bytes.max(1024 * 1024),
+        append_linger: std::time::Duration::from_millis(1),
     })?);
     engine.create_topic(TopicConfig {
         topic_id: TopicId::new(1),
@@ -144,20 +159,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shards: None,
     })?;
 
-    let payload = Arc::new(vec![0x5a; args.payload_bytes]);
+    let payload = Bytes::from(vec![0x5a; args.payload_bytes]);
     let next_batch = AtomicU64::new(0);
     let failed = AtomicBool::new(false);
     let start = Instant::now();
     let thread_results = std::thread::scope(|scope| {
         let mut workers = Vec::with_capacity(args.concurrency);
-        for _ in 0..args.concurrency {
+        for worker_index in 0..args.concurrency {
             let engine = Arc::clone(&engine);
-            let payload = Arc::clone(&payload);
+            let payload = payload.clone();
             let next_batch = &next_batch;
             let failed = &failed;
             workers.push(scope.spawn(move || {
                 let mut local_latencies = Vec::new();
                 let mut local_first = None;
+                let mut producer_sequence = 0u64;
                 loop {
                     if failed.load(Ordering::Relaxed) {
                         break;
@@ -172,12 +188,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         topic_id: TopicId::new(1),
                         partition_id: LogicalPartitionId::new(0),
                         record_count: args.records_per_batch,
-                        payload: payload.as_ref().clone(),
+                        payload: payload.clone(),
                         durability: args.durability.engine(),
-                        producer: None,
+                        producer: args.idempotent_producers.then_some(ProducerIdentity {
+                            producer_id: worker_index as u128 + 1,
+                            epoch: 0,
+                            first_sequence: producer_sequence,
+                        }),
                         leader_epoch: None,
                     }) {
                         Ok(response) => {
+                            if args.idempotent_producers {
+                                producer_sequence = producer_sequence
+                                    .checked_add(u64::from(args.records_per_batch))
+                                    .ok_or_else(|| "producer sequence overflow".to_owned())?;
+                            }
                             local_latencies.push(append_start.elapsed());
                             local_first = Some(
                                 local_first
@@ -263,6 +288,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         payload_bytes,
         batch_payload_bytes: args.payload_bytes,
         records_per_batch: args.records_per_batch,
+        idempotent_producers: args.idempotent_producers,
         elapsed_seconds: seconds,
         batches_per_second: args.batches as f64 / seconds,
         records_per_second: records as f64 / seconds,
@@ -336,4 +362,40 @@ fn temporary_benchmark_dir() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
     std::env::temp_dir().join(format!("shard-stream-bench-{}-{nonce}", std::process::id()))
+}
+
+fn require_empty_directory(
+    directory: &std::path::Path,
+    argument: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !directory.exists() {
+        return Ok(());
+    }
+    if !directory.is_dir() {
+        return Err(format!("{argument} must name a directory: {}", directory.display()).into());
+    }
+    if std::fs::read_dir(directory)?.next().transpose()?.is_some() {
+        return Err(format!(
+            "{argument} is nonempty; use a fresh directory or pass --reuse-data explicitly: {}",
+            directory.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_benchmark_directory_must_be_empty_by_default() {
+        let directory = temporary_benchmark_dir();
+        std::fs::create_dir_all(&directory).expect("create benchmark directory");
+        require_empty_directory(&directory, "--data-dir").expect("empty directory");
+        std::fs::write(directory.join("existing.sse"), b"existing").expect("write marker");
+        let error = require_empty_directory(&directory, "--data-dir").expect_err("reject nonempty");
+        assert!(error.to_string().contains("--reuse-data"));
+        std::fs::remove_dir_all(directory).expect("remove benchmark directory");
+    }
 }

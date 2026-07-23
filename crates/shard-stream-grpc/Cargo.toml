@@ -12,6 +12,7 @@ publish = false
 build = "build.rs"
 
 [dependencies]
+bytes.workspace = true
 prost.workspace = true
 shard-stream-core.workspace = true
 shard-stream-engine.workspace = true

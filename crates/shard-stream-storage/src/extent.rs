@@ -1,25 +1,37 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{IoSlice, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
+use bytes::Bytes;
 use shard_stream_core::{
     BatchId, LogicalOffset, LogicalPartitionId, Placement, PlacementSequence, Reservation,
     RingEpoch, ShardId, TopicId, TopicPartition,
 };
+use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
 
 use crate::codec::{Decoder, push_u32, push_u64, push_u128};
-use crate::journal::{DIGEST_BLAKE3, ProducerSequence};
+use crate::journal::{DIGEST_XXH3_128, ProducerSequence};
 use crate::{StorageError, StorageResult};
 
-const EXTENT_MAGIC: &[u8; 4] = b"SSE2";
-const EXTENT_VERSION: u8 = 2;
+const EXTENT_MAGIC: &[u8; 4] = b"SSE4";
+const EXTENT_VERSION: u8 = 4;
 const EXTENT_FLAGS: u8 = 0;
 const PREFIX_LEN: usize = 4 + 1 + 1 + 2 + 8;
-const PRODUCER_FIXED_LEN: usize = 1 + 3 + 16 + 4 + 8 + 1 + 3 + 32;
+const PRODUCER_FIXED_LEN: usize = 1 + 3 + 16 + 4 + 8 + 1 + 3 + 16;
 const BODY_FIXED_LEN: usize = 16 + 4 + 16 + 16 + 16 + 4 + 4 + 8 + 16 + PRODUCER_FIXED_LEN + 8;
 const HEADER_LEN: usize = PREFIX_LEN + BODY_FIXED_LEN;
-const CRC_LEN: usize = 4;
+const CHECKSUM_LEN: usize = 8;
+const MAX_COALESCED_READ_GAP: u64 = 4 * 1024;
+const FETCH_PLAN_INITIAL_CAPACITY: usize = 64;
+const MAX_EXTENTS_PER_WRITE: usize = 128;
+const READ_BUFFER_POOL_SLOTS: usize = 8;
+const MAX_CACHED_READ_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+static NEXT_STORE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct ShardStoreConfig {
@@ -49,7 +61,44 @@ impl ShardStoreConfig {
 pub struct StoredBatch {
     pub reservation: Reservation,
     pub producer: Option<ProducerSequence>,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredBatchMetadata {
+    reservation: Reservation,
+    producer: Option<ProducerSequence>,
+    pack_sequence: u64,
+    payload_offset: u64,
+    payload_len: usize,
+    store_token: u64,
+    plan_epoch: u64,
+}
+
+impl StoredBatchMetadata {
+    #[must_use]
+    pub const fn reservation(self) -> Reservation {
+        self.reservation
+    }
+
+    #[must_use]
+    pub const fn payload_len(self) -> usize {
+        self.payload_len
+    }
+}
+
+#[derive(Debug)]
+pub struct PreparedExtent {
+    reservation: Reservation,
+    producer: Option<ProducerSequence>,
+    payload: Bytes,
+    encoded: EncodedExtent,
+}
+
+impl PreparedExtent {
+    pub fn reservation(&self) -> Reservation {
+        self.reservation
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,12 +141,124 @@ struct ActivePack {
 }
 
 #[derive(Debug)]
+struct ReadBufferOwner {
+    buffer: Option<Vec<u8>>,
+    recycle: SyncSender<Vec<u8>>,
+    cached_buffers: Arc<AtomicUsize>,
+}
+
+impl AsRef<[u8]> for ReadBufferOwner {
+    fn as_ref(&self) -> &[u8] {
+        self.buffer.as_deref().expect("read buffer owner is live")
+    }
+}
+
+impl Drop for ReadBufferOwner {
+    fn drop(&mut self) {
+        let Some(buffer) = self.buffer.take() else {
+            return;
+        };
+        if buffer.capacity() <= MAX_CACHED_READ_BUFFER_BYTES
+            && claim_read_buffer_slot(&self.cached_buffers)
+            && self.recycle.try_send(buffer).is_err()
+        {
+            self.cached_buffers.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ReadBufferPool {
+    available: Vec<Vec<u8>>,
+    recycle: SyncSender<Vec<u8>>,
+    recycled: Receiver<Vec<u8>>,
+    cached_buffers: Arc<AtomicUsize>,
+}
+
+impl ReadBufferPool {
+    fn new() -> Self {
+        let (recycle, recycled) = sync_channel(READ_BUFFER_POOL_SLOTS);
+        let cached_buffers = Arc::new(AtomicUsize::new(0));
+        Self {
+            available: Vec::with_capacity(READ_BUFFER_POOL_SLOTS),
+            recycle,
+            recycled,
+            cached_buffers,
+        }
+    }
+
+    fn take(&mut self, len: usize) -> Vec<u8> {
+        self.drain_recycled();
+        let selected = self
+            .available
+            .iter()
+            .enumerate()
+            .filter(|(_, buffer)| buffer.capacity() >= len)
+            .min_by_key(|(_, buffer)| buffer.capacity())
+            .map(|(index, _)| index)
+            .or_else(|| {
+                self.available
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, buffer)| buffer.capacity())
+                    .map(|(index, _)| index)
+            });
+        let mut buffer = if let Some(index) = selected {
+            let previous = self.cached_buffers.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(previous > 0, "read buffer cache slot underflow");
+            self.available.swap_remove(index)
+        } else {
+            Vec::new()
+        };
+        buffer.resize(len, 0);
+        buffer
+    }
+
+    fn recycle_now(&mut self, buffer: Vec<u8>) {
+        if buffer.capacity() <= MAX_CACHED_READ_BUFFER_BYTES
+            && claim_read_buffer_slot(&self.cached_buffers)
+        {
+            self.available.push(buffer);
+        }
+    }
+
+    fn lease_bytes(&self, buffer: Vec<u8>) -> Bytes {
+        Bytes::from_owner(ReadBufferOwner {
+            buffer: Some(buffer),
+            recycle: self.recycle.clone(),
+            cached_buffers: Arc::clone(&self.cached_buffers),
+        })
+    }
+
+    fn drain_recycled(&mut self) {
+        while self.available.len() < READ_BUFFER_POOL_SLOTS {
+            let Ok(buffer) = self.recycled.try_recv() else {
+                break;
+            };
+            self.available.push(buffer);
+        }
+    }
+}
+
+fn claim_read_buffer_slot(cached_buffers: &AtomicUsize) -> bool {
+    cached_buffers
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cached| {
+            (cached < READ_BUFFER_POOL_SLOTS).then_some(cached + 1)
+        })
+        .is_ok()
+}
+
+#[derive(Debug)]
 pub struct ShardStore {
     config: ShardStoreConfig,
+    store_token: u64,
+    plan_epoch: u64,
     active: ActivePack,
     index: HashMap<TopicPartition, Vec<ExtentLocation>>,
     by_batch: HashMap<(TopicPartition, BatchId), ExtentLocation>,
     pack_paths: BTreeMap<u64, PathBuf>,
+    pack_readers: BTreeMap<u64, File>,
+    read_buffer_pool: ReadBufferPool,
 }
 
 impl ShardStore {
@@ -143,8 +304,24 @@ impl ShardStore {
             .write(true)
             .open(&active_path)?;
         let active_bytes = active_file.metadata()?.len();
+        let pack_readers = pack_paths
+            .iter()
+            .map(|(&sequence, path)| {
+                OpenOptions::new()
+                    .read(true)
+                    .open(path)
+                    .map(|file| (sequence, file))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let store_token = NEXT_STORE_TOKEN
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
+                token.checked_add(1)
+            })
+            .map_err(|_| StorageError::LimitExceeded("store token space exhausted".into()))?;
         Ok(Self {
             config,
+            store_token,
+            plan_epoch: 0,
             active: ActivePack {
                 sequence: last_sequence,
                 file: active_file,
@@ -153,6 +330,8 @@ impl ShardStore {
             index,
             by_batch,
             pack_paths,
+            pack_readers,
+            read_buffer_pool: ReadBufferPool::new(),
         })
     }
 
@@ -163,6 +342,102 @@ impl ShardStore {
         payload: &[u8],
         sync: bool,
     ) -> StorageResult<()> {
+        self.validate_append(reservation, payload)?;
+        let encoded = encode_extent(reservation, producer, payload)?;
+        self.append_encoded(reservation, producer, payload, &encoded, sync)
+    }
+
+    pub fn append_and_prepare(
+        &mut self,
+        reservation: Reservation,
+        producer: Option<ProducerSequence>,
+        payload: Bytes,
+        sync: bool,
+    ) -> StorageResult<PreparedExtent> {
+        let prepared = self.prepare_append(reservation, producer, payload)?;
+        self.append_prepared(&prepared, sync)?;
+        Ok(prepared)
+    }
+
+    pub fn prepare_append(
+        &self,
+        reservation: Reservation,
+        producer: Option<ProducerSequence>,
+        payload: Bytes,
+    ) -> StorageResult<PreparedExtent> {
+        self.validate_append(reservation, &payload)?;
+        let encoded = encode_extent(reservation, producer, &payload)?;
+        Ok(PreparedExtent {
+            reservation,
+            producer,
+            payload,
+            encoded,
+        })
+    }
+
+    pub fn append_prepared(&mut self, prepared: &PreparedExtent, sync: bool) -> StorageResult<()> {
+        self.append_prepared_group(&[prepared], sync)
+    }
+
+    pub fn append_prepared_group(
+        &mut self,
+        prepared: &[&PreparedExtent],
+        sync: bool,
+    ) -> StorageResult<()> {
+        let mut group_keys = HashSet::with_capacity(prepared.len());
+        for extent in prepared {
+            self.validate_append(extent.reservation, &extent.payload)?;
+            let key = (
+                TopicPartition::new(extent.reservation.topic_id, extent.reservation.partition_id),
+                extent.reservation.batch_id,
+            );
+            if !group_keys.insert(key) {
+                return Err(StorageError::InvalidInput(format!(
+                    "batch {} appears more than once in an append group",
+                    extent.reservation.batch_id
+                )));
+            }
+        }
+
+        let mut first = 0usize;
+        while first < prepared.len() {
+            let first_frame_len = u64::try_from(prepared[first].encoded.frame_len)
+                .map_err(|_| StorageError::LimitExceeded("extent frame exceeds u64".into()))?;
+            if self.active.bytes > 0
+                && self
+                    .active
+                    .bytes
+                    .checked_add(first_frame_len)
+                    .is_none_or(|next| next > self.config.target_pack_bytes)
+            {
+                self.rotate()?;
+            }
+
+            let mut end = first;
+            let mut pack_bytes = self.active.bytes;
+            while end < prepared.len() && end - first < MAX_EXTENTS_PER_WRITE {
+                let frame_len = u64::try_from(prepared[end].encoded.frame_len)
+                    .map_err(|_| StorageError::LimitExceeded("extent frame exceeds u64".into()))?;
+                let next = pack_bytes
+                    .checked_add(frame_len)
+                    .ok_or_else(|| StorageError::LimitExceeded("pack length overflow".into()))?;
+                if pack_bytes > 0 && next > self.config.target_pack_bytes {
+                    break;
+                }
+                pack_bytes = next;
+                end += 1;
+            }
+            debug_assert!(end > first);
+            self.append_prepared_segment(&prepared[first..end])?;
+            first = end;
+        }
+        if sync && !prepared.is_empty() {
+            self.sync()?;
+        }
+        Ok(())
+    }
+
+    fn validate_append(&self, reservation: Reservation, payload: &[u8]) -> StorageResult<()> {
         if reservation.placement.shard_id != self.config.shard_id {
             return Err(StorageError::InvalidInput(format!(
                 "reservation targets shard {}, store owns {}",
@@ -186,13 +461,26 @@ impl ShardStore {
                 reservation.batch_id
             )));
         }
+        Ok(())
+    }
 
-        let encoded = encode_extent(reservation, producer, payload)?;
+    fn append_encoded(
+        &mut self,
+        reservation: Reservation,
+        producer: Option<ProducerSequence>,
+        payload: &[u8],
+        encoded: &EncodedExtent,
+        sync: bool,
+    ) -> StorageResult<()> {
+        let key = (
+            TopicPartition::new(reservation.topic_id, reservation.partition_id),
+            reservation.batch_id,
+        );
         if self.active.bytes > 0
             && self
                 .active
                 .bytes
-                .checked_add(encoded.len() as u64)
+                .checked_add(encoded.frame_len as u64)
                 .is_none_or(|next| next > self.config.target_pack_bytes)
         {
             self.rotate()?;
@@ -200,7 +488,12 @@ impl ShardStore {
 
         let frame_offset = self.active.bytes;
         self.active.file.seek(SeekFrom::Start(frame_offset))?;
-        if let Err(error) = self.active.file.write_all(&encoded) {
+        if let Err(error) = write_extent_frame(
+            &mut self.active.file,
+            &encoded.header,
+            payload,
+            &encoded.checksum,
+        ) {
             let _ = self.active.file.set_len(frame_offset);
             return Err(error.into());
         }
@@ -211,7 +504,7 @@ impl ShardStore {
         self.active.bytes = self
             .active
             .bytes
-            .checked_add(encoded.len() as u64)
+            .checked_add(encoded.frame_len as u64)
             .ok_or_else(|| StorageError::LimitExceeded("pack length overflow".into()))?;
 
         let location = ExtentLocation {
@@ -221,9 +514,76 @@ impl ShardStore {
             payload_offset: frame_offset + HEADER_LEN as u64,
             payload_len: payload.len(),
         };
-        self.index.entry(key.0).or_default().push(location.clone());
+        let locations = self.index.entry(key.0).or_default();
+        if locations
+            .last()
+            .is_none_or(|last| last.reservation.first_offset < reservation.first_offset)
+        {
+            locations.push(location.clone());
+        } else {
+            let insertion = locations.partition_point(|existing| {
+                existing.reservation.first_offset < reservation.first_offset
+            });
+            locations.insert(insertion, location.clone());
+        }
         self.by_batch.insert(key, location);
         Ok(())
+    }
+
+    fn append_prepared_segment(&mut self, prepared: &[&PreparedExtent]) -> StorageResult<()> {
+        let frame_offset = self.active.bytes;
+        self.active.file.seek(SeekFrom::Start(frame_offset))?;
+        let mut slices = Vec::with_capacity(prepared.len().saturating_mul(3));
+        for extent in prepared {
+            slices.push(IoSlice::new(&extent.encoded.header));
+            slices.push(IoSlice::new(&extent.payload));
+            slices.push(IoSlice::new(&extent.encoded.checksum));
+        }
+        if let Err(error) = write_all_vectored(&mut self.active.file, &mut slices) {
+            let _ = self.active.file.set_len(frame_offset);
+            return Err(error.into());
+        }
+        self.active.file.flush()?;
+
+        let mut next_frame_offset = frame_offset;
+        for extent in prepared {
+            let location = ExtentLocation {
+                reservation: extent.reservation,
+                producer: extent.producer,
+                pack_sequence: self.active.sequence,
+                payload_offset: next_frame_offset + HEADER_LEN as u64,
+                payload_len: extent.payload.len(),
+            };
+            self.install_location(location);
+            next_frame_offset = next_frame_offset
+                .checked_add(extent.encoded.frame_len as u64)
+                .ok_or_else(|| StorageError::LimitExceeded("pack length overflow".into()))?;
+        }
+        self.active.bytes = next_frame_offset;
+        Ok(())
+    }
+
+    fn install_location(&mut self, location: ExtentLocation) {
+        let key = (
+            TopicPartition::new(
+                location.reservation.topic_id,
+                location.reservation.partition_id,
+            ),
+            location.reservation.batch_id,
+        );
+        let locations = self.index.entry(key.0).or_default();
+        if locations
+            .last()
+            .is_none_or(|last| last.reservation.first_offset < location.reservation.first_offset)
+        {
+            locations.push(location.clone());
+        } else {
+            let insertion = locations.partition_point(|existing| {
+                existing.reservation.first_offset < location.reservation.first_offset
+            });
+            locations.insert(insertion, location.clone());
+        }
+        self.by_batch.insert(key, location);
     }
 
     pub fn contains(&self, reservation: &Reservation) -> bool {
@@ -233,7 +593,7 @@ impl ShardStore {
         ))
     }
 
-    pub fn read_batch(&self, reservation: &Reservation) -> StorageResult<Option<StoredBatch>> {
+    pub fn read_batch(&mut self, reservation: &Reservation) -> StorageResult<Option<StoredBatch>> {
         let Some(location) = self.by_batch.get(&(
             TopicPartition::new(reservation.topic_id, reservation.partition_id),
             reservation.batch_id,
@@ -246,41 +606,36 @@ impl ShardStore {
                 reservation.batch_id
             )));
         }
-        let path = self
-            .pack_paths
-            .get(&location.pack_sequence)
-            .ok_or_else(|| StorageError::InvalidInput("indexed pack is missing".into()))?;
-        let mut file = File::open(path)?;
-        file.seek(SeekFrom::Start(location.payload_offset))?;
-        let mut payload = vec![0; location.payload_len];
-        file.read_exact(&mut payload)?;
-        Ok(Some(StoredBatch {
-            reservation: *reservation,
-            producer: location.producer,
-            payload,
-        }))
+        let planned = self.metadata_for(location);
+        Ok(self.read_fetch_plan(&[planned])?.pop())
     }
 
-    pub fn fetch(
+    pub fn plan_fetch(
         &self,
         topic_partition: TopicPartition,
         start_offset: LogicalOffset,
         max_bytes: usize,
-    ) -> StorageResult<Vec<StoredBatch>> {
-        if max_bytes == 0 {
+        max_batches: usize,
+    ) -> StorageResult<Vec<StoredBatchMetadata>> {
+        if max_bytes == 0 || max_batches == 0 {
             return Err(StorageError::InvalidInput(
-                "fetch max_bytes must be nonzero".into(),
+                "fetch byte and batch limits must be nonzero".into(),
             ));
         }
         let Some(locations) = self.index.get(&topic_partition) else {
             return Ok(Vec::new());
         };
 
-        let mut result = Vec::new();
+        let first =
+            locations.partition_point(|location| location.reservation.last_offset < start_offset);
+        let capacity = FETCH_PLAN_INITIAL_CAPACITY
+            .min(max_batches)
+            .min(locations.len().saturating_sub(first));
+        let mut result = Vec::with_capacity(capacity);
         let mut used = 0usize;
-        for location in locations {
-            if location.reservation.last_offset < start_offset {
-                continue;
+        for location in &locations[first..] {
+            if result.len() == max_batches {
+                break;
             }
             let next = used
                 .checked_add(location.payload_len)
@@ -288,22 +643,81 @@ impl ShardStore {
             if !result.is_empty() && next > max_bytes {
                 break;
             }
-            let path = self
-                .pack_paths
-                .get(&location.pack_sequence)
-                .ok_or_else(|| StorageError::InvalidInput("indexed pack is missing".into()))?;
-            let mut file = File::open(path)?;
-            file.seek(SeekFrom::Start(location.payload_offset))?;
-            let mut payload = vec![0; location.payload_len];
-            file.read_exact(&mut payload)?;
-            result.push(StoredBatch {
-                reservation: location.reservation,
-                producer: location.producer,
-                payload,
-            });
+            result.push(self.metadata_for(location));
             used = next;
         }
         Ok(result)
+    }
+
+    pub fn read_fetch_plan(
+        &mut self,
+        planned: &[StoredBatchMetadata],
+    ) -> StorageResult<Vec<StoredBatch>> {
+        if planned.iter().any(|metadata| {
+            metadata.store_token != self.store_token || metadata.plan_epoch != self.plan_epoch
+        }) {
+            return Err(StorageError::InvalidInput(
+                "fetch plan does not belong to the current store generation".into(),
+            ));
+        }
+        let mut result = Vec::with_capacity(planned.len());
+        let mut first = 0usize;
+        while first < planned.len() {
+            let mut end = first + 1;
+            let mut range_end = payload_end(&planned[first])?;
+            while end < planned.len() {
+                let next = planned[end];
+                if next.pack_sequence != planned[first].pack_sequence
+                    || next.payload_offset < range_end
+                    || next.payload_offset - range_end > MAX_COALESCED_READ_GAP
+                {
+                    break;
+                }
+                range_end = payload_end(&next)?;
+                end += 1;
+            }
+
+            let range_start = planned[first].payload_offset;
+            let range_len = usize::try_from(range_end - range_start)
+                .map_err(|_| StorageError::LimitExceeded("fetch range exceeds usize".into()))?;
+            let reader = self
+                .pack_readers
+                .get(&planned[first].pack_sequence)
+                .ok_or_else(|| StorageError::InvalidInput("planned pack is missing".into()))?;
+            let mut buffer = self.read_buffer_pool.take(range_len);
+            if let Err(error) = read_exact_at(reader, &mut buffer, range_start) {
+                self.read_buffer_pool.recycle_now(buffer);
+                return Err(error.into());
+            }
+            let buffer = self.read_buffer_pool.lease_bytes(buffer);
+
+            for metadata in &planned[first..end] {
+                let payload_start = usize::try_from(metadata.payload_offset - range_start)
+                    .map_err(|_| {
+                        StorageError::LimitExceeded("payload offset exceeds usize".into())
+                    })?;
+                let payload_end = payload_start
+                    .checked_add(metadata.payload_len)
+                    .ok_or_else(|| StorageError::LimitExceeded("payload range overflow".into()))?;
+                result.push(StoredBatch {
+                    reservation: metadata.reservation,
+                    producer: metadata.producer,
+                    payload: buffer.slice(payload_start..payload_end),
+                });
+            }
+            first = end;
+        }
+        Ok(result)
+    }
+
+    pub fn fetch(
+        &mut self,
+        topic_partition: TopicPartition,
+        start_offset: LogicalOffset,
+        max_bytes: usize,
+    ) -> StorageResult<Vec<StoredBatch>> {
+        let planned = self.plan_fetch(topic_partition, start_offset, max_bytes, usize::MAX)?;
+        self.read_fetch_plan(&planned)
     }
 
     #[must_use]
@@ -389,9 +803,16 @@ impl ShardStore {
             })
             .collect::<Vec<_>>();
 
+        if !removable.is_empty() {
+            self.plan_epoch = self
+                .plan_epoch
+                .checked_add(1)
+                .ok_or_else(|| StorageError::LimitExceeded("fetch plan epoch exhausted".into()))?;
+        }
         let mut stats = GarbageCollectionStats::default();
         for (sequence, path, extents) in removable {
             let bytes = path.metadata()?.len();
+            self.pack_readers.remove(&sequence);
             fs::remove_file(&path)?;
             sync_directory(&self.config.directory)?;
             self.pack_paths.remove(&sequence);
@@ -429,7 +850,9 @@ impl ShardStore {
             .read(true)
             .write(true)
             .open(&path)?;
+        let reader = OpenOptions::new().read(true).open(&path)?;
         self.pack_paths.insert(sequence, path.clone());
+        self.pack_readers.insert(sequence, reader);
         self.active = ActivePack {
             sequence,
             file,
@@ -437,61 +860,161 @@ impl ShardStore {
         };
         Ok(())
     }
+
+    fn metadata_for(&self, location: &ExtentLocation) -> StoredBatchMetadata {
+        StoredBatchMetadata {
+            reservation: location.reservation,
+            producer: location.producer,
+            pack_sequence: location.pack_sequence,
+            payload_offset: location.payload_offset,
+            payload_len: location.payload_len,
+            store_token: self.store_token,
+            plan_epoch: self.plan_epoch,
+        }
+    }
+}
+
+fn payload_end(metadata: &StoredBatchMetadata) -> StorageResult<u64> {
+    metadata
+        .payload_offset
+        .checked_add(
+            u64::try_from(metadata.payload_len)
+                .map_err(|_| StorageError::LimitExceeded("payload length exceeds u64".into()))?,
+        )
+        .ok_or_else(|| StorageError::LimitExceeded("payload end overflow".into()))
+}
+
+fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    while !buffer.is_empty() {
+        match file.read_at(buffer, offset)? {
+            0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "planned extent ended before its payload",
+                ));
+            }
+            read => {
+                offset = offset
+                    .checked_add(read as u64)
+                    .ok_or_else(|| std::io::Error::other("read offset overflow"))?;
+                buffer = &mut buffer[read..];
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct EncodedExtent {
+    header: Vec<u8>,
+    checksum: [u8; CHECKSUM_LEN],
+    frame_len: usize,
 }
 
 fn encode_extent(
     reservation: Reservation,
     producer: Option<ProducerSequence>,
     payload: &[u8],
-) -> StorageResult<Vec<u8>> {
+) -> StorageResult<EncodedExtent> {
     let frame_len = HEADER_LEN
         .checked_add(payload.len())
-        .and_then(|value| value.checked_add(CRC_LEN))
+        .and_then(|value| value.checked_add(CHECKSUM_LEN))
         .ok_or_else(|| StorageError::LimitExceeded("extent frame length overflow".into()))?;
     let frame_len_u64 = u64::try_from(frame_len)
         .map_err(|_| StorageError::LimitExceeded("extent frame exceeds u64".into()))?;
     let payload_len_u64 = u64::try_from(payload.len())
         .map_err(|_| StorageError::LimitExceeded("payload exceeds u64".into()))?;
 
-    let mut bytes = Vec::with_capacity(frame_len);
-    bytes.extend_from_slice(EXTENT_MAGIC);
-    bytes.push(EXTENT_VERSION);
-    bytes.push(EXTENT_FLAGS);
-    bytes.extend_from_slice(&(HEADER_LEN as u16).to_le_bytes());
-    push_u64(&mut bytes, frame_len_u64);
-    push_u128(&mut bytes, reservation.topic_id.get());
-    push_u32(&mut bytes, reservation.partition_id.get());
-    push_u128(&mut bytes, reservation.batch_id.get());
-    push_u128(&mut bytes, reservation.first_offset.get());
-    push_u128(&mut bytes, reservation.last_offset.get());
-    push_u32(&mut bytes, reservation.record_count.get());
-    push_u32(&mut bytes, reservation.placement.shard_id.get());
-    push_u64(&mut bytes, reservation.placement.ring_epoch.get());
-    push_u128(&mut bytes, reservation.placement.sequence.get());
+    let mut header = Vec::with_capacity(HEADER_LEN);
+    header.extend_from_slice(EXTENT_MAGIC);
+    header.push(EXTENT_VERSION);
+    header.push(EXTENT_FLAGS);
+    header.extend_from_slice(&(HEADER_LEN as u16).to_le_bytes());
+    push_u64(&mut header, frame_len_u64);
+    push_u128(&mut header, reservation.topic_id.get());
+    push_u32(&mut header, reservation.partition_id.get());
+    push_u128(&mut header, reservation.batch_id.get());
+    push_u128(&mut header, reservation.first_offset.get());
+    push_u128(&mut header, reservation.last_offset.get());
+    push_u32(&mut header, reservation.record_count.get());
+    push_u32(&mut header, reservation.placement.shard_id.get());
+    push_u64(&mut header, reservation.placement.ring_epoch.get());
+    push_u128(&mut header, reservation.placement.sequence.get());
     match producer {
         Some(producer) => {
-            if producer.digest_algorithm != DIGEST_BLAKE3 {
+            if producer.digest_algorithm != DIGEST_XXH3_128 {
                 return Err(StorageError::InvalidInput(
                     "unsupported producer payload digest algorithm".into(),
                 ));
             }
-            bytes.push(1);
-            bytes.extend_from_slice(&[0; 3]);
-            push_u128(&mut bytes, producer.producer_id);
-            push_u32(&mut bytes, producer.epoch);
-            push_u64(&mut bytes, producer.first_sequence);
-            bytes.push(producer.digest_algorithm);
-            bytes.extend_from_slice(&[0; 3]);
-            bytes.extend_from_slice(&producer.payload_digest);
+            header.push(1);
+            header.extend_from_slice(&[0; 3]);
+            push_u128(&mut header, producer.producer_id);
+            push_u32(&mut header, producer.epoch);
+            push_u64(&mut header, producer.first_sequence);
+            header.push(producer.digest_algorithm);
+            header.extend_from_slice(&[0; 3]);
+            header.extend_from_slice(&producer.payload_digest);
         }
-        None => bytes.extend_from_slice(&[0; PRODUCER_FIXED_LEN]),
+        None => header.extend_from_slice(&[0; PRODUCER_FIXED_LEN]),
     }
-    push_u64(&mut bytes, payload_len_u64);
-    debug_assert_eq!(bytes.len(), HEADER_LEN);
-    bytes.extend_from_slice(payload);
-    let checksum = crc32fast::hash(&bytes);
-    push_u32(&mut bytes, checksum);
-    Ok(bytes)
+    push_u64(&mut header, payload_len_u64);
+    debug_assert_eq!(header.len(), HEADER_LEN);
+    Ok(EncodedExtent {
+        checksum: extent_checksum(&header, payload).to_le_bytes(),
+        header,
+        frame_len,
+    })
+}
+
+fn extent_checksum(header: &[u8], payload: &[u8]) -> u64 {
+    xxh3_64_with_seed(payload, xxh3_64(header))
+}
+
+fn write_extent_frame(
+    writer: &mut impl Write,
+    header: &[u8],
+    payload: &[u8],
+    checksum: &[u8; CHECKSUM_LEN],
+) -> std::io::Result<()> {
+    let parts = [header, payload, checksum.as_slice()];
+    let slices = [
+        IoSlice::new(parts[0]),
+        IoSlice::new(parts[1]),
+        IoSlice::new(parts[2]),
+    ];
+    let written = writer.write_vectored(&slices)?;
+    if written == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "failed to write extent frame",
+        ));
+    }
+    let mut remaining_skip = written;
+    for part in parts {
+        if remaining_skip >= part.len() {
+            remaining_skip -= part.len();
+        } else {
+            writer.write_all(&part[remaining_skip..])?;
+            remaining_skip = 0;
+        }
+    }
+    Ok(())
+}
+
+fn write_all_vectored(writer: &mut impl Write, buffers: &mut [IoSlice<'_>]) -> std::io::Result<()> {
+    let mut remaining = buffers;
+    while !remaining.is_empty() {
+        let written = writer.write_vectored(remaining)?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "failed to write grouped extent frames",
+            ));
+        }
+        IoSlice::advance_slices(&mut remaining, written);
+    }
+    Ok(())
 }
 
 fn decode_extent(
@@ -500,16 +1023,19 @@ fn decode_extent(
     frame: &[u8],
     expected_shard: ShardId,
 ) -> StorageResult<ExtentLocation> {
-    if frame.len() < HEADER_LEN + CRC_LEN {
+    if frame.len() < HEADER_LEN + CHECKSUM_LEN {
         return Err(StorageError::corrupt(path, frame_offset, "frame too short"));
     }
-    let expected_crc = u32::from_le_bytes(
-        frame[frame.len() - CRC_LEN..]
+    let expected_checksum = u64::from_le_bytes(
+        frame[frame.len() - CHECKSUM_LEN..]
             .try_into()
-            .expect("CRC width"),
+            .expect("checksum width"),
     );
-    let actual_crc = crc32fast::hash(&frame[..frame.len() - CRC_LEN]);
-    if actual_crc != expected_crc {
+    let actual_checksum = extent_checksum(
+        &frame[..HEADER_LEN],
+        &frame[HEADER_LEN..frame.len() - CHECKSUM_LEN],
+    );
+    if actual_checksum != expected_checksum {
         return Err(StorageError::corrupt(
             path,
             frame_offset,
@@ -517,7 +1043,7 @@ fn decode_extent(
         ));
     }
 
-    let mut decoder = Decoder::new(&frame[PREFIX_LEN..frame.len() - CRC_LEN]);
+    let mut decoder = Decoder::new(&frame[PREFIX_LEN..frame.len() - CHECKSUM_LEN]);
     let topic_id = TopicId::new(decoder.u128()?);
     let partition_id = LogicalPartitionId::new(decoder.u32()?);
     let batch_id = BatchId::new(decoder.u128()?);
@@ -535,7 +1061,7 @@ fn decode_extent(
     let producer_first_sequence = decoder.u64()?;
     let digest_algorithm = decoder.u8()?;
     let digest_reserved = decoder.take(3)?;
-    let payload_digest: [u8; 32] = decoder.take(32)?.try_into().expect("producer digest width");
+    let payload_digest: [u8; 16] = decoder.take(16)?.try_into().expect("producer digest width");
     if producer_reserved != [0; 3] || digest_reserved != [0; 3] {
         return Err(StorageError::corrupt(
             path,
@@ -549,7 +1075,7 @@ fn decode_extent(
                 || producer_epoch != 0
                 || producer_first_sequence != 0
                 || digest_algorithm != 0
-                || payload_digest != [0; 32]
+                || payload_digest != [0; 16]
             {
                 return Err(StorageError::corrupt(
                     path,
@@ -559,7 +1085,7 @@ fn decode_extent(
             }
             None
         }
-        1 if digest_algorithm == DIGEST_BLAKE3 => Some(ProducerSequence {
+        1 if digest_algorithm == DIGEST_XXH3_128 => Some(ProducerSequence {
             producer_id,
             epoch: producer_epoch,
             first_sequence: producer_first_sequence,
@@ -662,9 +1188,9 @@ fn scan_pack(
         let frame_len = u64::from_le_bytes(prefix[8..16].try_into().expect("frame length"));
         let max_frame_len = (HEADER_LEN as u64)
             .checked_add(max_batch_bytes as u64)
-            .and_then(|value| value.checked_add(CRC_LEN as u64))
+            .and_then(|value| value.checked_add(CHECKSUM_LEN as u64))
             .ok_or_else(|| StorageError::LimitExceeded("configured frame limit overflow".into()))?;
-        if frame_len < (HEADER_LEN + CRC_LEN) as u64 || frame_len > max_frame_len {
+        if frame_len < (HEADER_LEN + CHECKSUM_LEN) as u64 || frame_len > max_frame_len {
             return Err(StorageError::corrupt(
                 path,
                 offset,
@@ -765,10 +1291,109 @@ fn sync_directory(path: &Path) -> StorageResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::num::NonZeroU32;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    struct ShortWriter {
+        bytes: Vec<u8>,
+        max_write: usize,
+    }
+
+    impl Write for ShortWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let written = bytes.len().min(self.max_write);
+            self.bytes.extend_from_slice(&bytes[..written]);
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn write_vectored(&mut self, buffers: &[IoSlice<'_>]) -> io::Result<usize> {
+            let Some(first) = buffers.iter().find(|buffer| !buffer.is_empty()) else {
+                return Ok(0);
+            };
+            self.write(first)
+        }
+    }
+
+    #[test]
+    fn vectored_extent_write_completes_after_a_short_first_write() {
+        let mut writer = ShortWriter {
+            bytes: Vec::new(),
+            max_write: 3,
+        };
+        write_extent_frame(&mut writer, b"header", b"payload", &123u64.to_le_bytes())
+            .expect("write frame");
+        assert_eq!(writer.bytes, b"headerpayload{\0\0\0\0\0\0\0");
+    }
+
+    #[test]
+    fn grouped_vectored_write_completes_across_short_writes_and_slices() {
+        let mut writer = ShortWriter {
+            bytes: Vec::new(),
+            max_write: 3,
+        };
+        let mut slices = [
+            IoSlice::new(b"header"),
+            IoSlice::new(b"payload"),
+            IoSlice::new(b"checksum"),
+            IoSlice::new(b"next"),
+        ];
+        write_all_vectored(&mut writer, &mut slices).expect("write grouped frames");
+        assert_eq!(writer.bytes, b"headerpayloadchecksumnext");
+    }
+
+    #[test]
+    fn read_buffer_is_recycled_after_the_last_bytes_slice_is_dropped() {
+        let mut pool = ReadBufferPool::new();
+        let mut buffer = Vec::with_capacity(1024);
+        buffer.resize(1024, 7);
+        let original_pointer = buffer.as_ptr();
+
+        let bytes = pool.lease_bytes(buffer);
+        let slice = bytes.slice(1..);
+        drop(bytes);
+        pool.drain_recycled();
+        assert!(pool.available.is_empty());
+        assert_eq!(pool.cached_buffers.load(Ordering::Acquire), 0);
+
+        drop(slice);
+        let reused = pool.take(512);
+        assert_eq!(reused.as_ptr(), original_pointer);
+        assert_eq!(reused.len(), 512);
+        assert_eq!(pool.cached_buffers.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn read_buffer_cache_limit_includes_ready_and_returned_buffers() {
+        let mut pool = ReadBufferPool::new();
+        let first_wave = (0..READ_BUFFER_POOL_SLOTS)
+            .map(|_| pool.lease_bytes(vec![0; 64]))
+            .collect::<Vec<_>>();
+        drop(first_wave);
+        pool.drain_recycled();
+        assert_eq!(pool.available.len(), READ_BUFFER_POOL_SLOTS);
+        assert_eq!(
+            pool.cached_buffers.load(Ordering::Acquire),
+            READ_BUFFER_POOL_SLOTS
+        );
+
+        let second_wave = (0..READ_BUFFER_POOL_SLOTS)
+            .map(|_| pool.lease_bytes(vec![0; 64]))
+            .collect::<Vec<_>>();
+        drop(second_wave);
+        pool.drain_recycled();
+        assert_eq!(pool.available.len(), READ_BUFFER_POOL_SLOTS);
+        assert_eq!(
+            pool.cached_buffers.load(Ordering::Acquire),
+            READ_BUFFER_POOL_SLOTS
+        );
+    }
 
     struct TempDir(PathBuf);
 
@@ -832,7 +1457,7 @@ mod tests {
             assert!(store.pack_paths.len() >= 2);
         }
 
-        let store = ShardStore::open(config(&temp.0, 150)).expect("reopen");
+        let mut store = ShardStore::open(config(&temp.0, 150)).expect("reopen");
         let batches = store
             .fetch(
                 TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0)),
@@ -843,9 +1468,147 @@ mod tests {
         assert_eq!(
             batches
                 .iter()
-                .map(|batch| batch.payload.as_slice())
+                .map(|batch| batch.payload.as_ref())
                 .collect::<Vec<_>>(),
             vec![b"first".as_slice(), b"second".as_slice()]
+        );
+    }
+
+    #[test]
+    fn metadata_fetch_plan_is_bounded_and_materializes_only_selected_extents() {
+        let temp = TempDir::new("planned-fetch");
+        let mut store = ShardStore::open(config(&temp.0, 1)).expect("open");
+        for (batch, payload) in [
+            (0, b"zero".as_slice()),
+            (1, b"one".as_slice()),
+            (2, b"two".as_slice()),
+        ] {
+            store
+                .append(reservation(batch, batch * 2, 3), None, payload, false)
+                .expect("append");
+        }
+        let topic_partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+
+        let planned = store
+            .plan_fetch(topic_partition, LogicalOffset::new(0), 1024, 2)
+            .expect("plan");
+        assert_eq!(planned.len(), 2);
+        assert_eq!(
+            planned
+                .iter()
+                .map(|metadata| metadata.reservation.batch_id)
+                .collect::<Vec<_>>(),
+            vec![BatchId::new(0), BatchId::new(1)]
+        );
+
+        let batches = store
+            .read_fetch_plan(&planned[..1])
+            .expect("read selection");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].payload.as_ref(), b"zero");
+
+        store
+            .garbage_collect(&HashMap::from([(topic_partition, LogicalOffset::new(2))]))
+            .expect("garbage collect first planned extent");
+        assert!(matches!(
+            store.read_fetch_plan(&planned[..1]),
+            Err(StorageError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn grouped_prepared_append_rotates_and_recovers_every_extent() {
+        let temp = TempDir::new("grouped-append");
+        let store_config = config(&temp.0, 300);
+        let mut store = ShardStore::open(store_config.clone()).expect("open");
+        let prepared = [
+            (0, 0, b"zero".as_slice()),
+            (1, 2, b"one".as_slice()),
+            (2, 4, b"two".as_slice()),
+        ]
+        .map(|(batch, first, payload)| {
+            store
+                .prepare_append(
+                    reservation(batch, first, 3),
+                    None,
+                    Bytes::copy_from_slice(payload),
+                )
+                .expect("prepare")
+        });
+        store
+            .append_prepared_group(&prepared.iter().collect::<Vec<_>>(), true)
+            .expect("append group");
+        assert_eq!(store.catalog().len(), 3);
+        assert_eq!(store.pack_paths.len(), 3);
+        drop(store);
+
+        let mut store = ShardStore::open(store_config).expect("reopen");
+        let batches = store
+            .fetch(
+                TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0)),
+                LogicalOffset::new(0),
+                1024,
+            )
+            .expect("fetch");
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.payload.as_ref())
+                .collect::<Vec<_>>(),
+            vec![b"zero".as_slice(), b"one".as_slice(), b"two".as_slice()]
+        );
+    }
+
+    #[test]
+    fn grouped_prepared_append_rejects_duplicate_batch_before_writing() {
+        let temp = TempDir::new("grouped-duplicate");
+        let mut store = ShardStore::open(config(&temp.0, 4096)).expect("open");
+        let prepared = store
+            .prepare_append(reservation(0, 0, 3), None, Bytes::from_static(b"duplicate"))
+            .expect("prepare");
+
+        assert!(matches!(
+            store.append_prepared_group(&[&prepared, &prepared], false),
+            Err(StorageError::InvalidInput(_))
+        ));
+        assert_eq!(store.active.bytes, 0);
+        assert!(store.catalog().is_empty());
+    }
+
+    #[test]
+    fn fetch_is_ordered_before_reopen_when_appends_arrive_out_of_order() {
+        let temp = TempDir::new("out-of-order-arrival");
+        let mut store = ShardStore::open(config(&temp.0, 4096)).expect("open");
+        for (batch, first, payload) in [
+            (2, 4, b"two".as_slice()),
+            (0, 0, b"zero".as_slice()),
+            (1, 2, b"one".as_slice()),
+        ] {
+            store
+                .append(reservation(batch, first, 3), None, payload, false)
+                .expect("append");
+        }
+
+        let batches = store
+            .fetch(
+                TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0)),
+                LogicalOffset::new(0),
+                1024,
+            )
+            .expect("fetch");
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.reservation.batch_id)
+                .collect::<Vec<_>>(),
+            vec![BatchId::new(0), BatchId::new(1), BatchId::new(2)]
+        );
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.payload.as_ref())
+                .collect::<Vec<_>>(),
+            vec![b"zero".as_slice(), b"one".as_slice(), b"two".as_slice()]
         );
     }
 

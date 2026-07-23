@@ -2,25 +2,66 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use shard_stream_core::{
     ByteBoundedSender, LogicalOffset, Reservation, ShardId, TopicPartition, TrySendError,
     byte_bounded_channel,
 };
 use shard_stream_storage::{
-    ExtentCatalogEntry, LocalObjectTier, ProducerSequence, ShardStore, ShardStoreConfig,
-    StorageResult, StoredBatch,
+    ExtentCatalogEntry, LocalObjectTier, PreparedExtent, ProducerSequence, ShardStore,
+    ShardStoreConfig, StorageResult, StoredBatch, StoredBatchMetadata,
 };
 
 use crate::config::COMMAND_OVERHEAD_BYTES;
 use crate::coordinator::CoordinatorRouter;
 use crate::{EngineConfig, EngineError, EngineResult};
 
-const MAX_APPEND_GROUP: usize = 64;
-const APPEND_GROUP_LINGER: Duration = Duration::from_micros(200);
+const MAX_APPEND_GROUP: usize = 128;
+const TARGET_APPEND_GROUP: usize = 8;
+const MIN_APPEND_GROUP_LINGER: Duration = Duration::from_micros(200);
+const APPEND_GROUP_IDLE_RESET: Duration = Duration::from_millis(4);
+
+struct AppendGroupTuner {
+    linger: Duration,
+    min_linger: Duration,
+    max_linger: Duration,
+    last_group_completed: Option<Instant>,
+}
+
+impl AppendGroupTuner {
+    fn new(max_linger: Duration) -> Self {
+        let min_linger = MIN_APPEND_GROUP_LINGER.min(max_linger);
+        Self {
+            linger: min_linger,
+            min_linger,
+            max_linger,
+            last_group_completed: None,
+        }
+    }
+
+    fn begin_group(&mut self, now: Instant) -> Duration {
+        if self
+            .last_group_completed
+            .is_none_or(|completed| now.duration_since(completed) >= APPEND_GROUP_IDLE_RESET)
+        {
+            self.linger = self.min_linger;
+        }
+        self.linger
+    }
+
+    fn complete_group(&mut self, now: Instant, group_len: usize) {
+        self.last_group_completed = Some(now);
+        if group_len < TARGET_APPEND_GROUP {
+            self.linger = self.linger.saturating_mul(2).min(self.max_linger);
+        } else if group_len == MAX_APPEND_GROUP {
+            self.linger = (self.linger / 2).max(self.min_linger);
+        }
+    }
+}
 
 pub(crate) struct AppendFailure {
     pub(crate) error: EngineError,
@@ -46,19 +87,37 @@ impl AppendFailure {
 struct AppendCommand {
     reservation: Reservation,
     producer: Option<ProducerSequence>,
-    payload: Arc<[u8]>,
+    payload: Bytes,
     required_replicas: u32,
     object_durable: bool,
     response: SyncSender<StorageResult<AppendDurability>>,
 }
 
+pub(crate) enum FetchCompletion {
+    Plan {
+        lane: usize,
+        result: StorageResult<Vec<StoredBatchMetadata>>,
+    },
+    Read {
+        lane: usize,
+        result: StorageResult<Vec<StoredBatch>>,
+    },
+}
+
 enum ShardCommand {
     Append(AppendCommand),
-    Fetch {
+    PlanFetch {
+        lane: usize,
         topic_partition: TopicPartition,
         start_offset: LogicalOffset,
         max_bytes: usize,
-        response: SyncSender<StorageResult<Vec<StoredBatch>>>,
+        max_batches: usize,
+        completion: Sender<FetchCompletion>,
+    },
+    ReadFetch {
+        lane: usize,
+        planned: Vec<StoredBatchMetadata>,
+        completion: Sender<FetchCompletion>,
     },
     Sync {
         response: SyncSender<StorageResult<()>>,
@@ -87,7 +146,7 @@ impl ShardHandle {
         retained_log_starts: &HashMap<TopicPartition, LogicalOffset>,
     ) -> EngineResult<(Self, Vec<ExtentCatalogEntry>)> {
         let directory = shard_directory(&config.data_dir, shard_id);
-        let primary = ShardStore::open(ShardStoreConfig {
+        let mut primary = ShardStore::open(ShardStoreConfig {
             directory,
             shard_id,
             target_pack_bytes: config.target_pack_bytes,
@@ -121,7 +180,7 @@ impl ShardHandle {
                 target_pack_bytes: config.target_pack_bytes,
                 max_batch_bytes: config.max_batch_bytes,
             })?;
-            catch_up_replica(&primary, &mut replica, &catalog, retained_log_starts)?;
+            catch_up_replica(&mut primary, &mut replica, &catalog, retained_log_starts)?;
             replicas.push(Some(ReplicaHandle::spawn(
                 replica,
                 shard_id,
@@ -136,9 +195,10 @@ impl ShardHandle {
         let (sender, receiver) =
             byte_bounded_channel(config.queue_slots_per_shard, config.queue_bytes_per_shard)
                 .map_err(|error| EngineError::InvalidConfig(error.to_string()))?;
+        let append_linger = config.append_linger;
         let thread = thread::Builder::new()
             .name(format!("shard-stream-lane-{shard_id}"))
-            .spawn(move || run_worker(stores, receiver))
+            .spawn(move || run_worker(stores, receiver, append_linger))
             .map_err(|error| {
                 EngineError::InvalidConfig(format!("failed to spawn shard worker: {error}"))
             })?;
@@ -156,7 +216,7 @@ impl ShardHandle {
         &self,
         reservation: Reservation,
         producer: Option<ProducerSequence>,
-        payload: Vec<u8>,
+        payload: Bytes,
         required_replicas: u32,
         object_durable: bool,
     ) -> Result<AppendDurability, AppendFailure> {
@@ -174,7 +234,7 @@ impl ShardHandle {
             ShardCommand::Append(AppendCommand {
                 reservation,
                 producer,
-                payload: Arc::from(payload),
+                payload,
                 required_replicas,
                 object_durable,
                 response,
@@ -188,13 +248,15 @@ impl ShardHandle {
             .map_err(|error| AppendFailure::ambiguous(error.into()))
     }
 
-    pub(crate) fn begin_fetch(
+    pub(crate) fn begin_fetch_plan(
         &self,
+        lane: usize,
         topic_partition: TopicPartition,
         start_offset: LogicalOffset,
         max_bytes: usize,
-    ) -> EngineResult<Receiver<StorageResult<Vec<StoredBatch>>>> {
-        let (response, receiver) = sync_channel(1);
+        max_batches: usize,
+        completion: Sender<FetchCompletion>,
+    ) -> EngineResult<()> {
         let charged_bytes =
             max_bytes
                 .checked_add(COMMAND_OVERHEAD_BYTES)
@@ -203,15 +265,41 @@ impl ShardHandle {
                     reason: "fetch byte charge overflow",
                 })?;
         self.try_send(
-            ShardCommand::Fetch {
+            ShardCommand::PlanFetch {
+                lane,
                 topic_partition,
                 start_offset,
                 max_bytes,
-                response,
+                max_batches,
+                completion,
             },
             charged_bytes,
-        )?;
-        Ok(receiver)
+        )
+    }
+
+    pub(crate) fn begin_fetch_read(
+        &self,
+        lane: usize,
+        planned: Vec<StoredBatchMetadata>,
+        completion: Sender<FetchCompletion>,
+    ) -> EngineResult<()> {
+        let charged_bytes = planned
+            .iter()
+            .try_fold(COMMAND_OVERHEAD_BYTES, |total, metadata| {
+                total.checked_add(metadata.payload_len())
+            });
+        let charged_bytes = charged_bytes.ok_or(EngineError::AdmissionLimited {
+            shard_id: self.shard_id,
+            reason: "fetch read byte charge overflow",
+        })?;
+        self.try_send(
+            ShardCommand::ReadFetch {
+                lane,
+                planned,
+                completion,
+            },
+            charged_bytes,
+        )
     }
 
     pub(crate) fn sync(&self) -> EngineResult<()> {
@@ -290,8 +378,10 @@ impl Drop for ShardHandle {
 fn run_worker(
     mut stores: LaneStores,
     receiver: shard_stream_core::ByteBoundedReceiver<ShardCommand>,
+    append_linger: Duration,
 ) {
     let mut deferred = None;
+    let mut append_group_tuner = AppendGroupTuner::new(append_linger);
     loop {
         let command = match deferred.take() {
             Some(command) => command,
@@ -302,8 +392,10 @@ fn run_worker(
         };
         match command {
             ShardCommand::Append(first) => {
-                let mut appends = vec![first];
-                let deadline = Instant::now() + APPEND_GROUP_LINGER;
+                let started = Instant::now();
+                let deadline = started + append_group_tuner.begin_group(started);
+                let mut appends = Vec::with_capacity(TARGET_APPEND_GROUP);
+                appends.push(first);
                 while appends.len() < MAX_APPEND_GROUP {
                     let now = Instant::now();
                     if now >= deadline {
@@ -321,21 +413,38 @@ fn run_worker(
                     }
                 }
                 let results = stores.append_group(&appends);
+                append_group_tuner.complete_group(Instant::now(), appends.len());
                 for (command, result) in appends.into_iter().zip(results) {
                     let _ = command.response.send(result);
                 }
             }
-            ShardCommand::Fetch {
+            ShardCommand::PlanFetch {
+                lane,
                 topic_partition,
                 start_offset,
                 max_bytes,
-                response,
+                max_batches,
+                completion,
             } => {
-                let _ = response.send(stores.primary.fetch(
-                    topic_partition,
-                    start_offset,
-                    max_bytes,
-                ));
+                let _ = completion.send(FetchCompletion::Plan {
+                    lane,
+                    result: stores.primary.plan_fetch(
+                        topic_partition,
+                        start_offset,
+                        max_bytes,
+                        max_batches,
+                    ),
+                });
+            }
+            ShardCommand::ReadFetch {
+                lane,
+                planned,
+                completion,
+            } => {
+                let _ = completion.send(FetchCompletion::Read {
+                    lane,
+                    result: stores.primary.read_fetch_plan(&planned),
+                });
             }
             ShardCommand::Sync { response } => {
                 let _ = response.send(stores.sync());
@@ -367,9 +476,7 @@ fn replica_directory(data_dir: &std::path::Path, replica_index: u32, shard_id: S
 
 #[derive(Clone)]
 struct ReplicaAppend {
-    reservation: Reservation,
-    producer: Option<ProducerSequence>,
-    payload: Arc<[u8]>,
+    prepared: Arc<PreparedExtent>,
 }
 
 enum ReplicaCommand {
@@ -414,22 +521,21 @@ impl ReplicaHandle {
                             replica_index,
                             response,
                         } => {
-                            let result = (|| {
-                                for append in &appends {
-                                    store.append(
-                                        append.reservation,
-                                        append.producer,
-                                        &append.payload,
-                                        false,
-                                    )?;
-                                }
-                                store.sync()
-                            })();
+                            let result = {
+                                let prepared = appends
+                                    .iter()
+                                    .map(|append| append.prepared.as_ref())
+                                    .collect::<Vec<_>>();
+                                store.append_prepared_group(&prepared, true)
+                            };
                             if result.is_ok()
                                 && let Some(progress) = &progress
                             {
                                 for append in &appends {
-                                    progress.replica_durable(append.reservation, replica_index);
+                                    progress.replica_durable(
+                                        append.prepared.reservation(),
+                                        replica_index,
+                                    );
                                 }
                             }
                             let failed = result.is_err();
@@ -555,16 +661,39 @@ impl LaneStores {
             })
             .collect::<Vec<_>>();
         let mut primary_written = vec![false; appends.len()];
+        let mut prepared_extents = Vec::with_capacity(appends.len());
         for (index, append) in appends.iter().enumerate() {
-            match self
-                .primary
-                .append(append.reservation, append.producer, &append.payload, false)
-            {
-                Ok(()) => primary_written[index] = true,
-                Err(error) => outcomes[index] = Err(clone_storage_error(&error)),
+            match self.primary.prepare_append(
+                append.reservation,
+                append.producer,
+                append.payload.clone(),
+            ) {
+                Ok(prepared) => {
+                    prepared_extents.push(Some(Arc::new(prepared)));
+                }
+                Err(error) => {
+                    outcomes[index] = Err(clone_storage_error(&error));
+                    prepared_extents.push(None);
+                }
             }
         }
-        if primary_written.iter().any(|written| *written) {
+        let valid_prepared = prepared_extents
+            .iter()
+            .flatten()
+            .map(Arc::as_ref)
+            .collect::<Vec<_>>();
+        if !valid_prepared.is_empty() {
+            if let Err(error) = self.primary.append_prepared_group(&valid_prepared, false) {
+                for (index, prepared) in prepared_extents.iter().enumerate() {
+                    if prepared.is_some() {
+                        outcomes[index] = Err(clone_storage_error(&error));
+                    }
+                }
+                return outcomes;
+            }
+            for (index, prepared) in prepared_extents.iter().enumerate() {
+                primary_written[index] = prepared.is_some();
+            }
             match self.primary.sync() {
                 Ok(()) => {
                     for (index, written) in primary_written.iter().enumerate() {
@@ -591,10 +720,12 @@ impl LaneStores {
             .iter()
             .enumerate()
             .filter(|(index, _)| primary_written[*index])
-            .map(|(_, append)| ReplicaAppend {
-                reservation: append.reservation,
-                producer: append.producer,
-                payload: Arc::clone(&append.payload),
+            .map(|(index, _)| ReplicaAppend {
+                prepared: Arc::clone(
+                    prepared_extents[index]
+                        .as_ref()
+                        .expect("written primary has a prepared extent"),
+                ),
             })
             .collect::<Vec<_>>();
         let (replica_response, replica_receiver) = sync_channel(self.replicas.len().max(1));
@@ -735,7 +866,7 @@ fn clone_storage_error(
 }
 
 fn catch_up_replica(
-    primary: &ShardStore,
+    primary: &mut ShardStore,
     replica: &mut ShardStore,
     primary_catalog: &[ExtentCatalogEntry],
     retained_log_starts: &HashMap<TopicPartition, LogicalOffset>,
@@ -780,4 +911,63 @@ fn catch_up_replica(
         replica.append(entry.reservation, entry.producer, &batch.payload, true)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_group_linger_grows_for_sparse_groups_and_resets_after_idle() {
+        let max_linger = Duration::from_millis(1);
+        let mut tuner = AppendGroupTuner::new(max_linger);
+        let started = Instant::now();
+        assert_eq!(tuner.begin_group(started), MIN_APPEND_GROUP_LINGER);
+
+        tuner.complete_group(started, 1);
+        assert_eq!(
+            tuner.begin_group(started + Duration::from_micros(1)),
+            Duration::from_micros(400)
+        );
+        tuner.complete_group(started + Duration::from_micros(1), 2);
+        assert_eq!(
+            tuner.begin_group(started + Duration::from_micros(2)),
+            Duration::from_micros(800)
+        );
+        tuner.complete_group(started + Duration::from_micros(2), 4);
+        assert_eq!(
+            tuner.begin_group(started + Duration::from_micros(3)),
+            max_linger
+        );
+        assert_eq!(
+            tuner.begin_group(started + APPEND_GROUP_IDLE_RESET + Duration::from_micros(2)),
+            MIN_APPEND_GROUP_LINGER
+        );
+    }
+
+    #[test]
+    fn zero_append_linger_disables_group_waiting() {
+        let mut tuner = AppendGroupTuner::new(Duration::ZERO);
+        let now = Instant::now();
+        assert_eq!(tuner.begin_group(now), Duration::ZERO);
+        tuner.complete_group(now, 1);
+        assert_eq!(tuner.begin_group(now), Duration::ZERO);
+    }
+
+    #[test]
+    fn saturated_append_groups_reduce_linger() {
+        let max_linger = Duration::from_millis(1);
+        let mut tuner = AppendGroupTuner {
+            linger: max_linger,
+            min_linger: MIN_APPEND_GROUP_LINGER,
+            max_linger,
+            last_group_completed: None,
+        };
+        let now = Instant::now();
+        tuner.complete_group(now, MAX_APPEND_GROUP);
+        assert_eq!(
+            tuner.begin_group(now + Duration::from_micros(1)),
+            Duration::from_micros(500)
+        );
+    }
 }

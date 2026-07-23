@@ -18,15 +18,18 @@ protocol mock:
 - stream-native `u128` identifiers, offsets, and request IDs;
 - deterministic batch-level round-robin placement across shard-owned workers;
 - bounded MPSC admission accounting for queue slots and bytes;
-- a checksummed, self-describing extent-pack format that acts as the payload
-  WAL;
+- a self-describing `SSE4` extent-pack WAL with XXH3-64 header-and-payload
+  corruption checks;
 - hot-path coordination through bounded MPSC-owned partition state with no
   shared global mutex;
+- an MIT-licensed `ordered-segment-map` crate providing hash-free O(1) dense
+  batch lookup, segmented insertion-order iteration, and bounded prefix
+  retention;
 - a checksummed control journal for ring revisions and retention checkpoints,
   with no globally ordered per-append fsync;
 - ordered cross-shard fetch and an explicit completion-order fetch mode;
-- idempotent producer epoch and sequence validation using BLAKE3 content
-  identity;
+- idempotent producer epoch and sequence validation using an XXH3-128 retry
+  fingerprint, with no payload hash on non-idempotent appends;
 - grouped shard fsync, parallel local replica workers, quorum acknowledgement,
   replica catch-up, and replicated high watermarks;
 - stream-native Blossom lease claims, finality-certificate validation,
@@ -37,8 +40,12 @@ protocol mock:
 - REST, standard gRPC/HTTP2 streaming, and optional REST-compatible HTTP/3
   listeners;
 - a conservative Kafka wire adapter for topic creation, metadata, produce,
-  fetch, offset lookup, and API negotiation;
-- an OpenAPI document, Prometheus endpoint, and Rust client;
+  fetch, offset lookup, and API negotiation, with incremental
+  `bytes-handoff` framing and bounded asynchronous response writes;
+- immutable `Bytes` payload ownership from protocol ingress through shard and
+  replica dispatch;
+- an OpenAPI document, a `fast-telemetry`-backed Prometheus endpoint,
+  `eden_logger` lifecycle/error logging, and a Rust client;
 - MPSC-owned Kafka topic discovery and a single-owner native producer sequence,
   leaving no shared runtime `Mutex` or `RwLock`;
 - Docker and Compose packaging; and
@@ -53,9 +60,10 @@ administrative surface are not complete yet. The HTTP/3 adapter is experimental
 and disables TLS 0-RTT to prevent mutation replay. The server defaults to
 replication factor one so it never implies multi-node HA.
 
-The on-disk format has no SHA compatibility mode: immutable content identity
-uses BLAKE3 exclusively. CRC32 frame checks remain a separate, non-identity
-corruption-detection mechanism.
+The on-disk format has no SHA compatibility mode. Hot-path idempotent-producer
+retry fingerprints use XXH3-128, immutable object-tier content identity uses
+BLAKE3, on-disk extent checks use XXH3-64, and control-journal/native-wire
+frames retain CRC32 corruption checks.
 
 The reviewed architecture and performance contract are in
 [`docs/SHARD_STREAM_PLAN.md`](docs/SHARD_STREAM_PLAN.md).
@@ -84,6 +92,47 @@ cargo run -p shard-stream-server -- \
   --data-dir ./var/shard-stream \
   --shards 4
 ```
+
+The broker accepts environment variables for the corresponding deployment
+knobs. Explicit command-line flags take precedence:
+
+| Environment variable | Default | Effect |
+| --- | ---: | --- |
+| `SHARD_STREAM_MAX_BATCH_BYTES` | 16 MiB | Hard limit for one admitted batch |
+| `SHARD_STREAM_MAX_REQUEST_BYTES` | 32 MiB | Hard limit for a protocol request, which may contain multiple Kafka batches |
+| `SHARD_STREAM_MAX_FETCH_BYTES` | 64 MiB | Hard limit for one fetch response |
+| `SHARD_STREAM_APPEND_LINGER_MS` | 1 ms | Maximum adaptive wait for shard-local group fsync; `0` disables waiting |
+
+The native Rust client exposes the Kafka-familiar producer profile through
+`ClientConfig::from_env()`:
+
+| Environment variable | Default | Kafka analogue |
+| --- | ---: | --- |
+| `SHARD_STREAM_BATCH_SIZE` | 16 KiB | `batch.size` |
+| `SHARD_STREAM_LINGER_MS` | 5 ms | `linger.ms` |
+| `SHARD_STREAM_MAX_REQUEST_SIZE` | 1 MiB | `max.request.size` |
+
+`SHARD_STREAM_BATCH_SIZE` is a soft flush threshold: a single record may exceed
+it, but no append may exceed `SHARD_STREAM_MAX_REQUEST_SIZE`. The current native
+`Producer::append` API accepts an already assembled batch; applications can
+read `Producer::tuning()` and use `ProducerTuning::should_flush()` in their
+batching layer. Kafka-protocol applications continue setting `batch.size`,
+`linger.ms`, and `max.request.size` directly in their Kafka client.
+
+For a tuned 2 MiB producer batch, use:
+
+```shell
+export SHARD_STREAM_BATCH_SIZE=2097152
+export SHARD_STREAM_LINGER_MS=20
+export SHARD_STREAM_MAX_REQUEST_SIZE=4194304
+
+export SHARD_STREAM_MAX_BATCH_BYTES=2097152
+export SHARD_STREAM_MAX_REQUEST_BYTES=4194304
+```
+
+Docker Compose reads the broker variables from the shell or a local `.env`
+file. [`.env.example`](.env.example) contains the complete producer and broker
+set.
 
 Create a topic and append one raw native batch:
 
@@ -114,6 +163,8 @@ contract and current exclusions.
 
 - `shard-stream-core`: identifiers, sequencing, placement, and bounded
   execution primitives.
+- `ordered-segment-map`: reusable MIT-licensed dense and sparse append-ordered
+  indexes.
 - `shard-stream-control`: Blossom-finalized leases and write fencing.
 - `shard-stream-storage`: extent packs, coordinator journal, and object tier.
 - `shard-stream-engine`: shard workers, recovery, ordering, and replication.
@@ -128,4 +179,6 @@ contract and current exclusions.
 
 ## License
 
-Apache-2.0. See [`UPSTREAM.md`](UPSTREAM.md) for reused-source tracking.
+The shard-stream product is Apache-2.0. The standalone
+`ordered-segment-map` crate is MIT licensed. See [`UPSTREAM.md`](UPSTREAM.md)
+for reused-source tracking.

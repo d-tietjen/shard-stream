@@ -19,7 +19,7 @@ const MAX_EVENT_BYTES: usize = 1024 * 1024;
 const CONFIGURE_KIND: u8 = 1;
 const TRUNCATE_KIND: u8 = 6;
 
-pub const DIGEST_BLAKE3: u8 = 1;
+pub const DIGEST_XXH3_128: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProducerSequence {
@@ -27,7 +27,7 @@ pub struct ProducerSequence {
     pub epoch: u32,
     pub first_sequence: u64,
     pub digest_algorithm: u8,
-    pub payload_digest: [u8; 32],
+    pub payload_digest: [u8; 16],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
