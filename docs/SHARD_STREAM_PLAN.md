@@ -171,12 +171,14 @@ types, assertions, recovery tests, and the on-disk format:
    several batches advance it once per batch, not once per request or record.
 3. The active shard extent pack is the payload WAL. Payload bytes are not first
    written to one WAL and then copied into a second segment log.
-4. Queue slot and byte capacity are reserved before logical offsets or placement
-   identifiers are allocated.
-5. Every allocated offset range has a durable reservation. Recovery resolves it
-   to exactly one committed data extent or an aborted range, so later ordered
-   data cannot remain permanently hidden behind an unexplained gap.
-6. A committed data extent is self-describing and sufficient to rebuild all
+4. Logical identifiers are tentative until a complete extent reaches the
+   requested durability. A failed unpersisted tail allocation may be reused.
+5. Every durable allocation is represented by a self-describing extent.
+   Recovery merges extents by logical offset and infers interior abort ranges
+   from later batch, placement, and offset sequences, so later ordered data
+   cannot remain hidden behind an unexplained gap.
+6. A committed data extent, including optional producer identity and BLAKE3
+   payload identity, is sufficient to rebuild all
    derived indexes after a crash.
 7. Ordered visibility advances only through contiguous committed or aborted
    ranges. Pipelined completion order is never confused with logical order.
@@ -204,7 +206,7 @@ placement_seq = next per-topic placement sequence
 target_shard  = ring[placement_seq % ring.len()]
 ```
 
-A lightweight topic sequencer owns `placement_seq` and the ring epoch. A
+A lightweight MPSC-owned topic sequencer owns `placement_seq` and the ring epoch. A
 logical partition coordinator owns that partition's offset allocator, producer
 sequence table, watermarks, and ordered visibility. Version 1 should colocate
 the topic sequencer and all of that topic's partition-control state on one
@@ -276,43 +278,40 @@ The append path is:
 2. Peek at the next placement sequence, select its candidate lane, and
    asynchronously reserve both a queue slot and byte-budget permit there.
    Oversized batches fail before identifier allocation.
-3. Tentatively assign the placement sequence, logical offset range, reservation
-   ID, candidate lane, and ring epoch. These values are not published or
-   reusable by the data plane yet.
-4. Group-commit a compact `ReserveBatch` entry to the coordinator metadata
-   journal. This atomically makes the assignment durable and advances the
-   allocation counters. The journal stores allocation and control state, never
-   payload.
-5. Enqueue an immutable, reference-counted `AppendBatch` to the lane's bounded
+3. The partition's single MPSC owner assigns the placement sequence, logical
+   offset range, batch ID, candidate lane, and ring epoch without a shared
+   mutex or disk operation.
+4. Enqueue an immutable, reference-counted `AppendBatch` to the lane's bounded
    MPSC append queue.
-6. The single lane owner appends the self-describing extent once to its active
-   pack, applies the requested local durability, and sends it to direct data
-   replicas.
-7. Completion closes the reservation, advances any now-contiguous watermarks,
+5. The single lane owner drains a bounded group, appends each self-describing
+   extent once, and performs one shard-local fsync for the group.
+6. Persistent replica workers copy the same reference-counted payload and
+   flush followers concurrently. No payload or completion waits for a global
+   journal order.
+7. Completion returns to the partition owner, advances any contiguous watermarks,
    updates derived in-memory directories, and resolves the producer reply when
    its requested durability has been met.
 
-The coordinator journal can group many reservations in one flush. A later
-optimization may durably lease offset and placement ranges to a coordinator,
-but every unused leased range must be converted to an abort range during
-recovery. Cancellation after a durable reservation follows the same abort path;
-it cannot silently discard an allocated range.
+The checksummed coordinator journal is control-only: it persists ring revisions
+and retention/checkpoint state, not reservations or append completions. There is
+therefore no global per-append mutex, journal write, or fsync generation.
 
-Recovery reconciles the reservation journal with scanned data extents:
+Recovery merges scanned data extents from all shard lanes:
 
 | Crash point | Recovery result |
 | --- | --- |
-| Before capacity reservation or durable `ReserveBatch` | No append existed |
-| After reservation, before a complete data extent | Materialize an `ABORT` range |
+| Before a complete data extent and with no later extent | No durable append existed; the trailing tentative allocation may be reused |
+| Missing extent followed by a later valid extent | Infer an explicit abort range from the later batch/offset/placement sequence |
 | After extent durability, before completion callback | Extent scan proves commit |
-| During a torn extent write | Checksum/length validation truncates the suffix; reservation aborts |
+| During a torn extent write | Checksum/length validation truncates the suffix; a later extent implies an abort, otherwise the tail disappears |
 | After an ambiguous client timeout | Producer identity and sequence deduplicate the retry |
 
-There is no distributed payload/index transaction: the durable reservation
-prevents offset reuse, the canonical extent proves data commit, and all indexes
-are rebuildable. A bounded gap window limits outstanding reserved ranges. If an
-early lane stalls, the coordinator stops admitting later ranges rather than
-allowing unbounded memory growth or visibility lag.
+There is no distributed payload/index transaction: the canonical extent proves
+data commit and all indexes are rebuildable. Batch IDs and placement sequences
+advance together, allowing recovery to reject inconsistent or non-round-robin
+extents. A bounded gap window limits outstanding tentative ranges. If an early
+lane stalls, the coordinator stops admitting later ranges rather than allowing
+unbounded memory growth or visibility lag.
 
 ## 7. Bounded MPSC execution model
 
@@ -475,7 +474,8 @@ offset.
 Each partition publishes distinct watermarks:
 
 - `log_start_offset`: earliest retained logical offset;
-- `allocated_end_offset`: internal end of all durable reservations;
+- `allocated_end_offset`: internal end of all tentative in-flight and durable
+  ranges;
 - `log_end_offset`: end of the highest contiguous locally committed or aborted
   range;
 - `high_watermark`: end of the highest contiguous range satisfying the
@@ -500,10 +500,10 @@ validate checksums, reservation identity, ring epoch, leader epoch, and
 ownership-certificate digest before append. Replica acknowledgements and ISR
 membership determine replicated durability; Blossom does not.
 
-Coordinator reservation journals and producer-sequence checkpoints are also
-replicated or snapshotted to the coordinator standby. Canonical lane extents
-remain the final evidence of committed payload, so a stale metadata checkpoint
-can be reconciled by scanning later extents.
+Control-plane checkpoints are replicated or snapshotted to the coordinator
+standby. Producer identity is embedded in canonical extents, which remain the
+final evidence of committed payload and allow a stale derived checkpoint to be
+reconciled by scanning later extents.
 
 The initial profile is active-passive for each ordered logical partition.
 Active-active means different topics or partitions can have different active
@@ -806,8 +806,8 @@ The native surface provides:
 - Set per-connection and per-stream limits for concurrent streams, bytes,
   header sizes, idle time, acknowledgement backlog, and unread consumer data.
 - A slow or abandoned response stream triggers cancellation and releases
-  application queue permits without cancelling an append that already crossed
-  its durable reservation boundary.
+  application queue permits without cancelling an append whose canonical
+  extent already crossed its requested durability boundary.
 - Dynamic fetch and topology responses use explicit no-store cache policy.
   Mutating or streaming calls do not rely on automatic HTTP redirects: a
   `NOT_COORDINATOR` error returns the signed topology epoch and endpoint, and
@@ -1117,12 +1117,12 @@ The claims above should stay precise:
 
 ### Milestone 2: atomic local extent log
 
-- Implement the compact coordinator reservation journal.
+- Implement self-describing extents and a control-only coordinator journal.
 - Define and implement immutable extent-pack framing and sealing.
 - Add local SSD pack rotation, batch-range directories, checksums, and
   checkpoints.
 - Add append and fetch APIs over placement identifiers.
-- Validate every reservation/extent crash point, partial-pack truncation,
+- Validate every tentative-allocation/extent crash point, partial-pack truncation,
   deduplication, abort materialization, and index rebuild.
 
 ### Milestone 3: logical partitions and producer safety
@@ -1509,8 +1509,8 @@ durability.
   append batch.
 - Logical semantics: efficient Kafka-compatible partitions are ordered views
   over physically striped batch extents.
-- Atomicity: durable reservation plus one canonical data extent; missing
-  reservations recover as abort ranges and indexes rebuild from extents.
+- Atomicity: one canonical self-describing data extent; interior missing
+  extents recover as inferred abort ranges and indexes rebuild from extents.
 - Storage: shard-local shared extent packs are the WAL; there is no second
   payload WAL.
 - Indexing: exact batch/range directory plus sparse seek checkpoints, not an

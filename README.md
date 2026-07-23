@@ -20,13 +20,15 @@ protocol mock:
 - bounded MPSC admission accounting for queue slots and bytes;
 - a checksummed, self-describing extent-pack format that acts as the payload
   WAL;
-- a separate checksummed coordinator journal for durable reservations,
-  commit/abort decisions, ring revisions, and producer sequence recovery;
+- hot-path coordination through bounded MPSC-owned partition state with no
+  shared global mutex;
+- a checksummed control journal for ring revisions and retention checkpoints,
+  with no globally ordered per-append fsync;
 - ordered cross-shard fetch and an explicit completion-order fetch mode;
 - idempotent producer epoch and sequence validation using BLAKE3 content
   identity;
-- synchronous local replica sets, quorum acknowledgement, replica catch-up,
-  and replicated high watermarks;
+- grouped shard fsync, parallel local replica workers, quorum acknowledgement,
+  replica catch-up, and replicated high watermarks;
 - stream-native Blossom lease claims, finality-certificate validation,
   persistent leader epochs, and an engine write-fencing hook;
 - immutable BLAKE3-verified object-tier packs with atomic manifest generations;

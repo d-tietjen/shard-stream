@@ -1,6 +1,7 @@
 //! Durable shard-striped append and ordered fetch engine.
 
 mod config;
+mod coordinator;
 mod engine;
 mod error;
 mod worker;

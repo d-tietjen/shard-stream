@@ -13,6 +13,5 @@ pub use extent::{
 };
 pub use journal::{
     CoordinatorJournal, DIGEST_BLAKE3, JournalEvent, ProducerSequence, RecoveredJournal,
-    summarize_events,
 };
 pub use tier::{LocalObjectTier, TierManifest, TierObject};

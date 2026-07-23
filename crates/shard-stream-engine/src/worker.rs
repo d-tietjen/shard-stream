@@ -1,18 +1,25 @@
 use std::collections::HashMap;
+use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use shard_stream_core::{
     ByteBoundedSender, LogicalOffset, Reservation, ShardId, TopicPartition, TrySendError,
     byte_bounded_channel,
 };
 use shard_stream_storage::{
-    ExtentCatalogEntry, LocalObjectTier, ShardStore, ShardStoreConfig, StorageResult, StoredBatch,
+    ExtentCatalogEntry, LocalObjectTier, ProducerSequence, ShardStore, ShardStoreConfig,
+    StorageResult, StoredBatch,
 };
 
 use crate::config::COMMAND_OVERHEAD_BYTES;
 use crate::{EngineConfig, EngineError, EngineResult};
+
+const MAX_APPEND_GROUP: usize = 64;
+const APPEND_GROUP_LINGER: Duration = Duration::from_micros(200);
 
 pub(crate) struct AppendFailure {
     pub(crate) error: EngineError,
@@ -35,14 +42,16 @@ impl AppendFailure {
     }
 }
 
+struct AppendCommand {
+    reservation: Reservation,
+    producer: Option<ProducerSequence>,
+    payload: Arc<[u8]>,
+    object_durable: bool,
+    response: SyncSender<StorageResult<AppendDurability>>,
+}
+
 enum ShardCommand {
-    Append {
-        reservation: Reservation,
-        payload: Vec<u8>,
-        sync: bool,
-        object_durable: bool,
-        response: SyncSender<StorageResult<AppendDurability>>,
-    },
+    Append(AppendCommand),
     Fetch {
         topic_partition: TopicPartition,
         start_offset: LogicalOffset,
@@ -78,7 +87,6 @@ impl ShardHandle {
             target_pack_bytes: config.target_pack_bytes,
             max_batch_bytes: config.max_batch_bytes,
         })?;
-        let catalog = primary.catalog();
         let mut tier = config
             .object_store_dir
             .as_ref()
@@ -86,6 +94,18 @@ impl ShardHandle {
             .transpose()?;
         if let Some(tier) = &mut tier {
             offload_sealed_packs(&primary, tier)?;
+        }
+        let mut catalog = primary.catalog();
+        if let Some(tier) = &tier {
+            let durable_packs = tier
+                .manifest()
+                .objects
+                .iter()
+                .map(|object| object.pack_sequence)
+                .collect::<std::collections::HashSet<_>>();
+            for entry in &mut catalog {
+                entry.object_durable = durable_packs.contains(&entry.pack_sequence);
+            }
         }
         let mut replicas = Vec::with_capacity(config.replication_factor.saturating_sub(1) as usize);
         for replica_index in 1..config.replication_factor {
@@ -96,7 +116,11 @@ impl ShardHandle {
                 max_batch_bytes: config.max_batch_bytes,
             })?;
             catch_up_replica(&primary, &mut replica, &catalog, retained_log_starts)?;
-            replicas.push(Some(replica));
+            replicas.push(Some(ReplicaHandle::spawn(
+                replica,
+                shard_id,
+                replica_index,
+            )?));
         }
         let stores = LaneStores {
             primary,
@@ -125,8 +149,8 @@ impl ShardHandle {
     pub(crate) fn append(
         &self,
         reservation: Reservation,
+        producer: Option<ProducerSequence>,
         payload: Vec<u8>,
-        sync: bool,
         object_durable: bool,
     ) -> Result<AppendDurability, AppendFailure> {
         let (response, receiver) = sync_channel(1);
@@ -140,13 +164,13 @@ impl ShardHandle {
                 })
             })?;
         self.try_send(
-            ShardCommand::Append {
+            ShardCommand::Append(AppendCommand {
                 reservation,
-                payload,
-                sync,
+                producer,
+                payload: Arc::from(payload),
                 object_durable,
                 response,
-            },
+            }),
             charged_bytes,
         )
         .map_err(AppendFailure::rejected)?;
@@ -248,17 +272,39 @@ fn run_worker(
     mut stores: LaneStores,
     receiver: shard_stream_core::ByteBoundedReceiver<ShardCommand>,
 ) {
-    while let Ok(command) = receiver.recv() {
-        match &*command {
-            ShardCommand::Append {
-                reservation,
-                payload,
-                sync,
-                object_durable,
-                response,
-            } => {
-                let result = stores.append(*reservation, payload, *sync, *object_durable);
-                let _ = response.send(result);
+    let mut deferred = None;
+    loop {
+        let command = match deferred.take() {
+            Some(command) => command,
+            None => match receiver.recv() {
+                Ok(command) => command.into_inner(),
+                Err(_) => break,
+            },
+        };
+        match command {
+            ShardCommand::Append(first) => {
+                let mut appends = vec![first];
+                let deadline = Instant::now() + APPEND_GROUP_LINGER;
+                while appends.len() < MAX_APPEND_GROUP {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    match receiver.recv_timeout(deadline.saturating_duration_since(now)) {
+                        Ok(command) => match command.into_inner() {
+                            ShardCommand::Append(command) => appends.push(command),
+                            command => {
+                                deferred = Some(command);
+                                break;
+                            }
+                        },
+                        Err(_) => break,
+                    }
+                }
+                let results = stores.append_group(&appends);
+                for (command, result) in appends.into_iter().zip(results) {
+                    let _ = command.response.send(result);
+                }
             }
             ShardCommand::Fetch {
                 topic_partition,
@@ -267,9 +313,9 @@ fn run_worker(
                 response,
             } => {
                 let _ = response.send(stores.primary.fetch(
-                    *topic_partition,
-                    *start_offset,
-                    *max_bytes,
+                    topic_partition,
+                    start_offset,
+                    max_bytes,
                 ));
             }
             ShardCommand::Sync { response } => {
@@ -280,7 +326,7 @@ fn run_worker(
                 log_start,
                 response,
             } => {
-                let _ = response.send(stores.garbage_collect(*topic_partition, *log_start));
+                let _ = response.send(stores.garbage_collect(topic_partition, log_start));
             }
         }
     }
@@ -297,9 +343,132 @@ fn replica_directory(data_dir: &std::path::Path, replica_index: u32, shard_id: S
         .join(format!("shard-{shard_id}"))
 }
 
+#[derive(Clone)]
+struct ReplicaAppend {
+    reservation: Reservation,
+    producer: Option<ProducerSequence>,
+    payload: Arc<[u8]>,
+}
+
+enum ReplicaCommand {
+    AppendGroup {
+        appends: Vec<ReplicaAppend>,
+        response: SyncSender<StorageResult<()>>,
+    },
+    Sync {
+        response: SyncSender<StorageResult<()>>,
+    },
+    GarbageCollect {
+        topic_partition: TopicPartition,
+        log_start: LogicalOffset,
+        response: SyncSender<StorageResult<()>>,
+    },
+}
+
+struct ReplicaHandle {
+    shard_id: ShardId,
+    sender: Option<SyncSender<ReplicaCommand>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ReplicaHandle {
+    fn spawn(mut store: ShardStore, shard_id: ShardId, replica_index: u32) -> EngineResult<Self> {
+        let (sender, receiver) = sync_channel(8);
+        let thread = thread::Builder::new()
+            .name(format!(
+                "shard-stream-replica-{replica_index}-shard-{shard_id}"
+            ))
+            .spawn(move || {
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        ReplicaCommand::AppendGroup { appends, response } => {
+                            let result = (|| {
+                                for append in appends {
+                                    store.append(
+                                        append.reservation,
+                                        append.producer,
+                                        &append.payload,
+                                        false,
+                                    )?;
+                                }
+                                store.sync()
+                            })();
+                            let _ = response.send(result);
+                        }
+                        ReplicaCommand::Sync { response } => {
+                            let _ = response.send(store.sync());
+                        }
+                        ReplicaCommand::GarbageCollect {
+                            topic_partition,
+                            log_start,
+                            response,
+                        } => {
+                            let starts = HashMap::from([(topic_partition, log_start)]);
+                            let _ = response.send(store.garbage_collect(&starts).map(|_| ()));
+                        }
+                    }
+                }
+            })
+            .map_err(|error| {
+                EngineError::InvalidConfig(format!("failed to spawn replica worker: {error}"))
+            })?;
+        Ok(Self {
+            shard_id,
+            sender: Some(sender),
+            thread: Some(thread),
+        })
+    }
+
+    fn begin_append_group(
+        &self,
+        appends: Vec<ReplicaAppend>,
+    ) -> EngineResult<Receiver<StorageResult<()>>> {
+        let (response, receiver) = sync_channel(1);
+        self.send(ReplicaCommand::AppendGroup { appends, response })?;
+        Ok(receiver)
+    }
+
+    fn begin_sync(&self) -> EngineResult<Receiver<StorageResult<()>>> {
+        let (response, receiver) = sync_channel(1);
+        self.send(ReplicaCommand::Sync { response })?;
+        Ok(receiver)
+    }
+
+    fn begin_garbage_collect(
+        &self,
+        topic_partition: TopicPartition,
+        log_start: LogicalOffset,
+    ) -> EngineResult<Receiver<StorageResult<()>>> {
+        let (response, receiver) = sync_channel(1);
+        self.send(ReplicaCommand::GarbageCollect {
+            topic_partition,
+            log_start,
+            response,
+        })?;
+        Ok(receiver)
+    }
+
+    fn send(&self, command: ReplicaCommand) -> EngineResult<()> {
+        self.sender
+            .as_ref()
+            .ok_or(EngineError::WorkerStopped(self.shard_id))?
+            .send(command)
+            .map_err(|_| EngineError::WorkerStopped(self.shard_id))
+    }
+}
+
+impl Drop for ReplicaHandle {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 struct LaneStores {
     primary: ShardStore,
-    replicas: Vec<Option<ShardStore>>,
+    replicas: Vec<Option<ReplicaHandle>>,
     tier: Option<LocalObjectTier>,
 }
 
@@ -310,50 +479,118 @@ pub(crate) struct AppendDurability {
 }
 
 impl LaneStores {
-    fn append(
-        &mut self,
-        reservation: Reservation,
-        payload: &[u8],
-        sync: bool,
-        require_object_durability: bool,
-    ) -> StorageResult<AppendDurability> {
-        self.primary.append(reservation, payload, sync)?;
-        let mut durable_replicas = 1u32;
-        for replica in &mut self.replicas {
-            let Some(store) = replica else {
-                continue;
-            };
-            match store.append(reservation, payload, sync) {
-                Ok(()) => durable_replicas = durable_replicas.saturating_add(1),
-                Err(_) => *replica = None,
+    fn append_group(&mut self, appends: &[AppendCommand]) -> Vec<StorageResult<AppendDurability>> {
+        let mut outcomes = (0..appends.len())
+            .map(|_| {
+                Ok(AppendDurability {
+                    durable_replicas: 0,
+                    object_durable: false,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut primary_written = vec![false; appends.len()];
+        for (index, append) in appends.iter().enumerate() {
+            match self
+                .primary
+                .append(append.reservation, append.producer, &append.payload, false)
+            {
+                Ok(()) => primary_written[index] = true,
+                Err(error) => outcomes[index] = Err(clone_storage_error(&error)),
             }
         }
-        let object_durable = match (&mut self.tier, require_object_durability) {
-            (Some(tier), true) => self
-                .primary
-                .seal_active()
-                .and_then(|_| offload_sealed_packs(&self.primary, tier))
-                .is_ok(),
-            (Some(tier), false) => {
+        if primary_written.iter().any(|written| *written) {
+            match self.primary.sync() {
+                Ok(()) => {
+                    for (index, written) in primary_written.iter().enumerate() {
+                        if *written {
+                            outcomes[index] = Ok(AppendDurability {
+                                durable_replicas: 1,
+                                object_durable: false,
+                            });
+                        }
+                    }
+                }
+                Err(error) => {
+                    for (index, written) in primary_written.iter().enumerate() {
+                        if *written {
+                            outcomes[index] = Err(clone_storage_error(&error));
+                        }
+                    }
+                    return outcomes;
+                }
+            }
+        }
+
+        let replica_appends = appends
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| primary_written[*index])
+            .map(|(_, append)| ReplicaAppend {
+                reservation: append.reservation,
+                producer: append.producer,
+                payload: Arc::clone(&append.payload),
+            })
+            .collect::<Vec<_>>();
+        let mut replica_receivers = Vec::new();
+        for (index, replica) in self.replicas.iter().enumerate() {
+            let Some(replica) = replica else {
+                continue;
+            };
+            match replica.begin_append_group(replica_appends.clone()) {
+                Ok(receiver) => replica_receivers.push((index, Some(receiver))),
+                Err(_) => replica_receivers.push((index, None)),
+            }
+        }
+        for (index, receiver) in replica_receivers {
+            let replica_ok = receiver.is_some_and(|receiver| matches!(receiver.recv(), Ok(Ok(()))));
+            if replica_ok {
+                for (batch_index, written) in primary_written.iter().enumerate() {
+                    if *written && let Ok(durability) = &mut outcomes[batch_index] {
+                        durability.durable_replicas = durability.durable_replicas.saturating_add(1);
+                    }
+                }
+            } else {
+                self.replicas[index] = None;
+            }
+        }
+
+        if let Some(tier) = &mut self.tier {
+            let requires_object = appends
+                .iter()
+                .enumerate()
+                .any(|(index, append)| primary_written[index] && append.object_durable);
+            let object_durable = if requires_object {
+                self.primary
+                    .seal_active()
+                    .and_then(|_| offload_sealed_packs(&self.primary, tier))
+                    .is_ok()
+            } else {
                 let _ = offload_sealed_packs(&self.primary, tier);
                 false
+            };
+            if object_durable {
+                for (index, written) in primary_written.iter().enumerate() {
+                    if *written && let Ok(durability) = &mut outcomes[index] {
+                        durability.object_durable = true;
+                    }
+                }
             }
-            (None, _) => false,
-        };
-        Ok(AppendDurability {
-            durable_replicas,
-            object_durable,
-        })
+        }
+        outcomes
     }
 
     fn sync(&mut self) -> StorageResult<()> {
-        self.primary.sync()?;
-        for replica in &mut self.replicas {
-            let Some(store) = replica else {
+        let mut receivers = Vec::new();
+        for (index, replica) in self.replicas.iter().enumerate() {
+            let Some(replica) = replica else {
                 continue;
             };
-            if store.sync().is_err() {
-                *replica = None;
+            receivers.push((index, replica.begin_sync().ok()));
+        }
+        self.primary.sync()?;
+        for (index, receiver) in receivers {
+            if !receiver.is_some_and(|receiver| matches!(receiver.recv(), Ok(Ok(())))) {
+                self.replicas[index] = None;
             }
         }
         Ok(())
@@ -366,12 +603,21 @@ impl LaneStores {
     ) -> StorageResult<()> {
         let log_starts = HashMap::from([(topic_partition, log_start)]);
         self.primary.garbage_collect(&log_starts)?;
-        for replica in &mut self.replicas {
-            let Some(store) = replica else {
+        let mut receivers = Vec::new();
+        for (index, replica) in self.replicas.iter().enumerate() {
+            let Some(replica) = replica else {
                 continue;
             };
-            if store.garbage_collect(&log_starts).is_err() {
-                *replica = None;
+            receivers.push((
+                index,
+                replica
+                    .begin_garbage_collect(topic_partition, log_start)
+                    .ok(),
+            ));
+        }
+        for (index, receiver) in receivers {
+            if !receiver.is_some_and(|receiver| matches!(receiver.recv(), Ok(Ok(())))) {
+                self.replicas[index] = None;
             }
         }
         Ok(())
@@ -383,6 +629,12 @@ fn offload_sealed_packs(store: &ShardStore, tier: &mut LocalObjectTier) -> Stora
         tier.offload_pack(pack.sequence, &pack.path)?;
     }
     Ok(())
+}
+
+fn clone_storage_error(
+    error: &shard_stream_storage::StorageError,
+) -> shard_stream_storage::StorageError {
+    shard_stream_storage::StorageError::Io(io::Error::other(error.to_string()))
 }
 
 fn catch_up_replica(
@@ -428,7 +680,7 @@ fn catch_up_replica(
                 "primary catalog entry is unreadable".into(),
             )
         })?;
-        replica.append(entry.reservation, &batch.payload, true)?;
+        replica.append(entry.reservation, entry.producer, &batch.payload, true)?;
     }
     Ok(())
 }

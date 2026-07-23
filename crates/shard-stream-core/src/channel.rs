@@ -4,8 +4,10 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{
-    Receiver, RecvError, SyncSender, TryRecvError, TrySendError as StdTrySendError, sync_channel,
+    Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError,
+    TrySendError as StdTrySendError, sync_channel,
 };
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelConfigError {
@@ -184,6 +186,10 @@ impl<T> ByteBoundedReceiver<T> {
 
     pub fn try_recv(&self) -> Result<Budgeted<T>, TryRecvError> {
         self.receiver.try_recv()
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Budgeted<T>, RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)
     }
 
     #[must_use]

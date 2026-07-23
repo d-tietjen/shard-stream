@@ -9,13 +9,15 @@ use shard_stream_core::{
 };
 
 use crate::codec::{Decoder, push_u32, push_u64, push_u128};
+use crate::journal::{DIGEST_BLAKE3, ProducerSequence};
 use crate::{StorageError, StorageResult};
 
-const EXTENT_MAGIC: &[u8; 4] = b"SSE1";
-const EXTENT_VERSION: u8 = 1;
+const EXTENT_MAGIC: &[u8; 4] = b"SSE2";
+const EXTENT_VERSION: u8 = 2;
 const EXTENT_FLAGS: u8 = 0;
 const PREFIX_LEN: usize = 4 + 1 + 1 + 2 + 8;
-const BODY_FIXED_LEN: usize = 16 + 4 + 16 + 16 + 16 + 4 + 4 + 8 + 16 + 8;
+const PRODUCER_FIXED_LEN: usize = 1 + 3 + 16 + 4 + 8 + 1 + 3 + 32;
+const BODY_FIXED_LEN: usize = 16 + 4 + 16 + 16 + 16 + 4 + 4 + 8 + 16 + PRODUCER_FIXED_LEN + 8;
 const HEADER_LEN: usize = PREFIX_LEN + BODY_FIXED_LEN;
 const CRC_LEN: usize = 4;
 
@@ -46,13 +48,17 @@ impl ShardStoreConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredBatch {
     pub reservation: Reservation,
+    pub producer: Option<ProducerSequence>,
     pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExtentCatalogEntry {
     pub reservation: Reservation,
+    pub producer: Option<ProducerSequence>,
     pub payload_bytes: u64,
+    pub pack_sequence: u64,
+    pub object_durable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +78,7 @@ pub struct GarbageCollectionStats {
 #[derive(Debug, Clone)]
 struct ExtentLocation {
     reservation: Reservation,
+    producer: Option<ProducerSequence>,
     pack_sequence: u64,
     payload_offset: u64,
     payload_len: usize,
@@ -152,6 +159,7 @@ impl ShardStore {
     pub fn append(
         &mut self,
         reservation: Reservation,
+        producer: Option<ProducerSequence>,
         payload: &[u8],
         sync: bool,
     ) -> StorageResult<()> {
@@ -179,7 +187,7 @@ impl ShardStore {
             )));
         }
 
-        let encoded = encode_extent(reservation, payload)?;
+        let encoded = encode_extent(reservation, producer, payload)?;
         if self.active.bytes > 0
             && self
                 .active
@@ -208,6 +216,7 @@ impl ShardStore {
 
         let location = ExtentLocation {
             reservation,
+            producer,
             pack_sequence: self.active.sequence,
             payload_offset: frame_offset + HEADER_LEN as u64,
             payload_len: payload.len(),
@@ -247,6 +256,7 @@ impl ShardStore {
         file.read_exact(&mut payload)?;
         Ok(Some(StoredBatch {
             reservation: *reservation,
+            producer: location.producer,
             payload,
         }))
     }
@@ -288,6 +298,7 @@ impl ShardStore {
             file.read_exact(&mut payload)?;
             result.push(StoredBatch {
                 reservation: location.reservation,
+                producer: location.producer,
                 payload,
             });
             used = next;
@@ -302,7 +313,10 @@ impl ShardStore {
             .values()
             .map(|location| ExtentCatalogEntry {
                 reservation: location.reservation,
+                producer: location.producer,
                 payload_bytes: location.payload_len as u64,
+                pack_sequence: location.pack_sequence,
+                object_durable: false,
             })
             .collect::<Vec<_>>();
         entries.sort_by_key(|entry| {
@@ -425,7 +439,11 @@ impl ShardStore {
     }
 }
 
-fn encode_extent(reservation: Reservation, payload: &[u8]) -> StorageResult<Vec<u8>> {
+fn encode_extent(
+    reservation: Reservation,
+    producer: Option<ProducerSequence>,
+    payload: &[u8],
+) -> StorageResult<Vec<u8>> {
     let frame_len = HEADER_LEN
         .checked_add(payload.len())
         .and_then(|value| value.checked_add(CRC_LEN))
@@ -450,6 +468,24 @@ fn encode_extent(reservation: Reservation, payload: &[u8]) -> StorageResult<Vec<
     push_u32(&mut bytes, reservation.placement.shard_id.get());
     push_u64(&mut bytes, reservation.placement.ring_epoch.get());
     push_u128(&mut bytes, reservation.placement.sequence.get());
+    match producer {
+        Some(producer) => {
+            if producer.digest_algorithm != DIGEST_BLAKE3 {
+                return Err(StorageError::InvalidInput(
+                    "unsupported producer payload digest algorithm".into(),
+                ));
+            }
+            bytes.push(1);
+            bytes.extend_from_slice(&[0; 3]);
+            push_u128(&mut bytes, producer.producer_id);
+            push_u32(&mut bytes, producer.epoch);
+            push_u64(&mut bytes, producer.first_sequence);
+            bytes.push(producer.digest_algorithm);
+            bytes.extend_from_slice(&[0; 3]);
+            bytes.extend_from_slice(&producer.payload_digest);
+        }
+        None => bytes.extend_from_slice(&[0; PRODUCER_FIXED_LEN]),
+    }
     push_u64(&mut bytes, payload_len_u64);
     debug_assert_eq!(bytes.len(), HEADER_LEN);
     bytes.extend_from_slice(payload);
@@ -492,6 +528,59 @@ fn decode_extent(
     let shard_id = ShardId::new(decoder.u32()?);
     let ring_epoch = RingEpoch::new(decoder.u64()?);
     let sequence = PlacementSequence::new(decoder.u128()?);
+    let producer_present = decoder.u8()?;
+    let producer_reserved = decoder.take(3)?;
+    let producer_id = decoder.u128()?;
+    let producer_epoch = decoder.u32()?;
+    let producer_first_sequence = decoder.u64()?;
+    let digest_algorithm = decoder.u8()?;
+    let digest_reserved = decoder.take(3)?;
+    let payload_digest: [u8; 32] = decoder.take(32)?.try_into().expect("producer digest width");
+    if producer_reserved != [0; 3] || digest_reserved != [0; 3] {
+        return Err(StorageError::corrupt(
+            path,
+            frame_offset,
+            "producer reserved bytes are nonzero",
+        ));
+    }
+    let producer = match producer_present {
+        0 => {
+            if producer_id != 0
+                || producer_epoch != 0
+                || producer_first_sequence != 0
+                || digest_algorithm != 0
+                || payload_digest != [0; 32]
+            {
+                return Err(StorageError::corrupt(
+                    path,
+                    frame_offset,
+                    "absent producer metadata is nonzero",
+                ));
+            }
+            None
+        }
+        1 if digest_algorithm == DIGEST_BLAKE3 => Some(ProducerSequence {
+            producer_id,
+            epoch: producer_epoch,
+            first_sequence: producer_first_sequence,
+            digest_algorithm,
+            payload_digest,
+        }),
+        1 => {
+            return Err(StorageError::corrupt(
+                path,
+                frame_offset,
+                "unsupported producer digest algorithm",
+            ));
+        }
+        _ => {
+            return Err(StorageError::corrupt(
+                path,
+                frame_offset,
+                "invalid producer metadata flag",
+            ));
+        }
+    };
     let payload_len = usize::try_from(decoder.u64()?)
         .map_err(|_| StorageError::corrupt(path, frame_offset, "payload length overflow"))?;
     if shard_id != expected_shard {
@@ -534,6 +623,7 @@ fn decode_extent(
                 sequence,
             },
         },
+        producer,
         pack_sequence: 0,
         payload_offset: frame_offset + HEADER_LEN as u64,
         payload_len,
@@ -734,10 +824,10 @@ mod tests {
         {
             let mut store = ShardStore::open(config(&temp.0, 150)).expect("open");
             store
-                .append(reservation(0, 0, 3), b"first", true)
+                .append(reservation(0, 0, 3), None, b"first", true)
                 .expect("append first");
             store
-                .append(reservation(1, 2, 3), b"second", true)
+                .append(reservation(1, 2, 3), None, b"second", true)
                 .expect("append second");
             assert!(store.pack_paths.len() >= 2);
         }
@@ -766,7 +856,7 @@ mod tests {
         {
             let mut store = ShardStore::open(config(&temp.0, 4096)).expect("open");
             store
-                .append(reservation(0, 0, 3), b"complete", true)
+                .append(reservation(0, 0, 3), None, b"complete", true)
                 .expect("append");
             active_path = store.active_path().to_path_buf();
         }
@@ -793,7 +883,7 @@ mod tests {
         {
             let mut store = ShardStore::open(config(&temp.0, 4096)).expect("open");
             store
-                .append(reservation(0, 0, 3), b"payload", true)
+                .append(reservation(0, 0, 3), None, b"payload", true)
                 .expect("append");
             active_path = store.active_path().to_path_buf();
         }

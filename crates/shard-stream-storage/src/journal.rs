@@ -1,12 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use shard_stream_core::{
-    BatchId, LogicalOffset, LogicalPartitionId, Placement, PlacementSequence, Reservation,
-    RingEpoch, ShardId, TopicId, TopicPartition,
+    LogicalOffset, LogicalPartitionId, RingEpoch, ShardId, TopicId, TopicPartition,
 };
 
 use crate::codec::{Decoder, push_u8, push_u32, push_u64, push_u128};
@@ -19,10 +17,6 @@ const CRC_LEN: usize = 4;
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
 
 const CONFIGURE_KIND: u8 = 1;
-const RESERVE_KIND: u8 = 2;
-const COMMIT_KIND: u8 = 3;
-const ABORT_KIND: u8 = 4;
-const COMMIT_V2_KIND: u8 = 5;
 const TRUNCATE_KIND: u8 = 6;
 
 pub const DIGEST_BLAKE3: u8 = 1;
@@ -42,20 +36,6 @@ pub enum JournalEvent {
         topic_partition: TopicPartition,
         ring_epoch: RingEpoch,
         shards: Vec<ShardId>,
-    },
-    Reserve {
-        reservation: Reservation,
-        producer: Option<ProducerSequence>,
-    },
-    Commit {
-        topic_partition: TopicPartition,
-        batch_id: BatchId,
-        durable_replicas: u32,
-        object_durable: bool,
-    },
-    Abort {
-        topic_partition: TopicPartition,
-        batch_id: BatchId,
     },
     Truncate {
         topic_partition: TopicPartition,
@@ -203,57 +183,6 @@ fn encode_event(event: &JournalEvent) -> StorageResult<Vec<u8>> {
             }
             (CONFIGURE_KIND, body)
         }
-        JournalEvent::Reserve {
-            reservation,
-            producer,
-        } => {
-            let mut body = Vec::with_capacity(128);
-            push_reservation(&mut body, *reservation);
-            match producer {
-                Some(producer) => {
-                    push_u8(&mut body, 1);
-                    push_u128(&mut body, producer.producer_id);
-                    push_u32(&mut body, producer.epoch);
-                    push_u64(&mut body, producer.first_sequence);
-                    if producer.digest_algorithm != DIGEST_BLAKE3 {
-                        return Err(StorageError::InvalidInput(
-                            "unsupported producer payload digest algorithm".into(),
-                        ));
-                    }
-                    push_u8(&mut body, producer.digest_algorithm);
-                    body.extend_from_slice(&producer.payload_digest);
-                }
-                None => push_u8(&mut body, 0),
-            }
-            (RESERVE_KIND, body)
-        }
-        JournalEvent::Commit {
-            topic_partition,
-            batch_id,
-            durable_replicas,
-            object_durable,
-        } => {
-            if *durable_replicas == 0 {
-                return Err(StorageError::InvalidInput(
-                    "committed batch must have a durable replica".into(),
-                ));
-            }
-            let mut body = Vec::with_capacity(40);
-            push_topic_partition(&mut body, *topic_partition);
-            push_u128(&mut body, batch_id.get());
-            push_u32(&mut body, *durable_replicas);
-            push_u8(&mut body, u8::from(*object_durable));
-            (COMMIT_V2_KIND, body)
-        }
-        JournalEvent::Abort {
-            topic_partition,
-            batch_id,
-        } => {
-            let mut body = Vec::with_capacity(36);
-            push_topic_partition(&mut body, *topic_partition);
-            push_u128(&mut body, batch_id.get());
-            (ABORT_KIND, body)
-        }
         JournalEvent::Truncate {
             topic_partition,
             log_start,
@@ -317,85 +246,6 @@ fn decode_event(path: &Path, offset: u64, kind: u8, body: &[u8]) -> StorageResul
                 shards,
             }
         }
-        RESERVE_KIND => {
-            let reservation = decode_reservation(&mut decoder)?;
-            let producer = match decoder.u8()? {
-                0 => None,
-                1 => {
-                    let producer_id = decoder.u128()?;
-                    let epoch = decoder.u32()?;
-                    let first_sequence = decoder.u64()?;
-                    let digest_algorithm = decoder.u8()?;
-                    if digest_algorithm != DIGEST_BLAKE3 {
-                        return Err(StorageError::corrupt(
-                            path,
-                            offset,
-                            "unsupported producer payload digest algorithm",
-                        ));
-                    }
-                    Some(ProducerSequence {
-                        producer_id,
-                        epoch,
-                        first_sequence,
-                        digest_algorithm,
-                        payload_digest: decoder.take(32)?.try_into().map_err(|_| {
-                            StorageError::corrupt(path, offset, "invalid payload digest")
-                        })?,
-                    })
-                }
-                _ => {
-                    return Err(StorageError::corrupt(
-                        path,
-                        offset,
-                        "invalid producer presence flag",
-                    ));
-                }
-            };
-            JournalEvent::Reserve {
-                reservation,
-                producer,
-            }
-        }
-        COMMIT_KIND | COMMIT_V2_KIND | ABORT_KIND => {
-            let topic_partition = decode_topic_partition(&mut decoder)?;
-            let batch_id = BatchId::new(decoder.u128()?);
-            if kind == COMMIT_KIND || kind == COMMIT_V2_KIND {
-                let durable_replicas = decoder.u32()?;
-                if durable_replicas == 0 {
-                    return Err(StorageError::corrupt(
-                        path,
-                        offset,
-                        "committed batch has zero durable replicas",
-                    ));
-                }
-                let object_durable = if kind == COMMIT_V2_KIND {
-                    match decoder.u8()? {
-                        0 => false,
-                        1 => true,
-                        _ => {
-                            return Err(StorageError::corrupt(
-                                path,
-                                offset,
-                                "invalid object durability flag",
-                            ));
-                        }
-                    }
-                } else {
-                    false
-                };
-                JournalEvent::Commit {
-                    topic_partition,
-                    batch_id,
-                    durable_replicas,
-                    object_durable,
-                }
-            } else {
-                JournalEvent::Abort {
-                    topic_partition,
-                    batch_id,
-                }
-            }
-        }
         TRUNCATE_KIND => JournalEvent::Truncate {
             topic_partition: decode_topic_partition(&mut decoder)?,
             log_start: LogicalOffset::new(decoder.u128()?),
@@ -430,54 +280,6 @@ fn decode_topic_partition(decoder: &mut Decoder<'_>) -> StorageResult<TopicParti
     ))
 }
 
-fn push_reservation(bytes: &mut Vec<u8>, reservation: Reservation) {
-    push_topic_partition(
-        bytes,
-        TopicPartition::new(reservation.topic_id, reservation.partition_id),
-    );
-    push_u128(bytes, reservation.batch_id.get());
-    push_u128(bytes, reservation.first_offset.get());
-    push_u128(bytes, reservation.last_offset.get());
-    push_u32(bytes, reservation.record_count.get());
-    push_u32(bytes, reservation.placement.shard_id.get());
-    push_u64(bytes, reservation.placement.ring_epoch.get());
-    push_u128(bytes, reservation.placement.sequence.get());
-}
-
-fn decode_reservation(decoder: &mut Decoder<'_>) -> StorageResult<Reservation> {
-    let topic_partition = decode_topic_partition(decoder)?;
-    let batch_id = BatchId::new(decoder.u128()?);
-    let first_offset = LogicalOffset::new(decoder.u128()?);
-    let last_offset = LogicalOffset::new(decoder.u128()?);
-    let record_count = NonZeroU32::new(decoder.u32()?)
-        .ok_or_else(|| StorageError::InvalidInput("zero journal record count".into()))?;
-    let shard_id = ShardId::new(decoder.u32()?);
-    let ring_epoch = RingEpoch::new(decoder.u64()?);
-    let sequence = PlacementSequence::new(decoder.u128()?);
-    if first_offset
-        .get()
-        .checked_add(u128::from(record_count.get()) - 1)
-        != Some(last_offset.get())
-    {
-        return Err(StorageError::InvalidInput(
-            "journal reservation range does not match count".into(),
-        ));
-    }
-    Ok(Reservation {
-        topic_id: topic_partition.topic_id,
-        partition_id: topic_partition.partition_id,
-        batch_id,
-        first_offset,
-        last_offset,
-        record_count,
-        placement: Placement {
-            shard_id,
-            ring_epoch,
-            sequence,
-        },
-    })
-}
-
 fn validate_prefix(path: &Path, offset: u64, prefix: &[u8; PREFIX_LEN]) -> StorageResult<()> {
     if &prefix[..4] != JOURNAL_MAGIC {
         return Err(StorageError::corrupt(path, offset, "invalid journal magic"));
@@ -497,40 +299,6 @@ fn validate_prefix(path: &Path, offset: u64, prefix: &[u8; PREFIX_LEN]) -> Stora
         ));
     }
     Ok(())
-}
-
-pub fn summarize_events(
-    events: &[JournalEvent],
-) -> HashMap<(TopicPartition, BatchId), &'static str> {
-    let mut states = HashMap::new();
-    for event in events {
-        match event {
-            JournalEvent::Reserve { reservation, .. } => {
-                states.insert(
-                    (
-                        TopicPartition::new(reservation.topic_id, reservation.partition_id),
-                        reservation.batch_id,
-                    ),
-                    "reserved",
-                );
-            }
-            JournalEvent::Commit {
-                topic_partition,
-                batch_id,
-                ..
-            } => {
-                states.insert((*topic_partition, *batch_id), "committed");
-            }
-            JournalEvent::Abort {
-                topic_partition,
-                batch_id,
-            } => {
-                states.insert((*topic_partition, *batch_id), "aborted");
-            }
-            JournalEvent::Configure { .. } | JournalEvent::Truncate { .. } => {}
-        }
-    }
-    states
 }
 
 #[cfg(test)]
@@ -560,22 +328,6 @@ mod tests {
         }
     }
 
-    fn reservation() -> Reservation {
-        Reservation {
-            topic_id: TopicId::new(9),
-            partition_id: LogicalPartitionId::new(2),
-            batch_id: BatchId::new(4),
-            first_offset: LogicalOffset::new(10),
-            last_offset: LogicalOffset::new(12),
-            record_count: NonZeroU32::new(3).expect("nonzero"),
-            placement: Placement {
-                shard_id: ShardId::new(1),
-                ring_epoch: RingEpoch::new(7),
-                sequence: PlacementSequence::new(4),
-            },
-        }
-    }
-
     #[test]
     fn round_trips_every_event_and_repairs_partial_tail() {
         let temp = TempFile::new("roundtrip");
@@ -584,22 +336,6 @@ mod tests {
                 topic_partition: TopicPartition::new(TopicId::new(9), LogicalPartitionId::new(2)),
                 ring_epoch: RingEpoch::new(7),
                 shards: vec![ShardId::new(1), ShardId::new(2)],
-            },
-            JournalEvent::Reserve {
-                reservation: reservation(),
-                producer: Some(ProducerSequence {
-                    producer_id: 3,
-                    epoch: 2,
-                    first_sequence: 99,
-                    digest_algorithm: DIGEST_BLAKE3,
-                    payload_digest: [17; 32],
-                }),
-            },
-            JournalEvent::Commit {
-                topic_partition: TopicPartition::new(TopicId::new(9), LogicalPartitionId::new(2)),
-                batch_id: BatchId::new(4),
-                durable_replicas: 2,
-                object_durable: true,
             },
             JournalEvent::Truncate {
                 topic_partition: TopicPartition::new(TopicId::new(9), LogicalPartitionId::new(2)),
@@ -632,9 +368,13 @@ mod tests {
             let (mut journal, _) = CoordinatorJournal::open(&temp.0).expect("open");
             journal
                 .append(
-                    &JournalEvent::Reserve {
-                        reservation: reservation(),
-                        producer: None,
+                    &JournalEvent::Configure {
+                        topic_partition: TopicPartition::new(
+                            TopicId::new(9),
+                            LogicalPartitionId::new(2),
+                        ),
+                        ring_epoch: RingEpoch::new(7),
+                        shards: vec![ShardId::new(1), ShardId::new(2)],
                     },
                     true,
                 )
