@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, RwLock};
 
+use shard_stream_control::WriteFence;
 use shard_stream_core::{
     BatchId, LogicalOffset, LogicalPartitionId, Placement, Reservation, RingEpoch, SequencerState,
     ShardId, TopicPartition, TopicSequencer,
@@ -156,10 +157,25 @@ pub struct StreamEngine {
     shards: Vec<ShardHandle>,
     partitions: RwLock<HashMap<TopicPartition, Arc<Mutex<PartitionState>>>>,
     journal: Mutex<CoordinatorJournal>,
+    write_fence: Option<Arc<dyn WriteFence>>,
 }
 
 impl StreamEngine {
     pub fn open(config: EngineConfig) -> EngineResult<Self> {
+        Self::open_inner(config, None)
+    }
+
+    pub fn open_with_fence(
+        config: EngineConfig,
+        write_fence: Arc<dyn WriteFence>,
+    ) -> EngineResult<Self> {
+        Self::open_inner(config, Some(write_fence))
+    }
+
+    fn open_inner(
+        config: EngineConfig,
+        write_fence: Option<Arc<dyn WriteFence>>,
+    ) -> EngineResult<Self> {
         config.validate()?;
         std::fs::create_dir_all(&config.data_dir)
             .map_err(shard_stream_storage::StorageError::from)?;
@@ -189,6 +205,7 @@ impl StreamEngine {
             shards,
             partitions: RwLock::new(partitions),
             journal: Mutex::new(journal),
+            write_fence,
         };
         for (topic_partition, log_start) in retained_log_starts {
             if log_start.get() > 0 {
@@ -286,6 +303,14 @@ impl StreamEngine {
                 EngineError::InvalidConfig(format!("invalid append request: {error}"))
             })?;
         let topic_partition = TopicPartition::new(request.topic_id, request.partition_id);
+        if let Some(write_fence) = &self.write_fence {
+            let leader_epoch = request.leader_epoch.ok_or_else(|| {
+                EngineError::Fenced("leader_epoch is required by the write fence".into())
+            })?;
+            write_fence
+                .check_write(topic_partition, leader_epoch)
+                .map_err(|error| EngineError::Fenced(error.to_string()))?;
+        }
         let partition = self.partition(topic_partition)?;
         let payload_digest = *blake3::hash(&request.payload).as_bytes();
 
@@ -466,6 +491,20 @@ impl StreamEngine {
         let partition = self.partition(topic_partition)?;
         let watermarks = mutex_lock(&partition).watermarks(self.config.min_in_sync_replicas);
         Ok(watermarks)
+    }
+
+    #[must_use]
+    pub fn topic_partitions(
+        &self,
+        topic_id: shard_stream_core::TopicId,
+    ) -> Vec<LogicalPartitionId> {
+        let mut partitions = read_lock(&self.partitions)
+            .keys()
+            .filter(|topic_partition| topic_partition.topic_id == topic_id)
+            .map(|topic_partition| topic_partition.partition_id)
+            .collect::<Vec<_>>();
+        partitions.sort_unstable();
+        partitions
     }
 
     pub fn truncate_partition(
@@ -1123,12 +1162,32 @@ fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use shard_stream_core::{PlacementSequence, TopicId};
     use shard_stream_storage::ShardStore;
 
     use super::*;
+
+    struct ExactEpochFence;
+
+    impl shard_stream_control::WriteFence for ExactEpochFence {
+        fn check_write(
+            &self,
+            _topic_partition: TopicPartition,
+            leader_epoch: u64,
+        ) -> shard_stream_control::ControlResult<()> {
+            if leader_epoch == 7 {
+                Ok(())
+            } else {
+                Err(shard_stream_control::ControlError::Fenced {
+                    expected_epoch: 7,
+                    received_epoch: leader_epoch,
+                })
+            }
+        }
+    }
 
     struct TempDir(std::path::PathBuf);
 
@@ -1181,6 +1240,7 @@ mod tests {
             payload: payload.to_vec(),
             durability: Durability::Leader,
             producer,
+            leader_epoch: None,
         }
     }
 
@@ -1239,6 +1299,33 @@ mod tests {
                 .contiguous_log_end,
             LogicalOffset::new(4)
         );
+    }
+
+    #[test]
+    fn installed_write_fence_requires_and_validates_leader_epoch() {
+        let temp = TempDir::new("write-fence");
+        let engine = StreamEngine::open_with_fence(config(&temp.0), Arc::new(ExactEpochFence))
+            .expect("open");
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("create topic");
+
+        let mut request = append_request(1, b"fenced", None);
+        assert!(matches!(
+            engine.append(request.clone()),
+            Err(EngineError::Fenced(_))
+        ));
+        request.leader_epoch = Some(6);
+        assert!(matches!(
+            engine.append(request.clone()),
+            Err(EngineError::Fenced(_))
+        ));
+        request.leader_epoch = Some(7);
+        engine.append(request).expect("current epoch");
     }
 
     #[test]

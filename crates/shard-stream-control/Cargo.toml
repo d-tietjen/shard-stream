@@ -1,5 +1,5 @@
 [package]
-name = "shard-stream-engine"
+name = "shard-stream-control"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,15 +7,12 @@ homepage.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Striped append and ordered fetch engine for shard-stream"
+description = "Blossom-backed lease coordination and write fencing for shard-stream"
 publish = false
 
 [dependencies]
 blake3.workspace = true
 shard-stream-core.workspace = true
-shard-stream-control.workspace = true
-shard-stream-protocol.workspace = true
-shard-stream-storage.workspace = true
 
 [lints]
 workspace = true

@@ -69,6 +69,14 @@
             }
           },
           {
+            "name": "request_id",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Optional unsigned 128-bit request identifier"
+          },
+          {
             "name": "durability",
             "in": "query",
             "schema": {
@@ -80,6 +88,40 @@
               ],
               "default": "leader"
             }
+          },
+          {
+            "name": "producer_id",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Unsigned 128-bit idempotent producer identifier; supply with producer_epoch and first_sequence"
+          },
+          {
+            "name": "producer_epoch",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "uint32"
+            }
+          },
+          {
+            "name": "first_sequence",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "uint64"
+            }
+          },
+          {
+            "name": "leader_epoch",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 1
+            },
+            "description": "Required fencing token when the broker uses Blossom-backed leases"
           }
         ],
         "requestBody": {
@@ -99,6 +141,9 @@
           },
           "429": {
             "description": "Admission budget exhausted"
+          },
+          "409": {
+            "description": "Producer or leader epoch is fenced"
           }
         }
       },

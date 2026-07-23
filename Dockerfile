@@ -14,7 +14,7 @@ RUN apt-get update \
     && chown shard-stream:shard-stream /var/lib/shard-stream
 COPY --from=builder /build/target/release/shard-stream-server /usr/local/bin/shard-stream-server
 USER shard-stream
-EXPOSE 7420 7421
+EXPOSE 7420 7421 9092
 VOLUME ["/var/lib/shard-stream"]
 ENTRYPOINT ["shard-stream-server"]
-CMD ["--listen", "0.0.0.0:7420", "--grpc-listen", "0.0.0.0:7421", "--data-dir", "/var/lib/shard-stream"]
+CMD ["--listen", "0.0.0.0:7420", "--grpc-listen", "0.0.0.0:7421", "--kafka-listen", "0.0.0.0:9092", "--data-dir", "/var/lib/shard-stream"]

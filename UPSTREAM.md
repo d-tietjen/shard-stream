@@ -22,6 +22,7 @@ here. Runtime dependencies on `shard-kv` crates are not allowed.
 | `crates/shard-stream-storage/src/extent.rs` | `crates/shardmap/src/persistence/wal.rs` | Adapted framing, checksum, rotation, and partial-tail recovery patterns |
 | `crates/shard-stream-storage/src/tier.rs` | `crates/shardmap/src/persistence/object_storage.rs` and `object_storage_manifest.rs` | Rewritten as immutable BLAKE3-addressed pack publication with atomic manifest generations |
 | `crates/shard-stream-engine/src/worker.rs` | `crates/shardmap/src/replication.rs` and `replication/*` | Clean-room append-only replica and catch-up foundation |
+| `crates/shard-stream-control/src/lib.rs` | `crates/shardmap/src/active_sync/blossom.rs` and `crates/shardmap-blossom-bridge/src/lib.rs` | Stream-native adaptation of canonical claims, exact finality binding, monotonic epoch chains, bounded persistence, and fail-closed validation; SHA and KV ownership types removed |
 
 The stream implementations are deliberately rewritten around immutable
 reservations and extents. The KV WAL encodes mutation records and the existing

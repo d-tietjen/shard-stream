@@ -118,6 +118,7 @@ impl Client {
             partition_id,
             producer_id,
             epoch,
+            leader_epoch: None,
             next_sequence: Arc::new(Mutex::new(0)),
         }
     }
@@ -149,10 +150,17 @@ pub struct Producer {
     partition_id: LogicalPartitionId,
     producer_id: u128,
     epoch: u32,
+    leader_epoch: Option<u64>,
     next_sequence: Arc<Mutex<u64>>,
 }
 
 impl Producer {
+    #[must_use]
+    pub fn with_leader_epoch(mut self, leader_epoch: u64) -> Self {
+        self.leader_epoch = Some(leader_epoch);
+        self
+    }
+
     pub async fn append(
         &self,
         payload: impl Into<Vec<u8>>,
@@ -176,7 +184,7 @@ impl Producer {
             self.topic_id, self.partition_id
         );
         let url = self.client.url(&path)?;
-        let query = [
+        let mut query = vec![
             ("request_id", request_id.to_string()),
             ("record_count", record_count.to_string()),
             ("durability", durability_name(durability).into()),
@@ -184,6 +192,9 @@ impl Producer {
             ("producer_epoch", self.epoch.to_string()),
             ("first_sequence", first_sequence.to_string()),
         ];
+        if let Some(leader_epoch) = self.leader_epoch {
+            query.push(("leader_epoch", leader_epoch.to_string()));
+        }
 
         let mut attempt = 0u32;
         loop {

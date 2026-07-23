@@ -37,6 +37,14 @@ struct Args {
     listen: SocketAddr,
     #[arg(long, default_value = "127.0.0.1:7421")]
     grpc_listen: SocketAddr,
+    #[arg(long, default_value = "127.0.0.1:9092")]
+    kafka_listen: SocketAddr,
+    #[arg(long, default_value = "127.0.0.1")]
+    kafka_advertised_host: String,
+    #[arg(long, default_value_t = 9092)]
+    kafka_advertised_port: u16,
+    #[arg(long, default_value_t = 0)]
+    kafka_node_id: i32,
     #[arg(long)]
     h3_listen: Option<SocketAddr>,
     #[arg(long, requires = "h3_listen")]
@@ -181,8 +189,17 @@ async fn run(args: Args) -> Result<(), AppError> {
             args.grpc_listen
         ))
     })?;
+    let kafka_listener = TcpListener::bind(args.kafka_listen)
+        .await
+        .map_err(|error| {
+            AppError::internal(format!(
+                "failed to bind Kafka listener {}: {error}",
+                args.kafka_listen
+            ))
+        })?;
     info!(address = %args.listen, "shard-stream REST listener ready");
     info!(address = %args.grpc_listen, "shard-stream gRPC listener ready");
+    info!(address = %args.kafka_listen, "shard-stream Kafka listener ready");
 
     let grpc_engine = Arc::clone(&state.engine);
     let grpc_max_message_bytes = args
@@ -192,13 +209,15 @@ async fn run(args: Args) -> Result<(), AppError> {
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
     let rest_shutdown = shutdown_receiver.clone();
     let h3_shutdown = shutdown_receiver.clone();
-    let mut rest_task = tokio::spawn(async move {
+    let kafka_shutdown = shutdown_receiver.clone();
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(wait_for_shutdown(rest_shutdown))
             .await
             .map_err(|error| AppError::internal(format!("HTTP server failed: {error}")))
     });
-    let mut grpc_task = tokio::spawn(async move {
+    tasks.spawn(async move {
         shard_stream_grpc::serve(
             grpc_listener,
             grpc_engine,
@@ -209,41 +228,47 @@ async fn run(args: Args) -> Result<(), AppError> {
         .await
         .map_err(|error| AppError::internal(format!("gRPC server failed: {error}")))
     });
+    let kafka_engine = Arc::clone(&state.engine);
+    let kafka_config = shard_stream_kafka::KafkaConfig {
+        advertised_host: args.kafka_advertised_host,
+        advertised_port: args.kafka_advertised_port,
+        node_id: args.kafka_node_id,
+        max_frame_bytes: args
+            .max_batch_bytes
+            .saturating_mul(2)
+            .clamp(1024 * 1024, 128 * 1024 * 1024),
+        max_fetch_bytes: args.max_fetch_bytes,
+    };
+    tasks.spawn(async move {
+        shard_stream_kafka::serve(kafka_listener, kafka_engine, kafka_config, kafka_shutdown)
+            .await
+            .map_err(|error| AppError::internal(format!("Kafka server failed: {error}")))
+    });
     let h3_engine = Arc::clone(&state.engine);
-    let mut h3_task = h3_config.map(|config| {
-        tokio::spawn(async move {
+    if let Some(config) = h3_config {
+        tasks.spawn(async move {
             shard_stream_h3::serve(config, h3_engine, h3_shutdown)
                 .await
                 .map_err(|error| AppError::internal(format!("HTTP/3 server failed: {error}")))
-        })
-    });
+        });
+    }
 
-    tokio::select! {
-        result = &mut rest_task => {
-            let _ = shutdown_sender.send(true);
-            flatten_server_task("REST", result)?;
-            flatten_server_task("gRPC", grpc_task.await)?;
-            flatten_optional_server_task("HTTP/3", h3_task).await
+    let first_result = tokio::select! {
+        result = tasks.join_next() => result,
+        () = shutdown_signal() => None,
+    };
+    let _ = shutdown_sender.send(true);
+    let mut first_error = first_result.and_then(server_task_error);
+    while let Some(result) = tasks.join_next().await {
+        if let Some(error) = server_task_error(result)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
         }
-        result = &mut grpc_task => {
-            let _ = shutdown_sender.send(true);
-            flatten_server_task("gRPC", result)?;
-            flatten_server_task("REST", rest_task.await)?;
-            flatten_optional_server_task("HTTP/3", h3_task).await
-        }
-        result = wait_optional_server_task(&mut h3_task) => {
-            let _ = shutdown_sender.send(true);
-            flatten_server_task("HTTP/3", result)?;
-            flatten_server_task("REST", rest_task.await)?;
-            flatten_server_task("gRPC", grpc_task.await)
-        }
-        () = shutdown_signal() => {
-            let _ = shutdown_sender.send(true);
-            let (rest_result, grpc_result) = tokio::join!(rest_task, grpc_task);
-            flatten_server_task("REST", rest_result)?;
-            flatten_server_task("gRPC", grpc_result)?;
-            flatten_optional_server_task("HTTP/3", h3_task).await
-        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -387,6 +412,7 @@ struct AppendQuery {
     producer_id: Option<String>,
     producer_epoch: Option<u32>,
     first_sequence: Option<u64>,
+    leader_epoch: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -426,6 +452,7 @@ async fn append(
         payload: payload.to_vec(),
         durability,
         producer,
+        leader_epoch: query.leader_epoch,
     };
     let engine = Arc::clone(&state.engine);
     let response = execute(move || engine.append(request))
@@ -665,29 +692,13 @@ async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
     }
 }
 
-fn flatten_server_task(
-    name: &str,
+fn server_task_error(
     result: Result<Result<(), AppError>, tokio::task::JoinError>,
-) -> Result<(), AppError> {
-    result.map_err(|error| AppError::internal(format!("{name} server task failed: {error}")))?
-}
-
-async fn wait_optional_server_task(
-    task: &mut Option<tokio::task::JoinHandle<Result<(), AppError>>>,
-) -> Result<Result<(), AppError>, tokio::task::JoinError> {
-    match task {
-        Some(task) => task.await,
-        None => std::future::pending().await,
-    }
-}
-
-async fn flatten_optional_server_task(
-    name: &str,
-    task: Option<tokio::task::JoinHandle<Result<(), AppError>>>,
-) -> Result<(), AppError> {
-    match task {
-        Some(task) => flatten_server_task(name, task.await),
-        None => Ok(()),
+) -> Option<AppError> {
+    match result {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error),
+        Err(error) => Some(AppError::internal(format!("server task failed: {error}"))),
     }
 }
 
@@ -792,6 +803,15 @@ impl From<EngineError> for AppError {
                 status: StatusCode::NOT_IMPLEMENTED,
                 problem: ProblemBody {
                     code: "DURABILITY_UNAVAILABLE",
+                    message,
+                    retryable: false,
+                },
+                retry_after_seconds: None,
+            },
+            EngineError::Fenced(_) => Self {
+                status: StatusCode::CONFLICT,
+                problem: ProblemBody {
+                    code: "FENCED",
                     message,
                     retryable: false,
                 },

@@ -26,6 +26,7 @@ pub enum EngineError {
         durable_replicas: u32,
     },
     ObjectDurabilityUnavailable,
+    Fenced(String),
     OffsetOutOfRange {
         requested: LogicalOffset,
         log_start: LogicalOffset,
@@ -82,6 +83,7 @@ impl fmt::Display for EngineError {
                     "object-store durability is temporarily unavailable"
                 )
             }
+            Self::Fenced(message) => write!(formatter, "writer fenced: {message}"),
             Self::OffsetOutOfRange {
                 requested,
                 log_start,

@@ -41,6 +41,8 @@ pub struct AppendRequest {
     pub payload: Vec<u8>,
     pub durability: Durability,
     pub producer: Option<ProducerIdentity>,
+    /// Fencing token required when the engine has a write fence installed.
+    pub leader_epoch: Option<u64>,
 }
 
 impl AppendRequest {
@@ -154,6 +156,7 @@ mod tests {
             payload: vec![0; payload_bytes],
             durability: Durability::Quorum,
             producer: None,
+            leader_epoch: None,
         }
     }
 

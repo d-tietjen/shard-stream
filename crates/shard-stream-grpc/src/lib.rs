@@ -153,6 +153,7 @@ fn decode_append(request: v1::AppendRequest) -> Result<EngineAppendRequest, Stat
             _ => return Err(Status::invalid_argument("durability is required")),
         },
         producer,
+        leader_epoch: request.leader_epoch,
     })
 }
 
@@ -226,6 +227,7 @@ fn engine_status(error: EngineError) -> Status {
         EngineError::OffsetOutOfRange { .. } => Status::out_of_range(error.to_string()),
         EngineError::UnsupportedDurability(_) => Status::unimplemented(error.to_string()),
         EngineError::TopicAlreadyExists(_)
+        | EngineError::Fenced(_)
         | EngineError::StaleProducerEpoch { .. }
         | EngineError::ProducerSequenceOutOfOrder { .. }
         | EngineError::ProducerRequiresNewEpoch(_)
@@ -332,6 +334,7 @@ mod tests {
             payload: b"grpc".to_vec(),
             durability: v1::Durability::Leader as i32,
             producer: None,
+            leader_epoch: None,
         };
         let mut appended = producer
             .append(tokio_stream::iter([request]))

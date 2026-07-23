@@ -202,6 +202,10 @@ where
                 payload: body,
                 durability: parse_durability(query.get("durability").map(String::as_str))?,
                 producer: parse_producer(&query)?,
+                leader_epoch: query
+                    .get("leader_epoch")
+                    .map(|value| parse_u64("leader_epoch", value))
+                    .transpose()?,
             };
             let response = tokio::task::spawn_blocking(move || engine.append(append))
                 .await
@@ -354,6 +358,11 @@ fn parse_u32(field: &str, value: &str) -> Result<u32, RouteError> {
         .map_err(|_| RouteError::bad_request(format!("{field} must be an unsigned u32")))
 }
 
+fn parse_u64(field: &str, value: &str) -> Result<u64, RouteError> {
+    u64::from_str(value)
+        .map_err(|_| RouteError::bad_request(format!("{field} must be an unsigned u64")))
+}
+
 fn parse_durability(value: Option<&str>) -> Result<Durability, RouteError> {
     match value.unwrap_or("leader") {
         "leader" => Ok(Durability::Leader),
@@ -487,6 +496,7 @@ impl From<EngineError> for RouteError {
                 false,
             ),
             EngineError::TopicAlreadyExists(_)
+            | EngineError::Fenced(_)
             | EngineError::StaleProducerEpoch { .. }
             | EngineError::ProducerSequenceOutOfOrder { .. }
             | EngineError::ProducerRequiresNewEpoch(_)

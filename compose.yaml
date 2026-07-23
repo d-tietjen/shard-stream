@@ -7,6 +7,10 @@ services:
       - 0.0.0.0:7420
       - --grpc-listen
       - 0.0.0.0:7421
+      - --kafka-listen
+      - 0.0.0.0:9092
+      - --kafka-advertised-host
+      - 127.0.0.1
       - --data-dir
       - /var/lib/shard-stream
       - --shards
@@ -14,6 +18,7 @@ services:
     ports:
       - "7420:7420"
       - "7421:7421"
+      - "9092:9092"
     volumes:
       - shard-stream-data:/var/lib/shard-stream
     healthcheck:

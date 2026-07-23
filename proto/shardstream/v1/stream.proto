@@ -36,6 +36,7 @@ message AppendRequest {
   bytes payload = 5;
   Durability durability = 6;
   ProducerIdentity producer = 7;
+  optional uint64 leader_epoch = 8;
 }
 
 message Placement {
