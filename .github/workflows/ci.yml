@@ -20,6 +20,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: schema exists
         run: test -s proto/shardstream/v1/stream.proto
+      - name: OpenAPI exists
+        run: test -s openapi/shard-stream-v1.json
       - name: format
         run: cargo fmt --all -- --check
       - name: lint

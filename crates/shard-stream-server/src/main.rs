@@ -1,6 +1,674 @@
-fn main() {
-    println!(
-        "shard-stream-server {} (bootstrap; no network listener yet)",
-        env!("CARGO_PKG_VERSION")
+use std::fmt::Write as _;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use axum::Router;
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::http::header::{CONTENT_TYPE, HeaderName};
+use axum::http::{HeaderValue, Response, StatusCode};
+use axum::response::{IntoResponse, Json};
+use axum::routing::{get, post, put};
+use clap::Parser;
+use serde::{Deserialize, Serialize};
+use shard_stream_core::{
+    LogicalOffset, LogicalPartitionId, RingEpoch, ShardId, TopicId, TopicPartition,
+};
+use shard_stream_engine::{EngineConfig, EngineError, StreamEngine, TopicConfig};
+use shard_stream_protocol::{
+    AppendRequest, Durability, FetchMode, FetchRequest, NativeFetchBatch, ProducerIdentity,
+    WireError, encode_fetch_batches,
+};
+use tokio::net::TcpListener;
+use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
+
+const OPENAPI: &str = include_str!("../../../openapi/shard-stream-v1.json");
+const NATIVE_BATCH_CONTENT_TYPE: &str = "application/vnd.shard-stream.batch.v1";
+
+#[derive(Debug, Parser)]
+#[command(name = "shard-stream-server", version, about)]
+struct Args {
+    #[arg(long, default_value = "127.0.0.1:7420")]
+    listen: SocketAddr,
+    #[arg(long, default_value = "./var/shard-stream")]
+    data_dir: PathBuf,
+    #[arg(long, default_value_t = 4)]
+    shards: u32,
+    #[arg(long, default_value_t = 1)]
+    replication_factor: u32,
+    #[arg(long, default_value_t = 1)]
+    min_in_sync_replicas: u32,
+    #[arg(long, default_value_t = 4096)]
+    queue_slots_per_shard: usize,
+    #[arg(long, default_value_t = 512 * 1024 * 1024)]
+    queue_bytes_per_shard: usize,
+    #[arg(long, default_value_t = 256 * 1024 * 1024)]
+    target_pack_bytes: u64,
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    max_batch_bytes: usize,
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    max_fetch_bytes: usize,
+}
+
+#[derive(Clone)]
+struct AppState {
+    engine: Arc<StreamEngine>,
+    metrics: Arc<HttpMetrics>,
+    next_request_id: Arc<AtomicU64>,
+    max_fetch_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct HttpMetrics {
+    requests: AtomicU64,
+    errors: AtomicU64,
+    appended_batches: AtomicU64,
+    appended_bytes: AtomicU64,
+    fetched_batches: AtomicU64,
+    fetched_bytes: AtomicU64,
+}
+
+impl HttpMetrics {
+    fn request(&self) {
+        saturating_increment(&self.requests, 1);
+    }
+
+    fn error(&self) {
+        saturating_increment(&self.errors, 1);
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+    let args = Args::parse();
+    if let Err(error) = run(args).await {
+        error!(%error, "shard-stream server stopped");
+        std::process::exit(1);
+    }
+}
+
+async fn run(args: Args) -> Result<(), AppError> {
+    let config = EngineConfig {
+        data_dir: args.data_dir,
+        shard_count: args.shards,
+        replication_factor: args.replication_factor,
+        min_in_sync_replicas: args.min_in_sync_replicas,
+        queue_slots_per_shard: args.queue_slots_per_shard,
+        queue_bytes_per_shard: args.queue_bytes_per_shard,
+        target_pack_bytes: args.target_pack_bytes,
+        max_batch_bytes: args.max_batch_bytes,
+        max_fetch_bytes: args.max_fetch_bytes,
+    };
+    let engine = Arc::new(StreamEngine::open(config).map_err(AppError::from)?);
+    let state = AppState {
+        engine,
+        metrics: Arc::new(HttpMetrics::default()),
+        next_request_id: Arc::new(AtomicU64::new(1)),
+        max_fetch_bytes: args.max_fetch_bytes,
+    };
+    let app = Router::new()
+        .route("/healthz", get(health))
+        .route("/readyz", get(health))
+        .route("/metrics", get(metrics))
+        .route("/openapi.json", get(openapi))
+        .route("/v1/topics", post(create_topic))
+        .route(
+            "/v1/topics/{topic_id}/partitions/{partition_id}/ring",
+            put(reconfigure_ring),
+        )
+        .route(
+            "/v1/topics/{topic_id}/partitions/{partition_id}/records",
+            post(append).get(fetch),
+        )
+        .route(
+            "/v1/topics/{topic_id}/partitions/{partition_id}/watermarks",
+            get(watermarks),
+        )
+        .layer(DefaultBodyLimit::max(args.max_batch_bytes))
+        .with_state(state);
+    let listener = TcpListener::bind(args.listen)
+        .await
+        .map_err(|error| AppError::internal(format!("failed to bind {}: {error}", args.listen)))?;
+    info!(address = %args.listen, "shard-stream REST listener ready");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .map_err(|error| AppError::internal(format!("HTTP server failed: {error}")))
+}
+
+async fn health() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "application/json")],
+        r#"{"status":"ok"}"#,
+    )
+}
+
+async fn openapi() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "application/json")],
+        OPENAPI,
+    )
+}
+
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let metrics = &state.metrics;
+    let mut body = String::new();
+    for (name, help, value) in [
+        (
+            "shard_stream_http_requests_total",
+            "HTTP requests received",
+            metrics.requests.load(Ordering::Relaxed),
+        ),
+        (
+            "shard_stream_http_errors_total",
+            "HTTP requests returning errors",
+            metrics.errors.load(Ordering::Relaxed),
+        ),
+        (
+            "shard_stream_appended_batches_total",
+            "Successfully appended batches",
+            metrics.appended_batches.load(Ordering::Relaxed),
+        ),
+        (
+            "shard_stream_appended_bytes_total",
+            "Successfully appended payload bytes",
+            metrics.appended_bytes.load(Ordering::Relaxed),
+        ),
+        (
+            "shard_stream_fetched_batches_total",
+            "Fetched batches",
+            metrics.fetched_batches.load(Ordering::Relaxed),
+        ),
+        (
+            "shard_stream_fetched_bytes_total",
+            "Fetched payload bytes",
+            metrics.fetched_bytes.load(Ordering::Relaxed),
+        ),
+    ] {
+        let _ = writeln!(body, "# HELP {name} {help}");
+        let _ = writeln!(body, "# TYPE {name} counter");
+        let _ = writeln!(body, "{name} {value}");
+    }
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "text/plain; version=0.0.4")],
+        body,
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateTopicBody {
+    topic_id: String,
+    partitions: u32,
+    shards: Option<Vec<u32>>,
+}
+
+#[derive(Debug, Serialize)]
+struct TopicResponse {
+    topic_id: String,
+    partitions: u32,
+}
+
+async fn create_topic(
+    State(state): State<AppState>,
+    Json(body): Json<CreateTopicBody>,
+) -> Result<impl IntoResponse, AppError> {
+    state.metrics.request();
+    let topic_id = parse_topic_id(&body.topic_id)?;
+    let config = TopicConfig {
+        topic_id,
+        partitions: body.partitions,
+        shards: body
+            .shards
+            .map(|shards| shards.into_iter().map(ShardId::new).collect()),
+    };
+    let engine = Arc::clone(&state.engine);
+    execute(move || engine.create_topic(config))
+        .await
+        .inspect_err(|_| state.metrics.error())?;
+    Ok((
+        StatusCode::CREATED,
+        Json(TopicResponse {
+            topic_id: topic_id.to_string(),
+            partitions: body.partitions,
+        }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct RingBody {
+    ring_epoch: u64,
+    shards: Vec<u32>,
+}
+
+async fn reconfigure_ring(
+    State(state): State<AppState>,
+    Path((topic_id, partition_id)): Path<(String, u32)>,
+    Json(body): Json<RingBody>,
+) -> Result<StatusCode, AppError> {
+    state.metrics.request();
+    let topic_partition = TopicPartition::new(
+        parse_topic_id(&topic_id)?,
+        LogicalPartitionId::new(partition_id),
     );
+    let engine = Arc::clone(&state.engine);
+    execute(move || {
+        engine.reconfigure_partition(
+            topic_partition,
+            RingEpoch::new(body.ring_epoch),
+            body.shards.into_iter().map(ShardId::new).collect(),
+        )
+    })
+    .await
+    .inspect_err(|_| state.metrics.error())?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct AppendQuery {
+    request_id: Option<String>,
+    #[serde(default = "default_record_count")]
+    record_count: u32,
+    #[serde(default = "default_durability")]
+    durability: String,
+    producer_id: Option<String>,
+    producer_epoch: Option<u32>,
+    first_sequence: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct AppendResponseBody {
+    request_id: String,
+    batch_id: String,
+    first_offset: String,
+    last_offset: String,
+    shard_id: u32,
+    ring_epoch: u64,
+    placement_sequence: String,
+}
+
+async fn append(
+    State(state): State<AppState>,
+    Path((topic_id, partition_id)): Path<(String, u32)>,
+    Query(query): Query<AppendQuery>,
+    payload: Bytes,
+) -> Result<Json<AppendResponseBody>, AppError> {
+    state.metrics.request();
+    let request_id = match query.request_id {
+        Some(request_id) => parse_u128("request_id", &request_id)?,
+        None => u128::from(state.next_request_id.fetch_add(1, Ordering::Relaxed)),
+    };
+    let durability = parse_durability(&query.durability)?;
+    let producer = parse_producer(
+        query.producer_id,
+        query.producer_epoch,
+        query.first_sequence,
+    )?;
+    let payload_len = payload.len() as u64;
+    let request = AppendRequest {
+        request_id,
+        topic_id: parse_topic_id(&topic_id)?,
+        partition_id: LogicalPartitionId::new(partition_id),
+        record_count: query.record_count,
+        payload: payload.to_vec(),
+        durability,
+        producer,
+    };
+    let engine = Arc::clone(&state.engine);
+    let response = execute(move || engine.append(request))
+        .await
+        .inspect_err(|_| state.metrics.error())?;
+    saturating_increment(&state.metrics.appended_batches, 1);
+    saturating_increment(&state.metrics.appended_bytes, payload_len);
+    Ok(Json(AppendResponseBody {
+        request_id: response.request_id.to_string(),
+        batch_id: response.batch_id.to_string(),
+        first_offset: response.first_offset.to_string(),
+        last_offset: response.last_offset.to_string(),
+        shard_id: response.placement.shard_id.get(),
+        ring_epoch: response.placement.ring_epoch.get(),
+        placement_sequence: response.placement.sequence.to_string(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct FetchQuery {
+    #[serde(default = "default_offset")]
+    offset: String,
+    max_bytes: Option<u32>,
+    #[serde(default = "default_fetch_mode")]
+    mode: String,
+    request_id: Option<String>,
+}
+
+async fn fetch(
+    State(state): State<AppState>,
+    Path((topic_id, partition_id)): Path<(String, u32)>,
+    Query(query): Query<FetchQuery>,
+) -> Result<Response<Body>, AppError> {
+    state.metrics.request();
+    let request_id = match query.request_id {
+        Some(request_id) => parse_u128("request_id", &request_id)?,
+        None => u128::from(state.next_request_id.fetch_add(1, Ordering::Relaxed)),
+    };
+    let configured_max = u32::try_from(state.max_fetch_bytes).unwrap_or(u32::MAX);
+    let max_bytes = query.max_bytes.unwrap_or(configured_max);
+    let request = FetchRequest {
+        request_id,
+        topic_id: parse_topic_id(&topic_id)?,
+        partition_id: LogicalPartitionId::new(partition_id),
+        start_offset: LogicalOffset::new(parse_u128("offset", &query.offset)?),
+        max_bytes,
+        mode: parse_fetch_mode(&query.mode)?,
+    };
+    let engine = Arc::clone(&state.engine);
+    let batches = execute(move || engine.fetch(request))
+        .await
+        .inspect_err(|_| state.metrics.error())?;
+    let payload_bytes = batches
+        .iter()
+        .map(|batch| batch.payload.len() as u64)
+        .sum::<u64>();
+    let native = batches
+        .into_iter()
+        .map(|batch| NativeFetchBatch {
+            request_id,
+            batch_id: batch.batch_id,
+            first_offset: batch.first_offset,
+            last_offset: batch.last_offset,
+            record_count: batch.record_count,
+            placement: batch.placement,
+            payload: batch.payload,
+        })
+        .collect::<Vec<_>>();
+    let max_output = state
+        .max_fetch_bytes
+        .saturating_add(native.len().saturating_mul(256));
+    let encoded = encode_fetch_batches(&native, max_output).map_err(AppError::from)?;
+    saturating_increment(&state.metrics.fetched_batches, native.len() as u64);
+    saturating_increment(&state.metrics.fetched_bytes, payload_bytes);
+
+    let mut response = Response::new(Body::from(encoded));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(NATIVE_BATCH_CONTENT_TYPE),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-shard-stream-batch-count"),
+        HeaderValue::from_str(&native.len().to_string())
+            .map_err(|error| AppError::internal(format!("invalid count header: {error}")))?,
+    );
+    Ok(response)
+}
+
+#[derive(Debug, Serialize)]
+struct WatermarksResponse {
+    log_start: String,
+    allocated_end: String,
+    contiguous_log_end: String,
+    replicated_high_watermark: String,
+    last_stable_offset: String,
+}
+
+async fn watermarks(
+    State(state): State<AppState>,
+    Path((topic_id, partition_id)): Path<(String, u32)>,
+) -> Result<Json<WatermarksResponse>, AppError> {
+    state.metrics.request();
+    let topic_partition = TopicPartition::new(
+        parse_topic_id(&topic_id)?,
+        LogicalPartitionId::new(partition_id),
+    );
+    let engine = Arc::clone(&state.engine);
+    let watermarks = execute(move || engine.watermarks(topic_partition))
+        .await
+        .inspect_err(|_| state.metrics.error())?;
+    Ok(Json(WatermarksResponse {
+        log_start: watermarks.log_start.to_string(),
+        allocated_end: watermarks.allocated_end.to_string(),
+        contiguous_log_end: watermarks.contiguous_log_end.to_string(),
+        replicated_high_watermark: watermarks.replicated_high_watermark.to_string(),
+        last_stable_offset: watermarks.last_stable_offset.to_string(),
+    }))
+}
+
+async fn execute<T, F>(operation: F) -> Result<T, AppError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, EngineError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| AppError::internal(format!("engine task failed: {error}")))?
+        .map_err(AppError::from)
+}
+
+fn parse_topic_id(value: &str) -> Result<TopicId, AppError> {
+    parse_u128("topic_id", value).map(TopicId::new)
+}
+
+fn parse_u128(field: &str, value: &str) -> Result<u128, AppError> {
+    u128::from_str(value)
+        .map_err(|_| AppError::bad_request(format!("{field} must be an unsigned 128-bit integer")))
+}
+
+fn parse_durability(value: &str) -> Result<Durability, AppError> {
+    match value {
+        "leader" => Ok(Durability::Leader),
+        "quorum" => Ok(Durability::Quorum),
+        "object" => Ok(Durability::Object),
+        _ => Err(AppError::bad_request(
+            "durability must be leader, quorum, or object",
+        )),
+    }
+}
+
+fn parse_fetch_mode(value: &str) -> Result<FetchMode, AppError> {
+    match value {
+        "ordered" => Ok(FetchMode::Ordered),
+        "as_available" => Ok(FetchMode::AsAvailable),
+        _ => Err(AppError::bad_request(
+            "mode must be ordered or as_available",
+        )),
+    }
+}
+
+fn parse_producer(
+    producer_id: Option<String>,
+    epoch: Option<u32>,
+    first_sequence: Option<u64>,
+) -> Result<Option<ProducerIdentity>, AppError> {
+    match (producer_id, epoch, first_sequence) {
+        (None, None, None) => Ok(None),
+        (Some(producer_id), Some(epoch), Some(first_sequence)) => Ok(Some(ProducerIdentity {
+            producer_id: parse_u128("producer_id", &producer_id)?,
+            epoch,
+            first_sequence,
+        })),
+        _ => Err(AppError::bad_request(
+            "producer_id, producer_epoch, and first_sequence must be supplied together",
+        )),
+    }
+}
+
+const fn default_record_count() -> u32 {
+    1
+}
+
+fn default_durability() -> String {
+    "leader".into()
+}
+
+fn default_offset() -> String {
+    "0".into()
+}
+
+fn default_fetch_mode() -> String {
+    "ordered".into()
+}
+
+fn saturating_increment(counter: &AtomicU64, amount: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_add(amount))
+    });
+}
+
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+    info!("shutdown signal received");
+}
+
+#[derive(Debug, Serialize)]
+struct ProblemBody {
+    code: &'static str,
+    message: String,
+    retryable: bool,
+}
+
+#[derive(Debug)]
+struct AppError {
+    status: StatusCode,
+    problem: ProblemBody,
+    retry_after_seconds: Option<u64>,
+}
+
+impl AppError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            problem: ProblemBody {
+                code: "INVALID_REQUEST",
+                message: message.into(),
+                retryable: false,
+            },
+            retry_after_seconds: None,
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            problem: ProblemBody {
+                code: "INTERNAL",
+                message: message.into(),
+                retryable: false,
+            },
+            retry_after_seconds: None,
+        }
+    }
+}
+
+impl From<WireError> for AppError {
+    fn from(error: WireError) -> Self {
+        Self::internal(format!("failed to encode native response: {error}"))
+    }
+}
+
+impl From<EngineError> for AppError {
+    fn from(error: EngineError) -> Self {
+        let message = error.to_string();
+        match error {
+            EngineError::InvalidConfig(_) => Self::bad_request(message),
+            EngineError::TopicAlreadyExists(_) => Self {
+                status: StatusCode::CONFLICT,
+                problem: ProblemBody {
+                    code: "TOPIC_EXISTS",
+                    message,
+                    retryable: false,
+                },
+                retry_after_seconds: None,
+            },
+            EngineError::UnknownPartition { .. } | EngineError::UnknownShard(_) => Self {
+                status: StatusCode::NOT_FOUND,
+                problem: ProblemBody {
+                    code: "NOT_FOUND",
+                    message,
+                    retryable: false,
+                },
+                retry_after_seconds: None,
+            },
+            EngineError::AdmissionLimited { .. } => Self {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                problem: ProblemBody {
+                    code: "ADMISSION_LIMITED",
+                    message,
+                    retryable: true,
+                },
+                retry_after_seconds: Some(1),
+            },
+            EngineError::WorkerStopped(_) => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                problem: ProblemBody {
+                    code: "WORKER_UNAVAILABLE",
+                    message,
+                    retryable: true,
+                },
+                retry_after_seconds: Some(1),
+            },
+            EngineError::DurabilityUnavailable { .. } => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                problem: ProblemBody {
+                    code: "DURABILITY_UNAVAILABLE",
+                    message,
+                    retryable: true,
+                },
+                retry_after_seconds: Some(1),
+            },
+            EngineError::UnsupportedDurability(_) => Self {
+                status: StatusCode::NOT_IMPLEMENTED,
+                problem: ProblemBody {
+                    code: "DURABILITY_UNAVAILABLE",
+                    message,
+                    retryable: false,
+                },
+                retry_after_seconds: None,
+            },
+            EngineError::StaleProducerEpoch { .. }
+            | EngineError::ProducerSequenceOutOfOrder { .. }
+            | EngineError::ProducerRequiresNewEpoch(_)
+            | EngineError::DuplicateSequenceMismatch(_)
+            | EngineError::Sequencer(_) => Self {
+                status: StatusCode::CONFLICT,
+                problem: ProblemBody {
+                    code: "PRODUCER_CONFLICT",
+                    message,
+                    retryable: false,
+                },
+                retry_after_seconds: None,
+            },
+            EngineError::CorruptState(_) | EngineError::Storage(_) => Self::internal(message),
+        }
+    }
+}
+
+impl std::fmt::Display for AppError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.problem.message)
+    }
+}
+
+impl std::error::Error for AppError {}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> axum::response::Response {
+        let mut response = (self.status, Json(self.problem)).into_response();
+        if let Some(seconds) = self.retry_after_seconds
+            && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
+        {
+            response.headers_mut().insert("retry-after", value);
+        }
+        response
+    }
 }

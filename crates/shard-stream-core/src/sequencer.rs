@@ -74,6 +74,17 @@ pub struct TopicSequencer {
     next_placement_sequence: u128,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequencerState {
+    pub topic_id: TopicId,
+    pub partition_id: LogicalPartitionId,
+    pub ring_epoch: RingEpoch,
+    pub shards: Vec<ShardId>,
+    pub next_batch_id: u128,
+    pub next_offset: u128,
+    pub next_placement_sequence: u128,
+}
+
 impl TopicSequencer {
     pub fn new(
         topic_id: TopicId,
@@ -90,6 +101,19 @@ impl TopicSequencer {
             next_batch_id: 0,
             next_offset: 0,
             next_placement_sequence: 0,
+        })
+    }
+
+    pub fn restore(state: SequencerState) -> Result<Self, SequencerError> {
+        validate_shards(&state.shards)?;
+        Ok(Self {
+            topic_id: state.topic_id,
+            partition_id: state.partition_id,
+            ring_epoch: state.ring_epoch,
+            shards: state.shards,
+            next_batch_id: state.next_batch_id,
+            next_offset: state.next_offset,
+            next_placement_sequence: state.next_placement_sequence,
         })
     }
 
@@ -158,6 +182,19 @@ impl TopicSequencer {
     #[must_use]
     pub const fn ring_epoch(&self) -> RingEpoch {
         self.ring_epoch
+    }
+
+    #[must_use]
+    pub fn state(&self) -> SequencerState {
+        SequencerState {
+            topic_id: self.topic_id,
+            partition_id: self.partition_id,
+            ring_epoch: self.ring_epoch,
+            shards: self.shards.clone(),
+            next_batch_id: self.next_batch_id,
+            next_offset: self.next_offset,
+            next_placement_sequence: self.next_placement_sequence,
+        }
     }
 
     #[cfg(test)]

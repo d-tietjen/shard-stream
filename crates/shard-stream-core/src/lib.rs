@@ -10,5 +10,6 @@ pub use channel::{
 };
 pub use ids::{
     BatchId, LogicalOffset, LogicalPartitionId, PlacementSequence, RingEpoch, ShardId, TopicId,
+    TopicPartition,
 };
-pub use sequencer::{Placement, Reservation, SequencerError, TopicSequencer};
+pub use sequencer::{Placement, Reservation, SequencerError, SequencerState, TopicSequencer};

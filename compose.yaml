@@ -1,0 +1,28 @@
+services:
+  shard-stream:
+    build:
+      context: .
+    command:
+      - --listen
+      - 0.0.0.0:7420
+      - --data-dir
+      - /var/lib/shard-stream
+      - --shards
+      - "4"
+    ports:
+      - "7420:7420"
+    volumes:
+      - shard-stream-data:/var/lib/shard-stream
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - --silent
+        - http://127.0.0.1:7420/healthz
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  shard-stream-data:

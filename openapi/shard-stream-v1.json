@@ -1,0 +1,151 @@
+{
+  "openapi": "3.2.0",
+  "info": {
+    "title": "shard-stream native REST API",
+    "version": "0.1.0",
+    "description": "Bootstrap REST control API and binary append/fetch data path."
+  },
+  "paths": {
+    "/healthz": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Process is healthy"
+          }
+        }
+      }
+    },
+    "/v1/topics": {
+      "post": {
+        "summary": "Create a topic",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTopic"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Topic created"
+          },
+          "409": {
+            "description": "Topic already exists"
+          }
+        }
+      }
+    },
+    "/v1/topics/{topic_id}/partitions/{partition_id}/records": {
+      "post": {
+        "summary": "Append one opaque record batch",
+        "parameters": [
+          {
+            "name": "topic_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "partition_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "uint32"
+            }
+          },
+          {
+            "name": "record_count",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
+            }
+          },
+          {
+            "name": "durability",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "leader",
+                "quorum",
+                "object"
+              ],
+              "default": "leader"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Append committed at the requested durability"
+          },
+          "429": {
+            "description": "Admission budget exhausted"
+          }
+        }
+      },
+      "get": {
+        "summary": "Fetch ordered or as-available binary batches",
+        "responses": {
+          "200": {
+            "description": "Length-delimited shard-stream v1 batches",
+            "content": {
+              "application/vnd.shard-stream.batch.v1": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CreateTopic": {
+        "type": "object",
+        "required": [
+          "topic_id",
+          "partitions"
+        ],
+        "properties": {
+          "topic_id": {
+            "type": "string",
+            "description": "Unsigned 128-bit decimal identifier"
+          },
+          "partitions": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "shards": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    }
+  }
+}

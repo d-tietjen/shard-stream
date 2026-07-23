@@ -1,8 +1,12 @@
 [workspace]
 members = [
+    "crates/shard-stream-bench",
+    "crates/shard-stream-client",
     "crates/shard-stream-core",
+    "crates/shard-stream-engine",
     "crates/shard-stream-protocol",
     "crates/shard-stream-server",
+    "crates/shard-stream-storage",
 ]
 resolver = "3"
 
@@ -16,8 +20,20 @@ repository = "https://github.com/d-tietjen/shard-stream"
 rust-version = "1.90"
 
 [workspace.dependencies]
+axum = "0.8"
+clap = { version = "4.5", features = ["derive"] }
+crc32fast = "1.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["http2", "json", "rustls-tls"] }
+sha2 = "0.10"
 shard-stream-core = { path = "crates/shard-stream-core", version = "0.1.0" }
+shard-stream-engine = { path = "crates/shard-stream-engine", version = "0.1.0" }
 shard-stream-protocol = { path = "crates/shard-stream-protocol", version = "0.1.0" }
+shard-stream-storage = { path = "crates/shard-stream-storage", version = "0.1.0" }
+tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

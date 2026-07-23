@@ -1,5 +1,5 @@
 [package]
-name = "shard-stream-protocol"
+name = "shard-stream-bench"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,12 +7,16 @@ homepage.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Transport-independent producer and consumer protocol types for shard-stream"
+description = "Reproducible benchmark harness for shard-stream"
 publish = false
 
 [dependencies]
-crc32fast.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 shard-stream-core.workspace = true
+shard-stream-engine.workspace = true
+shard-stream-protocol.workspace = true
 
 [lints]
 workspace = true

@@ -11,8 +11,16 @@ description = "Broker binary for shard-stream"
 publish = false
 
 [dependencies]
+axum.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 shard-stream-core.workspace = true
+shard-stream-engine.workspace = true
 shard-stream-protocol.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

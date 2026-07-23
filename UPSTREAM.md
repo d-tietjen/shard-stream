@@ -18,11 +18,14 @@ here. Runtime dependencies on `shard-kv` crates are not allowed.
 | `Cargo.toml` release profiles | `Cargo.toml` release profiles | Adapted for the new workspace |
 | `.github/workflows/ci.yml` | `.github/workflows/ci.yml` | Reduced and adapted; Redis/KV jobs removed |
 | `docs/SHARD_STREAM_PLAN.md` | `docs/SHARD_STREAM_PLAN.md` on branch `shard-stream-plan` | Copied architecture plan |
+| `crates/shard-stream-core/src/channel.rs` | `crates/shardmap` bounded channel patterns | Clean-room stream-specific adaptation |
+| `crates/shard-stream-storage/src/extent.rs` | `crates/shardmap/src/persistence/wal.rs` | Adapted framing, checksum, rotation, and partial-tail recovery patterns |
+| `crates/shard-stream-engine/src/worker.rs` | `crates/shardmap/src/replication.rs` and `replication/*` | Clean-room append-only replica and catch-up foundation |
 
-No `shard-kv` runtime implementation is copied in the bootstrap commit. The KV
-WAL encodes mutation records and the existing Blossom bridge imports
-`shardmap` ownership types directly. Copying either unchanged would couple the
-new repository to the old data model.
+The stream implementations are deliberately rewritten around immutable
+reservations and extents. The KV WAL encodes mutation records and the existing
+Blossom bridge imports `shardmap` ownership types directly, so copying either
+unchanged would couple the new repository to the old data model.
 
 ## Candidate ports
 

@@ -1,10 +1,14 @@
 //! Transport-independent request, response, and error contracts.
 
+mod wire;
+
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroU32;
 
 use shard_stream_core::{BatchId, LogicalOffset, LogicalPartitionId, Placement, TopicId};
+
+pub use wire::{NativeFetchBatch, WireError, decode_fetch_batches, encode_fetch_batches};
 
 pub const NATIVE_PROTOCOL_VERSION: u16 = 1;
 
