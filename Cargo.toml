@@ -1,0 +1,37 @@
+[workspace]
+members = [
+    "crates/shard-stream-core",
+    "crates/shard-stream-protocol",
+    "crates/shard-stream-server",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Devon Tietjen <devon@eden.dev>"]
+homepage = "https://github.com/d-tietjen/shard-stream"
+license = "Apache-2.0"
+repository = "https://github.com/d-tietjen/shard-stream"
+rust-version = "1.90"
+
+[workspace.dependencies]
+shard-stream-core = { path = "crates/shard-stream-core", version = "0.1.0" }
+shard-stream-protocol = { path = "crates/shard-stream-protocol", version = "0.1.0" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
+strip = false
+codegen-units = 1

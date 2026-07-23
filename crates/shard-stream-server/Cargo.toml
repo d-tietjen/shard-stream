@@ -1,0 +1,18 @@
+[package]
+name = "shard-stream-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Broker binary for shard-stream"
+publish = false
+
+[dependencies]
+shard-stream-core.workspace = true
+shard-stream-protocol.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package shardstream.v1;
+
+// UInt128 preserves stream-native identifiers without narrowing them to
+// Kafka's signed 64-bit offset representation.
+message UInt128 {
+  fixed64 high = 1;
+  fixed64 low = 2;
+}
+
+enum Durability {
+  DURABILITY_UNSPECIFIED = 0;
+  DURABILITY_LEADER = 1;
+  DURABILITY_QUORUM = 2;
+  DURABILITY_OBJECT = 3;
+}
+
+enum FetchMode {
+  FETCH_MODE_UNSPECIFIED = 0;
+  FETCH_MODE_ORDERED = 1;
+  FETCH_MODE_AS_AVAILABLE = 2;
+}
+
+message ProducerIdentity {
+  UInt128 producer_id = 1;
+  uint32 epoch = 2;
+  uint64 first_sequence = 3;
+}
+
+message AppendRequest {
+  UInt128 request_id = 1;
+  UInt128 topic_id = 2;
+  uint32 partition_id = 3;
+  uint32 record_count = 4;
+  bytes payload = 5;
+  Durability durability = 6;
+  ProducerIdentity producer = 7;
+}
+
+message Placement {
+  uint32 shard_id = 1;
+  uint64 ring_epoch = 2;
+  UInt128 sequence = 3;
+}
+
+message AppendResponse {
+  UInt128 request_id = 1;
+  UInt128 batch_id = 2;
+  UInt128 first_offset = 3;
+  UInt128 last_offset = 4;
+  Placement placement = 5;
+}
+
+message FetchRequest {
+  UInt128 request_id = 1;
+  UInt128 topic_id = 2;
+  uint32 partition_id = 3;
+  UInt128 start_offset = 4;
+  uint32 max_bytes = 5;
+  FetchMode mode = 6;
+}
+
+message FetchBatch {
+  UInt128 request_id = 1;
+  UInt128 batch_id = 2;
+  UInt128 first_offset = 3;
+  UInt128 last_offset = 4;
+  bytes payload = 5;
+  Placement placement = 6;
+}
+
+service ProducerService {
+  rpc Append(stream AppendRequest) returns (stream AppendResponse);
+}
+
+service ConsumerService {
+  rpc Fetch(FetchRequest) returns (stream FetchBatch);
+}
