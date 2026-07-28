@@ -1,0 +1,25 @@
+[package]
+name = "ordered-segment-map"
+description = "Append-ordered segmented indexes with direct dense-key and prehashed sparse-key lookup"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+license = "MIT"
+readme = "README.md"
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hashbrown.workspace = true
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+indexmap.workspace = true
+
+[[bench]]
+name = "ordered_index"
+harness = false
+
+[lints]
+workspace = true

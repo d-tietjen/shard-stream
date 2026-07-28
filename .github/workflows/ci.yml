@@ -1,0 +1,69 @@
+name: ci
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: schema exists
+        run: test -s crates/shard-stream-grpc/proto/shardstream/v1/stream.proto
+      - name: OpenAPI exists
+        run: test -s crates/shard-stream-server/openapi/shard-stream-v1.json
+      - name: public-source guard
+        run: bash scripts/check-public-surface.sh
+      - name: OpenAPI parses
+        run: jq empty crates/shard-stream-server/openapi/shard-stream-v1.json
+      - name: format
+        run: cargo fmt --all -- --check
+      - name: server feature matrix
+        run: |
+          cargo check --locked -p shard-stream-server --no-default-features
+          cargo test --locked -p shard-stream-server --no-default-features
+          if cargo tree --locked -p shard-stream-server --no-default-features -e normal --prefix none \
+            | grep -Eq '^(shard-stream-kafka|kafka-protocol) '; then
+            echo "Kafka dependencies remain in the no-default-features graph" >&2
+            exit 1
+          fi
+          cargo build --locked -p shard-stream-server --no-default-features
+          no_kafka_data="$(mktemp -d)"
+          target/debug/shard-stream-server \
+            --data-dir "$no_kafka_data" \
+            --listen 127.0.0.1:17420 \
+            --grpc-listen 127.0.0.1:17421 &
+          no_kafka_pid=$!
+          trap 'kill "$no_kafka_pid" 2>/dev/null || true' EXIT
+          for attempt in {1..20}; do
+            if curl -sSf http://127.0.0.1:17420/readyz >/dev/null; then
+              break
+            fi
+            sleep 0.25
+          done
+          curl -sSf http://127.0.0.1:17420/readyz >/dev/null
+          curl -sSf http://127.0.0.1:17420/openapi.json \
+            | jq -e '.paths["/v1/diagnostics/kafka-profile"] == null' >/dev/null
+          kill "$no_kafka_pid"
+          wait "$no_kafka_pid" || true
+          trap - EXIT
+          cargo check --locked -p shard-stream-server --features kafka
+      - name: lint
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --locked --workspace
+      - name: documentation
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
+      - name: package validation
+        run: bash scripts/check-publish-artifacts.sh

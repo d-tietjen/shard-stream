@@ -1,0 +1,31 @@
+[package]
+name = "shard-stream-grpc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Standard gRPC/HTTP2 adapter for shard-stream"
+publish = true
+build = "build.rs"
+
+[dependencies]
+bytes.workspace = true
+prost.workspace = true
+shard-stream-core.workspace = true
+shard-stream-engine.workspace = true
+shard-stream-protocol.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+protoc-bin-vendored.workspace = true
+tonic-prost-build = "0.14"
+
+[lints]
+workspace = true

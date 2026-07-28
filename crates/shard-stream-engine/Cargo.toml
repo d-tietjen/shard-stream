@@ -1,0 +1,22 @@
+[package]
+name = "shard-stream-engine"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Striped append and ordered fetch engine for shard-stream"
+publish = true
+
+[dependencies]
+bytes.workspace = true
+ordered-segment-map.workspace = true
+shard-stream-core.workspace = true
+shard-stream-protocol.workspace = true
+shardlog.workspace = true
+xxhash-rust.workspace = true
+
+[lints]
+workspace = true

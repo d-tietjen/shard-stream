@@ -1,0 +1,10 @@
+/target/
+/var/
+/tmp/
+/dev-certs/
+/.idea/
+/.vscode/
+/.DS_Store
+*.tmp
+*.trace
+perf.data*

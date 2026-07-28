@@ -1,0 +1,22 @@
+[package]
+name = "shard-stream-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Native Rust producer, consumer, and admin client for shard-stream"
+publish = true
+
+[dependencies]
+bytes.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+shard-stream-core.workspace = true
+shard-stream-protocol.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

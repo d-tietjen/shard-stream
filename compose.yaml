@@ -1,0 +1,42 @@
+services:
+  shard-stream:
+    build:
+      context: .
+    command:
+      - --listen
+      - 0.0.0.0:7420
+      - --grpc-listen
+      - 0.0.0.0:7421
+      - --kafka-listen
+      - 0.0.0.0:9092
+      - --kafka-advertised-host
+      - 127.0.0.1
+      - --data-dir
+      - /var/lib/shard-stream
+      - --shards
+      - "4"
+    environment:
+      SHARD_STREAM_ADMIN_TOKEN: ${SHARD_STREAM_ADMIN_TOKEN:-local-development-administration}
+      SHARD_STREAM_APPEND_LINGER_MS: ${SHARD_STREAM_APPEND_LINGER_MS:-1}
+      SHARD_STREAM_MAX_BATCH_BYTES: ${SHARD_STREAM_MAX_BATCH_BYTES:-16777216}
+      SHARD_STREAM_MAX_FETCH_BYTES: ${SHARD_STREAM_MAX_FETCH_BYTES:-67108864}
+      SHARD_STREAM_MAX_REQUEST_BYTES: ${SHARD_STREAM_MAX_REQUEST_BYTES:-33554432}
+    ports:
+      - "7420:7420"
+      - "7421:7421"
+      - "9092:9092"
+    volumes:
+      - shard-stream-data:/var/lib/shard-stream
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - --silent
+        - http://127.0.0.1:7420/healthz
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  shard-stream-data:

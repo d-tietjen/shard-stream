@@ -1,0 +1,469 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "shard-stream RF1 REST API",
+    "version": "0.1.0",
+    "description": "Single-node RF1 administration and native append/fetch API. Quorum and all_replicas are local RF1 compatibility aliases."
+  },
+  "paths": {
+    "/healthz": {
+      "get": {
+        "summary": "Get process liveness",
+        "responses": {
+          "200": {
+            "description": "The single-node process is live"
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "summary": "Get local traffic readiness",
+        "responses": {
+          "200": {
+            "description": "The RF1 broker is ready"
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "summary": "Export process-local Prometheus metrics",
+        "responses": {
+          "200": {
+            "description": "Prometheus text",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/diagnostics/kafka-profile": {
+      "get": {
+        "summary": "Get sampled Kafka Produce stage costs",
+        "description": "Available only when shard-stream-server is compiled with its kafka feature.",
+        "responses": {
+          "200": {
+            "description": "Current process-local profile"
+          }
+        }
+      }
+    },
+    "/v1/topology": {
+      "get": {
+        "summary": "Get the single-broker RF1 topology",
+        "responses": {
+          "200": {
+            "description": "One local broker with replication_factor and min_in_sync_replicas equal to one"
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "Get this OpenAPI document",
+        "responses": {
+          "200": {
+            "description": "OpenAPI JSON"
+          }
+        }
+      }
+    },
+    "/v1/topics": {
+      "post": {
+        "summary": "Create an RF1 topic",
+        "security": [
+          {
+            "AdminTokenHeader": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTopic"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Topic created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Topic"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The configured local administration credential is invalid"
+          },
+          "409": {
+            "description": "Topic already exists"
+          }
+        }
+      }
+    },
+    "/v1/topics/{topic_id}/binding": {
+      "get": {
+        "summary": "Resolve a stable logical topic",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TopicId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Generation-one self-binding",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogicalTopicBinding"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown topic"
+          }
+        }
+      }
+    },
+    "/v1/topics/{topic_id}/partitions/{partition_id}/cursor": {
+      "get": {
+        "summary": "Create a generation-one logical cursor",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TopicId"
+          },
+          {
+            "$ref": "#/components/parameters/PartitionId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Active-passive-compatible cursor at offset zero"
+          },
+          "404": {
+            "description": "Unknown topic partition"
+          }
+        }
+      }
+    },
+    "/v1/topics/{topic_id}/partitions/{partition_id}/records": {
+      "post": {
+        "summary": "Append one opaque record batch",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TopicId"
+          },
+          {
+            "$ref": "#/components/parameters/PartitionId"
+          },
+          {
+            "name": "record_count",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
+            }
+          },
+          {
+            "name": "durability",
+            "in": "query",
+            "description": "leader, quorum, and all_replicas resolve to the same RF1 local durability boundary",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "leader",
+                "quorum",
+                "all_replicas",
+                "object"
+              ],
+              "default": "leader"
+            }
+          },
+          {
+            "name": "expected_data_generation",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "const": 1
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "contentEncoding": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Durable RF1 append receipt"
+          },
+          "409": {
+            "description": "Stale data generation"
+          }
+        }
+      },
+      "get": {
+        "summary": "Fetch ordered batches",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TopicId"
+          },
+          {
+            "$ref": "#/components/parameters/PartitionId"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "default": "0"
+            }
+          },
+          {
+            "name": "max_bytes",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "mode",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "ordered",
+                "replicated",
+                "as_available"
+              ],
+              "default": "ordered"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Segmented native batch response"
+          }
+        }
+      }
+    },
+    "/v1/topics/{topic_id}/partitions/{partition_id}/ring": {
+      "put": {
+        "summary": "Reconfigure local virtual-lane placement",
+        "security": [
+          {
+            "AdminTokenHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TopicId"
+          },
+          {
+            "$ref": "#/components/parameters/PartitionId"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Local placement updated"
+          }
+        }
+      }
+    },
+    "/v1/topics/{topic_id}/partitions/{partition_id}/watermarks": {
+      "get": {
+        "summary": "Get RF1 partition watermarks",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TopicId"
+          },
+          {
+            "$ref": "#/components/parameters/PartitionId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Partition watermarks with RF1/min-ISR 1"
+          }
+        }
+      }
+    },
+    "/v1/topics/{topic_id}/partitions/{partition_id}/retained-bytes": {
+      "get": {
+        "summary": "Get locally retained bytes",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TopicId"
+          },
+          {
+            "$ref": "#/components/parameters/PartitionId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current retained-byte count"
+          }
+        }
+      }
+    },
+    "/v1/topics/{topic_id}/partitions/{partition_id}/retention": {
+      "put": {
+        "summary": "Advance the local retention boundary",
+        "security": [
+          {
+            "AdminTokenHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TopicId"
+          },
+          {
+            "$ref": "#/components/parameters/PartitionId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Updated partition watermarks"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "AdminTokenHeader": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-shard-stream-admin-token",
+        "description": "Required only when SHARD_STREAM_ADMIN_TOKEN is configured"
+      }
+    },
+    "parameters": {
+      "TopicId": {
+        "name": "topic_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        }
+      },
+      "PartitionId": {
+        "name": "partition_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "integer",
+          "format": "uint32"
+        }
+      }
+    },
+    "schemas": {
+      "CreateTopic": {
+        "type": "object",
+        "required": [
+          "topic_id",
+          "partitions"
+        ],
+        "properties": {
+          "topic_id": {
+            "type": "string"
+          },
+          "partitions": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "shards": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "uint32"
+            }
+          }
+        }
+      },
+      "Topic": {
+        "type": "object",
+        "required": [
+          "topic_id",
+          "partitions",
+          "replication_factor",
+          "min_in_sync_replicas"
+        ],
+        "properties": {
+          "topic_id": {
+            "type": "string"
+          },
+          "partitions": {
+            "type": "integer",
+            "format": "uint32"
+          },
+          "replication_factor": {
+            "type": "integer",
+            "const": 1
+          },
+          "min_in_sync_replicas": {
+            "type": "integer",
+            "const": 1
+          }
+        }
+      },
+      "LogicalTopicBinding": {
+        "type": "object",
+        "required": [
+          "logical_topic_id",
+          "physical_topic_id",
+          "partitions",
+          "policy_generation",
+          "data_generation",
+          "mode"
+        ],
+        "properties": {
+          "logical_topic_id": {
+            "type": "string"
+          },
+          "physical_topic_id": {
+            "type": "string"
+          },
+          "partitions": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "policy_generation": {
+            "type": "integer",
+            "const": 1
+          },
+          "data_generation": {
+            "type": "integer",
+            "const": 1
+          },
+          "mode": {
+            "type": "string",
+            "const": "ActivePassive"
+          }
+        }
+      }
+    }
+  }
+}

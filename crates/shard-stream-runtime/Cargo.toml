@@ -1,0 +1,25 @@
+[package]
+name = "shard-stream-runtime"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Listener-free single-node lifecycle and extension hooks for shard-stream"
+publish = true
+
+[dependencies]
+blake3.workspace = true
+fs2.workspace = true
+serde.workspace = true
+shard-stream-core.workspace = true
+shard-stream-engine.workspace = true
+shard-stream-protocol.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+
+[lints]
+workspace = true

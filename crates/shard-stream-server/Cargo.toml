@@ -1,0 +1,34 @@
+[package]
+name = "shard-stream-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Single-node RF1 broker and composable server host for shard-stream"
+publish = true
+
+[features]
+default = ["kafka"]
+kafka = ["dep:shard-stream-kafka"]
+
+[dependencies]
+axum.workspace = true
+bytes.workspace = true
+clap.workspace = true
+eden_logger.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shard-stream-core.workspace = true
+shard-stream-engine.workspace = true
+shard-stream-grpc = { path = "../shard-stream-grpc", version = "0.1.0" }
+shard-stream-h3 = { path = "../shard-stream-h3", version = "0.1.0" }
+shard-stream-kafka = { workspace = true, optional = true }
+shard-stream-protocol.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+
+[lints]
+workspace = true

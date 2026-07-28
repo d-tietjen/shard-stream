@@ -1,0 +1,17 @@
+[package]
+name = "shard-stream-storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Crash-recoverable extent packs and coordinator journal for shard-stream"
+publish = false
+
+[dependencies]
+shardlog.workspace = true
+
+[lints]
+workspace = true

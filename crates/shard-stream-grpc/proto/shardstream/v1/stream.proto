@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+package shardstream.v1;
+
+// UInt128 preserves stream-native identifiers without narrowing them to
+// Kafka's signed 64-bit offset representation.
+message UInt128 {
+  fixed64 high = 1;
+  fixed64 low = 2;
+}
+
+enum Durability {
+  DURABILITY_UNSPECIFIED = 0;
+  // Local RF1 durability. Kept as a stable wire spelling.
+  DURABILITY_LEADER = 1;
+  // RF1 local durability alias in the public server.
+  DURABILITY_QUORUM = 2;
+  // Publish the immutable local pack to configured object storage.
+  DURABILITY_OBJECT = 3;
+  // RF1 local durability alias in the public server.
+  DURABILITY_ALL_REPLICAS = 4;
+}
+
+enum FetchMode {
+  FETCH_MODE_UNSPECIFIED = 0;
+  FETCH_MODE_ORDERED = 1;
+  FETCH_MODE_AS_AVAILABLE = 2;
+  FETCH_MODE_REPLICATED = 3;
+}
+
+message ProducerIdentity {
+  UInt128 producer_id = 1;
+  uint32 epoch = 2;
+  uint64 first_sequence = 3;
+  // Optional caller-supplied logical event identity.
+  UInt128 event_id = 4;
+}
+
+message AtomicGroupIdentity {
+  UInt128 transaction_id = 1;
+  uint64 chunk_sequence = 2;
+}
+
+message AppendRequest {
+  UInt128 request_id = 1;
+  UInt128 topic_id = 2;
+  uint32 partition_id = 3;
+  uint32 record_count = 4;
+  bytes payload = 5;
+  Durability durability = 6;
+  ProducerIdentity producer = 7;
+  optional uint64 leader_epoch = 8;
+  AtomicGroupIdentity atomic_group = 9;
+}
+
+message Placement {
+  uint32 virtual_lane_id = 1;
+  uint64 ring_epoch = 2;
+  uint64 sequence = 3;
+  uint64 leader_epoch = 4;
+}
+
+message AppendResponse {
+  UInt128 request_id = 1;
+  UInt128 batch_id = 2;
+  uint64 first_offset = 3;
+  uint64 last_offset = 4;
+  Placement placement = 5;
+  UInt128 record_id = 6;
+  // Exclusive upper bound of the contiguous range visible to ordered fetches.
+  uint64 visible_through = 7;
+}
+
+message FetchRequest {
+  UInt128 request_id = 1;
+  UInt128 topic_id = 2;
+  uint32 partition_id = 3;
+  uint64 start_offset = 4;
+  uint32 max_bytes = 5;
+  FetchMode mode = 6;
+}
+
+message FetchBatch {
+  UInt128 request_id = 1;
+  UInt128 batch_id = 2;
+  uint64 first_offset = 3;
+  uint64 last_offset = 4;
+  bytes payload = 5;
+  Placement placement = 6;
+  uint32 record_count = 7;
+  UInt128 event_id = 8;
+  AtomicGroupIdentity atomic_group = 9;
+}
+
+service ProducerService {
+  rpc Append(stream AppendRequest) returns (stream AppendResponse);
+}
+
+service ConsumerService {
+  rpc Fetch(FetchRequest) returns (stream FetchBatch);
+}

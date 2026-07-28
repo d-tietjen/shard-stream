@@ -1,0 +1,29 @@
+[package]
+name = "shard-stream-kafka"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Kafka wire-protocol compatibility adapter for shard-stream"
+publish = true
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+bytes-handoff.workspace = true
+crc32c.workspace = true
+eden_logger.workspace = true
+fast-telemetry.workspace = true
+kafka-protocol.workspace = true
+serde.workspace = true
+shard-stream-core.workspace = true
+shard-stream-engine.workspace = true
+shard-stream-protocol.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

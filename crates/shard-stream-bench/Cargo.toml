@@ -1,0 +1,29 @@
+[package]
+name = "shard-stream-bench"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Reproducible benchmark harness for shard-stream"
+publish = false
+default-run = "shard-stream-bench"
+
+[dependencies]
+arc-swap = "1.7"
+blake3.workspace = true
+bytes.workspace = true
+clap.workspace = true
+kafka-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shard-stream-client = { path = "../shard-stream-client", version = "0.1.0" }
+shard-stream-core.workspace = true
+shard-stream-engine.workspace = true
+shard-stream-protocol.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
