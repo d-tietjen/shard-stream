@@ -1333,6 +1333,7 @@ impl From<EngineError> for AppError {
             | EngineError::WorkerStopped(_)
             | EngineError::DurabilityUnavailable { .. }
             | EngineError::ObjectDurabilityUnavailable
+            | EngineError::DurableSinkUnavailable(_)
             | EngineError::ReplicaInFlight(_) => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "DURABILITY_UNAVAILABLE",
@@ -1345,7 +1346,9 @@ impl From<EngineError> for AppError {
                 message,
                 false,
             ),
-            EngineError::CorruptState(_) | EngineError::Storage(_) => Self::internal(message),
+            EngineError::DurableSinkCheckpoint(_)
+            | EngineError::CorruptState(_)
+            | EngineError::Storage(_) => Self::internal(message),
             _ => Self::new(StatusCode::CONFLICT, "CONFLICT", message, false),
         }
     }

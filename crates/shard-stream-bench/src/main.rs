@@ -1,13 +1,20 @@
+use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
-use shard_stream_core::{LogicalOffset, LogicalPartitionId, TopicId};
-use shard_stream_engine::{EngineConfig, StreamEngine, TopicConfig};
+use shard_stream_core::{LogicalOffset, LogicalPartitionId, ShardId, TopicId, TopicPartition};
+use shard_stream_engine::{
+    DurableAppend, DurableAppendSink, DurableAppendSinkFactory, DurableSinkApply,
+    DurableSinkCheckpoint, DurableSinkConfig, DurableSinkLagPolicy, DurableSinkOptions,
+    DurableSinkStats, EngineConfig, EngineError, EngineResult, StreamEngine, TopicConfig,
+};
 use shard_stream_protocol::{AppendRequest, Durability, ProducerIdentity};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -38,6 +45,25 @@ impl DurabilityArg {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SinkMode {
+    None,
+    Noop,
+    Slow,
+    Failed,
+}
+
+impl SinkMode {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Noop => "noop",
+            Self::Slow => "slow",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "shard-stream-bench", version, about)]
 struct Args {
@@ -56,6 +82,12 @@ struct Args {
     concurrency: usize,
     #[arg(long, value_enum, default_value_t = DurabilityArg::Leader)]
     durability: DurabilityArg,
+    /// Durable sink behavior used to measure disabled, healthy, slow, and failed paths.
+    #[arg(long, value_enum, default_value_t = SinkMode::None)]
+    sink_mode: SinkMode,
+    /// Per-append callback delay used by `--sink-mode slow`.
+    #[arg(long, default_value_t = 1_000)]
+    sink_delay_us: u64,
     #[arg(long)]
     data_dir: Option<PathBuf>,
     #[arg(long)]
@@ -93,6 +125,22 @@ struct GateDocument {
 }
 
 #[derive(Debug, Serialize)]
+struct SinkDocument {
+    mode: &'static str,
+    delay_us: u64,
+    drain_ms: f64,
+    pending_items: u64,
+    pending_bytes: u64,
+    checkpoint_age_ms: u64,
+    applied_appends: u64,
+    checkpoint_conflicts: u64,
+    retry_attempts: u64,
+    failed_attempts: u64,
+    dropped_notifications: u64,
+    dirty_partitions: u64,
+}
+
+#[derive(Debug, Serialize)]
 struct ResultDocument {
     format_version: u32,
     durability: &'static str,
@@ -107,6 +155,7 @@ struct ResultDocument {
     batch_payload_bytes: usize,
     records_per_batch: u32,
     idempotent_producers: bool,
+    sink: SinkDocument,
     elapsed_seconds: f64,
     durable_sync_ms: f64,
     batches_per_second: f64,
@@ -144,7 +193,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .checked_mul(args.concurrency.max(64))
         .and_then(|bytes| bytes.checked_add(64 * 1024 * 1024))
         .ok_or("queue byte configuration overflow")?;
-    let engine = Arc::new(StreamEngine::open(EngineConfig {
+    let engine_config = EngineConfig {
         data_dir: data_dir.clone(),
         object_store_dir: object_store_dir.clone(),
         shard_count: args.shards,
@@ -158,7 +207,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_batch_bytes: args.payload_bytes,
         max_fetch_bytes: args.payload_bytes.max(1024 * 1024),
         append_linger: std::time::Duration::from_millis(1),
-    })?);
+    };
+    let engine = Arc::new(match args.sink_mode {
+        SinkMode::None => StreamEngine::open(engine_config)?,
+        mode => StreamEngine::open_with_durable_sink(
+            engine_config,
+            benchmark_sink_config(mode, args.sink_delay_us),
+        )?,
+    });
     engine.create_topic(TopicConfig {
         topic_id: TopicId::new(1),
         partitions: args.partitions,
@@ -256,6 +312,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let durable_sync_started = Instant::now();
     engine.sync()?;
     let durable_sync_ms = duration_ms(durable_sync_started.elapsed());
+    let sink_drain_started = Instant::now();
+    if matches!(args.sink_mode, SinkMode::Noop | SinkMode::Slow) {
+        let partitions = (0..args.partitions)
+            .map(|partition| {
+                TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(partition))
+            })
+            .collect::<Vec<_>>();
+        engine.resume_durable_sink(&partitions)?;
+    }
+    let sink_drain_ms = duration_ms(sink_drain_started.elapsed());
+    let sink_stats = engine.durable_sink_stats();
     let elapsed = start.elapsed();
     if latencies.len() != args.batches as usize {
         return Err(format!(
@@ -309,7 +376,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     let result = ResultDocument {
-        format_version: 2,
+        format_version: 3,
         durability: args.durability.name(),
         shards: args.shards,
         partitions: args.partitions,
@@ -322,6 +389,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         batch_payload_bytes: args.payload_bytes,
         records_per_batch: args.records_per_batch,
         idempotent_producers: args.idempotent_producers,
+        sink: sink_document(
+            args.sink_mode,
+            args.sink_delay_us,
+            sink_drain_ms,
+            sink_stats,
+        ),
         elapsed_seconds: seconds,
         durable_sync_ms,
         batches_per_second: args.batches as f64 / seconds,
@@ -361,6 +434,7 @@ fn validate_args(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         || args.shards == 0
         || args.partitions == 0
         || args.concurrency == 0
+        || (args.sink_mode == SinkMode::Slow && args.sink_delay_us == 0)
     {
         return Err(
             "benchmark counts, sizes, shards, partitions, and concurrency must be nonzero".into(),
@@ -375,6 +449,117 @@ fn validate_args(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct BenchmarkSink {
+    mode: SinkMode,
+    delay: Duration,
+    checkpoints: Arc<Mutex<HashMap<TopicPartition, DurableSinkCheckpoint>>>,
+}
+
+#[derive(Debug)]
+struct BenchmarkSinkFactory {
+    mode: SinkMode,
+    delay: Duration,
+    checkpoints: Arc<Mutex<HashMap<TopicPartition, DurableSinkCheckpoint>>>,
+}
+
+impl DurableAppendSink for BenchmarkSink {
+    fn apply(
+        &self,
+        expected: DurableSinkCheckpoint,
+        _appends: &[DurableAppend],
+        next: DurableSinkCheckpoint,
+    ) -> EngineResult<DurableSinkApply> {
+        if self.mode == SinkMode::Failed {
+            return Err(EngineError::DurableSinkUnavailable(
+                "benchmark sink injected failure".into(),
+            ));
+        }
+        if self.mode == SinkMode::Slow {
+            std::thread::sleep(self.delay);
+        }
+        let mut checkpoints = self
+            .checkpoints
+            .lock()
+            .map_err(|_| EngineError::DurableSinkUnavailable("benchmark sink poisoned".into()))?;
+        let actual = checkpoints
+            .get(&expected.topic_partition)
+            .copied()
+            .unwrap_or_else(|| DurableSinkCheckpoint::initial(expected.topic_partition));
+        if actual != expected {
+            return Ok(DurableSinkApply::CheckpointConflict(actual));
+        }
+        checkpoints.insert(next.topic_partition, next);
+        Ok(DurableSinkApply::Applied)
+    }
+}
+
+impl DurableAppendSinkFactory for BenchmarkSinkFactory {
+    fn validate_append(&self, _payload: &[u8], _record_count: NonZeroU32) -> EngineResult<()> {
+        Ok(())
+    }
+
+    fn load_checkpoint(
+        &self,
+        topic_partition: TopicPartition,
+    ) -> EngineResult<Option<DurableSinkCheckpoint>> {
+        Ok(self
+            .checkpoints
+            .lock()
+            .map_err(|_| EngineError::DurableSinkUnavailable("benchmark sink poisoned".into()))?
+            .get(&topic_partition)
+            .copied())
+    }
+
+    fn open_shard(&self, _shard_id: ShardId) -> EngineResult<Arc<dyn DurableAppendSink>> {
+        Ok(Arc::new(BenchmarkSink {
+            mode: self.mode,
+            delay: self.delay,
+            checkpoints: Arc::clone(&self.checkpoints),
+        }))
+    }
+}
+
+fn benchmark_sink_config(mode: SinkMode, delay_us: u64) -> DurableSinkConfig {
+    let lag_policy = if mode == SinkMode::Failed {
+        DurableSinkLagPolicy::Availability
+    } else {
+        DurableSinkLagPolicy::Backpressure
+    };
+    let options = DurableSinkOptions {
+        lag_policy,
+        ..DurableSinkOptions::default()
+    };
+    DurableSinkConfig::new(Arc::new(BenchmarkSinkFactory {
+        mode,
+        delay: Duration::from_micros(delay_us),
+        checkpoints: Arc::new(Mutex::new(HashMap::new())),
+    }))
+    .with_options(options)
+}
+
+fn sink_document(
+    mode: SinkMode,
+    delay_us: u64,
+    drain_ms: f64,
+    stats: DurableSinkStats,
+) -> SinkDocument {
+    SinkDocument {
+        mode: mode.name(),
+        delay_us,
+        drain_ms,
+        pending_items: stats.pending_items,
+        pending_bytes: stats.pending_bytes,
+        checkpoint_age_ms: stats.checkpoint_age_ms,
+        applied_appends: stats.applied_appends,
+        checkpoint_conflicts: stats.checkpoint_conflicts,
+        retry_attempts: stats.retry_attempts,
+        failed_attempts: stats.failed_attempts,
+        dropped_notifications: stats.dropped_notifications,
+        dirty_partitions: stats.dirty_partitions,
+    }
 }
 
 fn quantile(sorted: &[Duration], quantile: f64) -> Duration {

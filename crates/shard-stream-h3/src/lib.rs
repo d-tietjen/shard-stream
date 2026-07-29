@@ -512,7 +512,8 @@ impl From<EngineError> for RouteError {
             ),
             EngineError::WorkerStopped(_)
             | EngineError::DurabilityUnavailable { .. }
-            | EngineError::ObjectDurabilityUnavailable => Self::new(
+            | EngineError::ObjectDurabilityUnavailable
+            | EngineError::DurableSinkUnavailable(_) => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "DURABILITY_UNAVAILABLE",
                 message,
@@ -547,7 +548,9 @@ impl From<EngineError> for RouteError {
             | EngineError::Sequencer(_) => {
                 Self::new(StatusCode::CONFLICT, "CONFLICT", message, false)
             }
-            EngineError::CorruptState(_) | EngineError::Storage(_) => Self::internal(message),
+            EngineError::DurableSinkCheckpoint(_)
+            | EngineError::CorruptState(_)
+            | EngineError::Storage(_) => Self::internal(message),
         }
     }
 }

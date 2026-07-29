@@ -18,8 +18,9 @@ use std::time::{Duration, Instant};
 
 use shard_stream_core::{AssignmentProvider, BrokerId, TopicPartition, WriteFence};
 use shard_stream_engine::{
-    EngineConfig, EngineError, FetchedBatch, PartitionWatermarks, ReplicationStats,
-    ReplicationTransport, RetentionGuard, StreamEngine, TopicConfig,
+    DurableSinkConfig, DurableSinkStats, EngineConfig, EngineError, FetchedBatch,
+    PartitionWatermarks, ReplicationStats, ReplicationTransport, RetentionGuard, StreamEngine,
+    TopicConfig,
 };
 use shard_stream_protocol::{AppendRequest, AppendResponse, FetchRequest, ReplicaAppend};
 
@@ -147,6 +148,7 @@ impl Default for EmbeddedRuntimeOptions {
 pub struct EmbeddedRuntimeBuilder {
     storage: Option<EmbeddedStorage>,
     replication: Option<Arc<dyn ReplicationTransport>>,
+    durable_sink: Option<DurableSinkConfig>,
     write_fence: Option<Arc<dyn WriteFence>>,
     retention_guard: Option<Arc<dyn RetentionGuard>>,
     assignments: Option<Arc<dyn AssignmentProvider>>,
@@ -163,6 +165,7 @@ impl fmt::Debug for EmbeddedRuntimeBuilder {
             .debug_struct("EmbeddedRuntimeBuilder")
             .field("storage", &self.storage)
             .field("replication", &self.replication.is_some())
+            .field("durable_sink", &self.durable_sink.is_some())
             .field("write_fence", &self.write_fence.is_some())
             .field("retention_guard", &self.retention_guard.is_some())
             .field("assignments", &self.assignments.is_some())
@@ -185,6 +188,12 @@ impl EmbeddedRuntimeBuilder {
     #[must_use]
     pub fn replication(mut self, replication: Arc<dyn ReplicationTransport>) -> Self {
         self.replication = Some(replication);
+        self
+    }
+
+    #[must_use]
+    pub fn durable_sink(mut self, durable_sink: DurableSinkConfig) -> Self {
+        self.durable_sink = Some(durable_sink);
         self
     }
 
@@ -266,11 +275,12 @@ impl EmbeddedRuntimeBuilder {
         let identity = open_node_identity(&storage.engine.data_dir, broker_id)?;
         let data_dir = storage.engine.data_dir.clone();
         let runtime_write_fence = self.write_fence.clone();
-        let engine = StreamEngine::open_with_all_components(
+        let engine = StreamEngine::open_with_all_components_and_durable_sink(
             storage.engine,
             self.write_fence,
             self.replication,
             self.retention_guard,
+            self.durable_sink,
         )?;
         let health_probe = self
             .health_probe
@@ -342,6 +352,13 @@ impl EmbeddedRuntime {
         let mut recovered = engine.recovered_partitions();
         if let Some(assignments) = &self.assignments {
             recovered.retain(|partition| assignments.is_local_leader(*partition));
+        }
+        if let Err(error) = engine.resume_durable_sink(&recovered) {
+            self.corruption_detected
+                .store(error.is_corruption(), Ordering::Release);
+            self.lifecycle
+                .store(LifecycleState::Failed as u8, Ordering::Release);
+            return Err(error.into());
         }
         if let Err(error) = engine.resume_recovered_replication(&recovered) {
             self.corruption_detected
@@ -440,6 +457,13 @@ impl EmbeddedRuntime {
         self.engine
             .as_ref()
             .map_or_else(ReplicationStats::default, StreamEngine::replication_stats)
+    }
+
+    #[must_use]
+    pub fn durable_sink_stats(&self) -> DurableSinkStats {
+        self.engine
+            .as_ref()
+            .map_or_else(DurableSinkStats::default, StreamEngine::durable_sink_stats)
     }
 
     /// Returns a typed, conservative readiness snapshot without mutating the
@@ -860,17 +884,21 @@ pub type RuntimeResult<T> = Result<T, RuntimeError>;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::num::NonZeroU32;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
     use shard_stream_core::{
-        AssignmentProvider, BrokerDescriptor, BrokerId, LogicalPartitionId, SingleNodeAssignment,
-        TopicId, TopicPartition, WriteFence, WriteFenceError,
+        AssignmentProvider, BrokerDescriptor, BrokerId, LogicalPartitionId, ShardId,
+        SingleNodeAssignment, TopicId, TopicPartition, WriteFence, WriteFenceError,
     };
     use shard_stream_engine::{
-        EngineConfig, EngineResult, ReplicationProgress, ReplicationStats, ReplicationTransport,
-        TopicConfig,
+        DurableAppend, DurableAppendSink, DurableAppendSinkFactory, DurableSinkApply,
+        DurableSinkCheckpoint, DurableSinkConfig, EngineConfig, EngineError, EngineResult,
+        ReplicationProgress, ReplicationStats, ReplicationTransport, TopicConfig,
     };
     use shard_stream_protocol::{
         AppendRequest, Durability, FetchMode, FetchRequest, ReplicaAppend,
@@ -935,6 +963,57 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Default)]
+    struct RuntimeSinkState {
+        checkpoints: Arc<Mutex<HashMap<TopicPartition, DurableSinkCheckpoint>>>,
+    }
+
+    impl DurableAppendSink for RuntimeSinkState {
+        fn apply(
+            &self,
+            expected: DurableSinkCheckpoint,
+            _appends: &[DurableAppend],
+            next: DurableSinkCheckpoint,
+        ) -> EngineResult<DurableSinkApply> {
+            let mut checkpoints = self.checkpoints.lock().map_err(|_| {
+                EngineError::DurableSinkUnavailable("runtime test sink poisoned".into())
+            })?;
+            let actual = checkpoints
+                .get(&expected.topic_partition)
+                .copied()
+                .unwrap_or_else(|| DurableSinkCheckpoint::initial(expected.topic_partition));
+            if actual != expected {
+                return Ok(DurableSinkApply::CheckpointConflict(actual));
+            }
+            checkpoints.insert(next.topic_partition, next);
+            Ok(DurableSinkApply::Applied)
+        }
+    }
+
+    impl DurableAppendSinkFactory for RuntimeSinkState {
+        fn validate_append(&self, _payload: &[u8], _record_count: NonZeroU32) -> EngineResult<()> {
+            Ok(())
+        }
+
+        fn load_checkpoint(
+            &self,
+            topic_partition: TopicPartition,
+        ) -> EngineResult<Option<DurableSinkCheckpoint>> {
+            Ok(self
+                .checkpoints
+                .lock()
+                .map_err(|_| {
+                    EngineError::DurableSinkUnavailable("runtime test sink poisoned".into())
+                })?
+                .get(&topic_partition)
+                .copied())
+        }
+
+        fn open_shard(&self, _shard_id: ShardId) -> EngineResult<Arc<dyn DurableAppendSink>> {
+            Ok(Arc::new(self.clone()))
+        }
+    }
+
     #[derive(Debug)]
     struct FixedHealthProbe(HealthProbeSnapshot);
 
@@ -977,6 +1056,31 @@ mod tests {
         }
     }
 
+    fn single_node_assignments() -> Arc<dyn AssignmentProvider> {
+        Arc::new(
+            SingleNodeAssignment::new(
+                BrokerDescriptor {
+                    broker_id: BrokerId::new(0),
+                    incarnation: 1,
+                    rack: String::new(),
+                    zone: String::new(),
+                    internal_rest: "http://127.0.0.1:1".into(),
+                    internal_replication: String::new(),
+                    advertised_rest: "http://127.0.0.1:3".into(),
+                    advertised_grpc: "http://127.0.0.1:4".into(),
+                    kafka_host: "127.0.0.1".into(),
+                    kafka_port: 5,
+                    cpu_capacity: 1,
+                    disk_capacity_bytes: 0,
+                    network_capacity_bytes_per_sec: 0,
+                    certificate_digest: [0; 32],
+                },
+                2,
+            )
+            .expect("assignment"),
+        )
+    }
+
     #[test]
     fn runtime_supports_fence_and_replication_together() {
         let temp = TempDir::new("components");
@@ -1013,6 +1117,52 @@ mod tests {
             })
             .expect("fetch");
         assert_eq!(fetched.len(), 1);
+        runtime.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn runtime_replays_only_after_assignment_aware_recovery() {
+        let temp = TempDir::new("durable-sink-recovery");
+        {
+            let runtime = EmbeddedRuntime::builder()
+                .storage(config(&temp.0))
+                .broker_id(BrokerId::new(0))
+                .open()
+                .expect("open writer");
+            runtime.recover().expect("recover writer");
+            runtime.ready().expect("ready writer");
+            runtime
+                .create_topic(TopicConfig {
+                    topic_id: TopicId::new(1),
+                    partitions: 1,
+                    shards: None,
+                })
+                .expect("topic");
+            runtime.append(append_request(0)).expect("append");
+            runtime.shutdown().expect("shutdown writer");
+        }
+
+        let sink = Arc::new(RuntimeSinkState::default());
+        let runtime = EmbeddedRuntime::builder()
+            .storage(config(&temp.0))
+            .assignment_provider(single_node_assignments())
+            .durable_sink(DurableSinkConfig::new(sink.clone()))
+            .open()
+            .expect("open with sink");
+        assert!(sink.checkpoints.lock().expect("sink").is_empty());
+        runtime.recover().expect("assignment-aware recovery");
+        assert_eq!(
+            sink.checkpoints
+                .lock()
+                .expect("sink")
+                .values()
+                .next()
+                .expect("checkpoint")
+                .next_offset,
+            shard_stream_core::LogicalOffset::new(1)
+        );
+        runtime.ready().expect("ready");
+        assert_eq!(runtime.durable_sink_stats().applied_appends, 1);
         runtime.shutdown().expect("shutdown");
     }
 
@@ -1108,31 +1258,9 @@ mod tests {
     #[test]
     fn assignment_provider_supplies_and_validates_local_identity() {
         let temp = TempDir::new("assignment");
-        let assignments: Arc<dyn AssignmentProvider> = Arc::new(
-            SingleNodeAssignment::new(
-                BrokerDescriptor {
-                    broker_id: BrokerId::new(0),
-                    incarnation: 1,
-                    rack: String::new(),
-                    zone: String::new(),
-                    internal_rest: "http://127.0.0.1:1".into(),
-                    internal_replication: String::new(),
-                    advertised_rest: "http://127.0.0.1:3".into(),
-                    advertised_grpc: "http://127.0.0.1:4".into(),
-                    kafka_host: "127.0.0.1".into(),
-                    kafka_port: 5,
-                    cpu_capacity: 1,
-                    disk_capacity_bytes: 0,
-                    network_capacity_bytes_per_sec: 0,
-                    certificate_digest: [0; 32],
-                },
-                2,
-            )
-            .expect("assignment"),
-        );
         let runtime = EmbeddedRuntime::builder()
             .storage(config(&temp.0))
-            .assignment_provider(assignments)
+            .assignment_provider(single_node_assignments())
             .options(EmbeddedRuntimeOptions {
                 require_replication_caught_up: false,
                 ..EmbeddedRuntimeOptions::default()
