@@ -3,7 +3,7 @@ use std::fmt;
 use std::num::NonZeroU32;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -18,6 +18,8 @@ use crate::{AtomicGroupState, EngineError, EngineResult};
 
 const RETRY_MIN: Duration = Duration::from_millis(10);
 const RETRY_MAX: Duration = Duration::from_secs(1);
+const MAX_COMMANDS_PER_TICK: usize = 256;
+const MAX_APPENDS_PER_PARTITION_TICK: usize = 64;
 
 /// Cluster-shared progress for one logical partition.
 ///
@@ -220,7 +222,7 @@ impl Default for DurableSinkOptions {
             recovery_mode: DurableSinkRecoveryMode::Blocking,
             lag_policy: DurableSinkLagPolicy::Backpressure,
             atomic_visibility: DurableSinkAtomicVisibility::AllDurable,
-            worker_count: 1,
+            worker_count: 2,
             max_pending_items: 4_096,
             max_pending_bytes: None,
             recovery_timeout: Duration::from_secs(30),
@@ -279,6 +281,7 @@ pub struct DurableSinkStats {
 struct Budget {
     pending_items: AtomicUsize,
     pending_bytes: AtomicUsize,
+    waiters: AtomicUsize,
     stopped: AtomicBool,
     wait_lock: Mutex<()>,
     changed: Condvar,
@@ -304,21 +307,30 @@ impl Budget {
         let mut wait = self.wait_lock.lock().map_err(|_| {
             EngineError::DurableSinkUnavailable("delivery budget wait lock poisoned".into())
         })?;
+        self.waiters.fetch_add(1, Ordering::AcqRel);
         loop {
             if self.stopped.load(Ordering::Acquire) {
+                self.waiters.fetch_sub(1, Ordering::AcqRel);
                 return Err(EngineError::DurableSinkUnavailable(
                     "delivery worker stopped".into(),
                 ));
             }
             if self.try_reserve(bytes, true) {
+                self.waiters.fetch_sub(1, Ordering::AcqRel);
                 return Ok(Some(BudgetCharge {
                     budget: Arc::clone(self),
                     bytes,
                 }));
             }
-            wait = self.changed.wait(wait).map_err(|_| {
-                EngineError::DurableSinkUnavailable("delivery budget wait lock poisoned".into())
-            })?;
+            wait = match self.changed.wait(wait) {
+                Ok(wait) => wait,
+                Err(_) => {
+                    self.waiters.fetch_sub(1, Ordering::AcqRel);
+                    return Err(EngineError::DurableSinkUnavailable(
+                        "delivery budget wait lock poisoned".into(),
+                    ));
+                }
+            };
         }
     }
 
@@ -362,13 +374,15 @@ impl Budget {
     }
 
     fn release(&self, bytes: usize) {
-        let _wait = self
-            .wait_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.pending_items.fetch_sub(1, Ordering::AcqRel);
         self.pending_bytes.fetch_sub(bytes, Ordering::AcqRel);
-        self.changed.notify_all();
+        if self.waiters.load(Ordering::Acquire) > 0 {
+            let _wait = self
+                .wait_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.changed.notify_all();
+        }
     }
 
     fn stop(&self) {
@@ -409,6 +423,19 @@ struct QueuedAppend {
 struct QueuedDecision {
     decision: DurableAtomicDecision,
     _charge: BudgetCharge,
+    retry_at: Instant,
+    retry_delay: Duration,
+}
+
+impl QueuedDecision {
+    fn new(decision: DurableAtomicDecision, charge: BudgetCharge) -> Self {
+        Self {
+            decision,
+            _charge: charge,
+            retry_at: Instant::now(),
+            retry_delay: RETRY_MIN,
+        }
+    }
 }
 
 enum Command {
@@ -427,6 +454,8 @@ enum Command {
 struct PartitionDelivery {
     checkpoint: DurableSinkCheckpoint,
     pending: BTreeMap<u64, QueuedAppend>,
+    retry_at: Option<Instant>,
+    retry_delay: Duration,
 }
 
 impl fmt::Debug for PartitionDelivery {
@@ -435,6 +464,8 @@ impl fmt::Debug for PartitionDelivery {
             .debug_struct("PartitionDelivery")
             .field("checkpoint", &self.checkpoint)
             .field("pending", &self.pending.len())
+            .field("retry_at", &self.retry_at)
+            .field("retry_delay", &self.retry_delay)
             .finish()
     }
 }
@@ -575,6 +606,7 @@ impl DurableSinkDispatcher {
         let budget = Arc::new(Budget {
             pending_items: AtomicUsize::new(0),
             pending_bytes: AtomicUsize::new(0),
+            waiters: AtomicUsize::new(0),
             stopped: AtomicBool::new(false),
             wait_lock: Mutex::new(()),
             changed: Condvar::new(),
@@ -695,10 +727,7 @@ impl DurableSinkDispatcher {
         };
         if self
             .sender_for(decision.group.topic_partition)
-            .send(Command::Decision(QueuedDecision {
-                decision,
-                _charge: charge,
-            }))
+            .send(Command::Decision(QueuedDecision::new(decision, charge)))
             .is_err()
         {
             self.shared.mark_dirty(decision.group.topic_partition);
@@ -717,10 +746,7 @@ impl DurableSinkDispatcher {
             .reserve(0, DurableSinkLagPolicy::Backpressure)?
             .expect("blocking reserve returns a charge");
         self.sender_for(decision.group.topic_partition)
-            .send(Command::Decision(QueuedDecision {
-                decision,
-                _charge: charge,
-            }))
+            .send(Command::Decision(QueuedDecision::new(decision, charge)))
             .map_err(|_| EngineError::DurableSinkUnavailable("delivery worker stopped".into()))
     }
 
@@ -919,76 +945,143 @@ fn run_dispatcher(
 ) {
     let mut partitions: HashMap<TopicPartition, PartitionDelivery> = HashMap::new();
     let mut decisions = VecDeque::new();
-    let mut retry_delay = RETRY_MIN;
-    let mut next_retry = Instant::now();
-    loop {
-        let timeout = next_retry.saturating_duration_since(Instant::now());
-        match receiver.recv_timeout(timeout) {
-            Ok(Command::Append(mut queued)) => {
-                if atomic_visibility == DurableSinkAtomicVisibility::CommittedOnly
-                    && queued.append.atomic_group.is_some()
-                {
-                    queued.append.delivery = DurableAppendDelivery::Stage;
-                }
-                let topic_partition = queued.append.topic_partition();
-                match ensure_partition(&factory, &mut partitions, topic_partition, &shared) {
-                    Ok(partition) => {
-                        let sequence = queued.append.reservation.placement.sequence.get();
-                        if sequence < partition.checkpoint.next_placement_sequence.get() {
-                            continue;
-                        }
-                        match partition.pending.entry(sequence) {
-                            std::collections::btree_map::Entry::Vacant(entry) => {
-                                entry.insert(queued);
-                            }
-                            std::collections::btree_map::Entry::Occupied(entry) => {
-                                if entry.get().append.event_id != queued.append.event_id {
-                                    shared.stats.failed_attempts.fetch_add(1, Ordering::Relaxed);
-                                    shared.mark_dirty(topic_partition);
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        shared.stats.failed_attempts.fetch_add(1, Ordering::Relaxed);
-                        shared.mark_dirty(topic_partition);
-                    }
+    let mut processing_wake: Option<Instant> = None;
+    let mut flush_at: Option<Instant> = None;
+    'worker: loop {
+        let next_wake = earlier_deadline(processing_wake, flush_at);
+        let command = match next_wake {
+            Some(deadline) => {
+                match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(command) => Some(command),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
-            Ok(Command::Decision(decision)) => decisions.push_back(decision),
-            Ok(Command::LoadCheckpoint {
-                topic_partition,
-                response,
-            }) => {
-                let result = ensure_partition(&factory, &mut partitions, topic_partition, &shared)
-                    .map(|partition| partition.checkpoint);
-                let _ = response.send(result);
+            None => match receiver.recv() {
+                Ok(command) => Some(command),
+                Err(_) => break,
+            },
+        };
+        let mut schedule_flush = false;
+        if let Some(command) = command {
+            if !handle_command(
+                command,
+                &factory,
+                &mut partitions,
+                &mut decisions,
+                atomic_visibility,
+                &shared,
+                &mut schedule_flush,
+            ) {
+                break;
             }
-            Ok(Command::PendingGroups { response }) => {
-                let result = invoke_factory(|| factory.pending_atomic_groups());
-                let _ = response.send(result);
+            for _ in 1..MAX_COMMANDS_PER_TICK {
+                match receiver.try_recv() {
+                    Ok(command) => {
+                        if !handle_command(
+                            command,
+                            &factory,
+                            &mut partitions,
+                            &mut decisions,
+                            atomic_visibility,
+                            &shared,
+                            &mut schedule_flush,
+                        ) {
+                            break 'worker;
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => break 'worker,
+                }
             }
-            Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
-            Err(RecvTimeoutError::Timeout) => {}
         }
 
-        if Instant::now() < next_retry {
+        let now = Instant::now();
+        if schedule_flush && flush_at.is_none() {
+            flush_at = Some(now + RETRY_MIN);
+        }
+        let flush_due = flush_at.is_some_and(|deadline| deadline <= now);
+        let processing_due = processing_wake.is_some_and(|deadline| deadline <= now);
+        if !flush_due && !processing_due {
             continue;
         }
-        let mut failed = process_decisions(&factory, &mut decisions, &shared);
-        failed |= process_ready(&sinks, &mut partitions, &shared);
-        if failed {
-            shared.stats.retry_attempts.fetch_add(1, Ordering::Relaxed);
-            next_retry = Instant::now() + retry_delay;
-            retry_delay = retry_delay.saturating_mul(2).min(RETRY_MAX);
-        } else {
-            retry_delay = RETRY_MIN;
-            next_retry = Instant::now() + RETRY_MIN;
+        if flush_due {
+            flush_at = None;
         }
+        processing_wake = earlier_deadline(
+            process_decisions(&factory, &mut decisions, &shared, now),
+            process_ready(&sinks, &mut partitions, &shared, now),
+        );
     }
     shared.stopped.store(true, Ordering::Release);
     shared.changed.notify_all();
     shared.decision_changed.notify_all();
+}
+
+fn handle_command(
+    command: Command,
+    factory: &Arc<dyn DurableAppendSinkFactory>,
+    partitions: &mut HashMap<TopicPartition, PartitionDelivery>,
+    decisions: &mut VecDeque<QueuedDecision>,
+    atomic_visibility: DurableSinkAtomicVisibility,
+    shared: &SharedProgress,
+    schedule_flush: &mut bool,
+) -> bool {
+    match command {
+        Command::Append(mut queued) => {
+            *schedule_flush = true;
+            if atomic_visibility == DurableSinkAtomicVisibility::CommittedOnly
+                && queued.append.atomic_group.is_some()
+            {
+                queued.append.delivery = DurableAppendDelivery::Stage;
+            }
+            let topic_partition = queued.append.topic_partition();
+            match ensure_partition(factory, partitions, topic_partition, shared) {
+                Ok(partition) => {
+                    let sequence = queued.append.reservation.placement.sequence.get();
+                    if sequence < partition.checkpoint.next_placement_sequence.get() {
+                        return true;
+                    }
+                    match partition.pending.entry(sequence) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(queued);
+                        }
+                        std::collections::btree_map::Entry::Occupied(entry) => {
+                            if entry.get().append.event_id != queued.append.event_id {
+                                shared.stats.failed_attempts.fetch_add(1, Ordering::Relaxed);
+                                shared.mark_dirty(topic_partition);
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    shared.stats.failed_attempts.fetch_add(1, Ordering::Relaxed);
+                    shared.mark_dirty(topic_partition);
+                }
+            }
+            true
+        }
+        Command::Decision(decision) => {
+            *schedule_flush = true;
+            decisions.push_back(decision);
+            true
+        }
+        Command::LoadCheckpoint {
+            topic_partition,
+            response,
+        } => {
+            let result = ensure_partition(factory, partitions, topic_partition, shared)
+                .map(|partition| partition.checkpoint);
+            let _ = response.send(result);
+            true
+        }
+        Command::PendingGroups { response } => {
+            let result = invoke_factory(|| factory.pending_atomic_groups());
+            let _ = response.send(result);
+            true
+        }
+        Command::Shutdown => false,
+    }
 }
 
 fn ensure_partition<'a>(
@@ -1007,6 +1100,8 @@ fn ensure_partition<'a>(
             Ok(entry.insert(PartitionDelivery {
                 checkpoint,
                 pending: BTreeMap::new(),
+                retry_at: None,
+                retry_delay: RETRY_MIN,
             }))
         }
     }
@@ -1016,10 +1111,19 @@ fn process_ready(
     sinks: &HashMap<ShardId, Arc<dyn DurableAppendSink>>,
     partitions: &mut HashMap<TopicPartition, PartitionDelivery>,
     shared: &SharedProgress,
-) -> bool {
-    let mut failed = false;
+    now: Instant,
+) -> Option<Instant> {
+    let mut next_wake = None;
     for partition in partitions.values_mut() {
-        loop {
+        if let Some(retry_at) = partition.retry_at {
+            if retry_at > now {
+                next_wake = earlier_deadline(next_wake, Some(retry_at));
+                continue;
+            }
+            partition.retry_at = None;
+        }
+        let mut processed = 0;
+        while processed < MAX_APPENDS_PER_PARTITION_TICK {
             let sequence = partition.checkpoint.next_placement_sequence.get();
             let Some(queued) = partition.pending.remove(&sequence) else {
                 break;
@@ -1028,15 +1132,21 @@ fn process_ready(
                 Ok(next) => next,
                 Err(_) => {
                     shared.stats.failed_attempts.fetch_add(1, Ordering::Relaxed);
-                    failed = true;
                     partition.pending.insert(sequence, queued);
+                    next_wake = earlier_deadline(
+                        next_wake,
+                        Some(defer_partition_retry(partition, shared, now)),
+                    );
                     break;
                 }
             };
             let Some(sink) = sinks.get(&queued.append.physical_shard_id) else {
                 shared.stats.failed_attempts.fetch_add(1, Ordering::Relaxed);
-                failed = true;
                 partition.pending.insert(sequence, queued);
+                next_wake = earlier_deadline(
+                    next_wake,
+                    Some(defer_partition_retry(partition, shared, now)),
+                );
                 break;
             };
             let result = catch_unwind(AssertUnwindSafe(|| {
@@ -1049,8 +1159,10 @@ fn process_ready(
             match result {
                 Ok(Ok(DurableSinkApply::Applied)) => {
                     partition.checkpoint = next;
+                    partition.retry_delay = RETRY_MIN;
                     shared.record_checkpoint(next);
                     shared.stats.applied_appends.fetch_add(1, Ordering::Relaxed);
+                    processed += 1;
                 }
                 Ok(Ok(DurableSinkApply::CheckpointConflict(actual))) => {
                     if validate_checkpoint(partition.checkpoint.topic_partition, actual).is_err()
@@ -1061,11 +1173,15 @@ fn process_ready(
                             || actual.next_offset < next.next_offset)
                     {
                         shared.stats.failed_attempts.fetch_add(1, Ordering::Relaxed);
-                        failed = true;
                         partition.pending.insert(sequence, queued);
+                        next_wake = earlier_deadline(
+                            next_wake,
+                            Some(defer_partition_retry(partition, shared, now)),
+                        );
                         break;
                     }
                     partition.checkpoint = actual;
+                    partition.retry_delay = RETRY_MIN;
                     partition.pending.retain(|&pending_sequence, _| {
                         pending_sequence >= actual.next_placement_sequence.get()
                     });
@@ -1074,40 +1190,81 @@ fn process_ready(
                         .stats
                         .checkpoint_conflicts
                         .fetch_add(1, Ordering::Relaxed);
+                    processed += 1;
                 }
                 Ok(Err(_)) | Err(_) => {
                     shared.stats.failed_attempts.fetch_add(1, Ordering::Relaxed);
-                    failed = true;
                     partition.pending.insert(sequence, queued);
+                    next_wake = earlier_deadline(
+                        next_wake,
+                        Some(defer_partition_retry(partition, shared, now)),
+                    );
                     break;
                 }
             }
         }
+        if partition.retry_at.is_none()
+            && processed == MAX_APPENDS_PER_PARTITION_TICK
+            && partition
+                .pending
+                .contains_key(&partition.checkpoint.next_placement_sequence.get())
+        {
+            next_wake = earlier_deadline(next_wake, Some(now));
+        }
     }
-    failed
+    next_wake
+}
+
+fn defer_partition_retry(
+    partition: &mut PartitionDelivery,
+    shared: &SharedProgress,
+    now: Instant,
+) -> Instant {
+    let retry_at = now + partition.retry_delay;
+    partition.retry_at = Some(retry_at);
+    partition.retry_delay = partition.retry_delay.saturating_mul(2).min(RETRY_MAX);
+    shared.stats.retry_attempts.fetch_add(1, Ordering::Relaxed);
+    retry_at
 }
 
 fn process_decisions(
     factory: &Arc<dyn DurableAppendSinkFactory>,
     decisions: &mut VecDeque<QueuedDecision>,
     shared: &SharedProgress,
-) -> bool {
-    let mut failed = false;
+    now: Instant,
+) -> Option<Instant> {
+    let mut next_wake = None;
     let count = decisions.len();
     for _ in 0..count {
-        let Some(decision) = decisions.pop_front() else {
+        let Some(mut decision) = decisions.pop_front() else {
             break;
         };
+        if decision.retry_at > now {
+            next_wake = earlier_deadline(next_wake, Some(decision.retry_at));
+            decisions.push_back(decision);
+            continue;
+        }
         match invoke_factory(|| factory.finalize_atomic_group(decision.decision)) {
             Ok(()) => shared.record_decision(decision.decision.group),
             Err(_) => {
                 shared.stats.failed_attempts.fetch_add(1, Ordering::Relaxed);
+                shared.stats.retry_attempts.fetch_add(1, Ordering::Relaxed);
+                decision.retry_at = now + decision.retry_delay;
+                decision.retry_delay = decision.retry_delay.saturating_mul(2).min(RETRY_MAX);
+                next_wake = earlier_deadline(next_wake, Some(decision.retry_at));
                 decisions.push_back(decision);
-                failed = true;
             }
         }
     }
-    failed
+    next_wake
+}
+
+fn earlier_deadline(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    }
 }
 
 fn invoke_factory<T>(operation: impl FnOnce() -> EngineResult<T>) -> EngineResult<T> {

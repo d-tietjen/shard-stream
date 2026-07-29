@@ -62,7 +62,8 @@ perform sink I/O.
 - blocking or background startup recovery;
 - bounded backpressure or availability-first lag handling;
 - all-durable publication or committed-only atomic visibility;
-- callback worker count plus pending item and byte limits; and
+- callback worker count (two partition-striped workers by default) plus
+  pending item and byte limits; and
 - the recovery/checkpoint timeout.
 
 Backpressure is the default and happens before coordinator reservation.

@@ -1847,6 +1847,7 @@ mod tests {
         panic_once: AtomicBool,
         block: AtomicBool,
         entered: AtomicBool,
+        failed_partition: Mutex<Option<TopicPartition>>,
     }
 
     #[derive(Debug)]
@@ -1883,6 +1884,19 @@ mod tests {
             {
                 return Err(EngineError::DurableSinkUnavailable(
                     "recording sink injected failure".into(),
+                ));
+            }
+            if self
+                .control
+                .failed_partition
+                .lock()
+                .map_err(|_| {
+                    EngineError::CorruptState("recording sink failure lock poisoned".into())
+                })?
+                .is_some_and(|partition| partition == expected.topic_partition)
+            {
+                return Err(EngineError::DurableSinkUnavailable(
+                    "recording sink partition failure".into(),
                 ));
             }
             let mut state =
@@ -2404,6 +2418,55 @@ mod tests {
         let stats = engine.durable_sink_stats();
         assert_eq!(stats.checkpoint_conflicts, 1);
         assert!(stats.failed_attempts >= 1);
+    }
+
+    #[test]
+    fn durable_sink_retry_backoff_does_not_stall_healthy_partitions() {
+        let temp = TempDir::new("durable-sink-retry-isolation");
+        let failed_partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        let healthy_partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(1));
+        let control = Arc::new(RecordingSinkControl {
+            failed_partition: Mutex::new(Some(failed_partition)),
+            ..RecordingSinkControl::default()
+        });
+        let options = DurableSinkOptions {
+            worker_count: 1,
+            ..DurableSinkOptions::default()
+        };
+        let engine = StreamEngine::open_with_durable_sink(
+            config(&temp.0),
+            recording_sink_config(&control, options),
+        )
+        .expect("open");
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 2,
+                shards: None,
+            })
+            .expect("topic");
+        engine
+            .append(append_request(1, b"permanently-failing", None))
+            .expect("durable failed-partition append");
+        wait_for_test(|| engine.durable_sink_stats().retry_attempts >= 6);
+
+        let mut healthy = append_request(2, b"healthy", None);
+        healthy.partition_id = LogicalPartitionId::new(1);
+        let started = Instant::now();
+        engine.append(healthy).expect("durable healthy append");
+        wait_for_test(|| {
+            control
+                .state
+                .lock()
+                .expect("state")
+                .checkpoints
+                .get(&healthy_partition)
+                .is_some_and(|checkpoint| checkpoint.next_offset == LogicalOffset::new(1))
+        });
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "failed partition retry backoff stalled a healthy partition"
+        );
     }
 
     #[test]
