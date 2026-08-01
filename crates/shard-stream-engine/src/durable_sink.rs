@@ -104,6 +104,12 @@ pub struct DurableAppend {
     pub atomic_group: Option<AtomicGroupIdentity>,
     pub delivery: DurableAppendDelivery,
     pub payload: Bytes,
+    /// Optional process-local input retained only until this sink callback.
+    ///
+    /// The authoritative `payload` remains the sole recovery representation.
+    /// This context is charged to the sink lag budget and is never persisted,
+    /// replicated, or reconstructed during replay.
+    pub transient_context: Option<Bytes>,
 }
 
 impl DurableAppend {

@@ -476,6 +476,27 @@ impl StreamEngine {
     }
 
     pub fn append(&self, request: AppendRequest) -> EngineResult<AppendResponse> {
+        self.append_inner(request, None)
+    }
+
+    /// Appends durably while forwarding bounded process-local bytes to the
+    /// configured durable sink.
+    ///
+    /// `sink_context` is never authoritative: replay receives only the stored
+    /// append payload. Its bytes count against durable-sink backpressure.
+    pub fn append_with_durable_sink_context(
+        &self,
+        request: AppendRequest,
+        sink_context: Bytes,
+    ) -> EngineResult<AppendResponse> {
+        self.append_inner(request, Some(sink_context))
+    }
+
+    fn append_inner(
+        &self,
+        request: AppendRequest,
+        sink_context: Option<Bytes>,
+    ) -> EngineResult<AppendResponse> {
         if request.durability == Durability::Object && self.config.object_store_dir.is_none() {
             return Err(EngineError::UnsupportedDurability(
                 "object acknowledgement requires object_store_dir",
@@ -498,7 +519,17 @@ impl StreamEngine {
         let (mut sink_charge, sink_payload) = if let Some(durable_sink) = &self.durable_sink {
             durable_sink.validate_append(&request.payload, record_count)?;
             (
-                durable_sink.reserve(request.payload.len())?,
+                durable_sink.reserve(
+                    request
+                        .payload
+                        .len()
+                        .checked_add(sink_context.as_ref().map_or(0, Bytes::len))
+                        .ok_or_else(|| {
+                            EngineError::InvalidConfig(
+                                "append plus sink context exceeds usize".into(),
+                            )
+                        })?,
+                )?,
                 Some(request.payload.clone()),
             )
         } else {
@@ -641,6 +672,7 @@ impl StreamEngine {
                             request.producer.and_then(|producer| producer.event_id),
                             request.atomic_group,
                             payload,
+                            sink_context,
                         ),
                         sink_charge.take(),
                     );
@@ -1527,6 +1559,22 @@ impl StreamEngine {
             .transpose()
     }
 
+    /// Blocks until the configured durable sink reaches `target`.
+    ///
+    /// Unlike repeatedly loading [`Self::durable_sink_checkpoint`], this waits
+    /// on the sink's progress notification and consumes no polling interval.
+    pub fn wait_for_durable_sink_checkpoint(
+        &self,
+        target: DurableSinkCheckpoint,
+    ) -> EngineResult<()> {
+        self.durable_sink
+            .as_ref()
+            .ok_or_else(|| {
+                EngineError::DurableSinkUnavailable("engine has no configured durable sink".into())
+            })?
+            .wait_for(target)
+    }
+
     fn shard_for_lane(&self, lane_id: ShardId) -> EngineResult<&ShardHandle> {
         let shard_id = self.config.physical_shard_for_lane(lane_id);
         self.shards
@@ -1556,6 +1604,7 @@ fn durable_append(
     producer_event_id: Option<RecordId>,
     atomic_group: Option<AtomicGroupIdentity>,
     payload: Bytes,
+    transient_context: Option<Bytes>,
 ) -> DurableAppend {
     DurableAppend {
         event_id: RecordId::for_batch(
@@ -1569,6 +1618,7 @@ fn durable_append(
         atomic_group,
         delivery: DurableAppendDelivery::Publish,
         payload,
+        transient_context,
     }
 }
 
@@ -1582,6 +1632,7 @@ fn durable_append_from_stored(config: &EngineConfig, batch: StoredBatch) -> Dura
             chunk_sequence: group.chunk_sequence,
         }),
         batch.payload,
+        None,
     )
 }
 
@@ -2202,6 +2253,55 @@ mod tests {
     }
 
     #[test]
+    fn transient_sink_context_is_forwarded_bounded_and_not_authoritative() {
+        let temp = TempDir::new("durable-sink-transient-context");
+        let control = Arc::new(RecordingSinkControl {
+            block: AtomicBool::new(true),
+            ..RecordingSinkControl::default()
+        });
+        let engine = StreamEngine::open_with_durable_sink(
+            config(&temp.0),
+            recording_sink_config(&control, DurableSinkOptions::default()),
+        )
+        .expect("open with sink");
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("create topic");
+
+        let payload = Bytes::from_static(b"stored");
+        let context = Bytes::from_static(b"already-decoded");
+        engine
+            .append_with_durable_sink_context(append_request(1, &payload, None), context.clone())
+            .expect("authoritative append is durable");
+        wait_for_test(|| control.entered.load(Ordering::Acquire));
+        assert_eq!(
+            engine.durable_sink_stats().pending_bytes,
+            (payload.len() + context.len()) as u64
+        );
+
+        control.block.store(false, Ordering::Release);
+        wait_for_test(|| engine.durable_sink_stats().pending_items == 0);
+        let state = control.state.lock().expect("state");
+        assert_eq!(state.appends.len(), 1);
+        assert_eq!(state.appends[0].payload, payload);
+        assert_eq!(
+            state.appends[0].transient_context.as_deref(),
+            Some(context.as_ref())
+        );
+        drop(state);
+
+        let fetched = engine
+            .fetch(fetch_request(0))
+            .expect("stored payload fetches");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].payload, payload);
+    }
+
+    #[test]
     fn durable_sink_replays_wal_written_before_sink_installation() {
         let temp = TempDir::new("durable-sink-replay");
         let engine_config = config(&temp.0);
@@ -2236,6 +2336,7 @@ mod tests {
         let state = control.state.lock().expect("state");
         assert_eq!(state.appends.len(), 1);
         assert_eq!(state.appends[0].payload.as_ref(), b"before-install");
+        assert!(state.appends[0].transient_context.is_none());
     }
 
     #[test]
