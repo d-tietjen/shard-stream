@@ -272,7 +272,6 @@ pub struct ShardStore {
     index: HashMap<TopicPartition, Vec<ExtentLocation>>,
     by_batch: HashMap<(TopicPartition, BatchId), ExtentLocation>,
     pack_paths: BTreeMap<u64, PathBuf>,
-    pack_readers: BTreeMap<u64, File>,
     read_buffer_pool: ReadBufferPool,
 }
 
@@ -340,15 +339,6 @@ impl ShardStore {
             .write(true)
             .open(&active_path)?;
         let active_bytes = active_file.metadata()?.len();
-        let pack_readers = pack_paths
-            .iter()
-            .map(|(&sequence, path)| {
-                OpenOptions::new()
-                    .read(true)
-                    .open(path)
-                    .map(|file| (sequence, file))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
         let store_token = NEXT_STORE_TOKEN
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
                 token.checked_add(1)
@@ -368,7 +358,6 @@ impl ShardStore {
             index,
             by_batch,
             pack_paths,
-            pack_readers,
             read_buffer_pool: ReadBufferPool::new(),
         })
     }
@@ -748,12 +737,9 @@ impl ShardStore {
             let range_start = planned[first].payload_offset;
             let range_len = usize::try_from(range_end - range_start)
                 .map_err(|_| StorageError::LimitExceeded("fetch range exceeds usize".into()))?;
-            let reader = self
-                .pack_readers
-                .get(&planned[first].pack_sequence)
-                .ok_or_else(|| StorageError::InvalidInput("planned pack is missing".into()))?;
+            let reader = self.open_pack_reader(planned[first].pack_sequence)?;
             let mut buffer = self.read_buffer_pool.take(range_len);
-            if let Err(error) = read_exact_at(reader, &mut buffer, range_start) {
+            if let Err(error) = read_exact_at(&reader, &mut buffer, range_start) {
                 self.read_buffer_pool.recycle_now(buffer);
                 return Err(error.into());
             }
@@ -892,7 +878,6 @@ impl ShardStore {
             let tombstone = pending_pack_deletion_path(&path);
             fs::rename(&path, &tombstone)?;
             sync_directory(&self.config.directory)?;
-            self.pack_readers.remove(&sequence);
             self.pack_paths.remove(&sequence);
             self.by_batch
                 .retain(|_, location| location.pack_sequence != sequence);
@@ -939,9 +924,7 @@ impl ShardStore {
             .read(true)
             .write(true)
             .open(&path)?;
-        let reader = OpenOptions::new().read(true).open(&path)?;
         self.pack_paths.insert(sequence, path.clone());
-        self.pack_readers.insert(sequence, reader);
         sync_directory(&self.config.directory)?;
         self.active = ActivePack {
             sequence,
@@ -963,6 +946,14 @@ impl ShardStore {
             store_token: self.store_token,
             plan_epoch: self.plan_epoch,
         }
+    }
+
+    fn open_pack_reader(&self, sequence: u64) -> StorageResult<File> {
+        let path = self
+            .pack_paths
+            .get(&sequence)
+            .ok_or_else(|| StorageError::InvalidInput("planned pack is missing".into()))?;
+        Ok(OpenOptions::new().read(true).open(path)?)
     }
 }
 
@@ -1791,6 +1782,38 @@ mod tests {
         assert!(!tombstone.exists());
         assert_eq!(store.catalog().len(), 1);
         assert_eq!(store.catalog()[0].reservation.batch_id, BatchId::new(1));
+    }
+
+    #[test]
+    fn many_pack_recovery_and_fetch_open_readers_on_demand() {
+        const PACKS: u128 = 81;
+        let temp = TempDir::new("on-demand-pack-readers");
+        {
+            let mut store = ShardStore::open(config(&temp.0, 1)).expect("open");
+            for batch in 0..PACKS {
+                store
+                    .append(
+                        reservation(batch, u64::try_from(batch * 2).expect("offset fits"), 3),
+                        None,
+                        b"payload",
+                        false,
+                    )
+                    .expect("append");
+            }
+            assert_eq!(store.pack_paths.len(), PACKS as usize);
+        }
+
+        let mut store = ShardStore::open(config(&temp.0, 1)).expect("reopen");
+        assert_eq!(store.pack_paths.len(), PACKS as usize);
+        let batches = store
+            .fetch(
+                TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0)),
+                LogicalOffset::new(0),
+                usize::MAX,
+            )
+            .expect("fetch every pack");
+        assert_eq!(batches.len(), PACKS as usize);
+        assert!(batches.iter().all(|batch| batch.payload == "payload"));
     }
 
     #[test]
