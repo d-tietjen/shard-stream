@@ -340,10 +340,15 @@ impl StreamEngine {
         for shard_id in config.shard_ids() {
             let (handle, entries) = ShardHandle::spawn(&config, shard_id)?;
             for entry in entries {
-                let key = (
-                    TopicPartition::new(entry.reservation.topic_id, entry.reservation.partition_id),
-                    entry.reservation.batch_id,
-                );
+                let topic_partition =
+                    TopicPartition::new(entry.reservation.topic_id, entry.reservation.partition_id);
+                if retained_log_starts
+                    .get(&topic_partition)
+                    .is_some_and(|log_start| entry.reservation.last_offset < *log_start)
+                {
+                    continue;
+                }
+                let key = (topic_partition, entry.reservation.batch_id);
                 if catalog.insert(key, entry).is_some() {
                     return Err(EngineError::CorruptState(format!(
                         "batch {} appears in more than one extent",
@@ -354,13 +359,9 @@ impl StreamEngine {
             shards.push(handle);
         }
 
-        let mut recovered_partitions = catalog
-            .keys()
-            .map(|(topic_partition, _)| *topic_partition)
-            .collect::<Vec<_>>();
-        recovered_partitions.sort_unstable();
-        recovered_partitions.dedup();
         let recovered_states = recover_partition_states(&config, &recovered.events, &catalog, 1)?;
+        let mut recovered_partitions = recovered_states.keys().copied().collect::<Vec<_>>();
+        recovered_partitions.sort_unstable();
         let journal = ControlJournal::spawn(journal)?;
         let coordinators =
             CoordinatorPool::spawn(config.shard_count as usize, recovered_states, &journal)?;
@@ -4016,6 +4017,11 @@ mod tests {
                     .expect("append");
             }
             engine.sync().expect("sync");
+        }
+        {
+            // Reopen first so both tiny source packs are immutable and the
+            // retention pass can physically remove the complete prefix.
+            let engine = StreamEngine::open(engine_config.clone()).expect("reopen before truncate");
             let watermarks = engine
                 .truncate_partition(topic_partition, LogicalOffset::new(2))
                 .expect("truncate complete prefix");
