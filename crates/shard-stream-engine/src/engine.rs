@@ -3995,6 +3995,51 @@ mod tests {
     }
 
     #[test]
+    fn recovery_applies_log_start_before_validating_a_fully_reclaimed_prefix() {
+        let temp = TempDir::new("retention-empty-prefix-recovery");
+        let mut engine_config = config(&temp.0);
+        engine_config.shard_count = 1;
+        engine_config.target_pack_bytes = 1;
+        let topic_partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        {
+            let engine = StreamEngine::open(engine_config.clone()).expect("open");
+            engine
+                .create_topic(TopicConfig {
+                    topic_id: TopicId::new(1),
+                    partitions: 1,
+                    shards: None,
+                })
+                .expect("create");
+            for request_id in 1..=2 {
+                engine
+                    .append(append_request(request_id, &[request_id as u8], None))
+                    .expect("append");
+            }
+            engine.sync().expect("sync");
+            let watermarks = engine
+                .truncate_partition(topic_partition, LogicalOffset::new(2))
+                .expect("truncate complete prefix");
+            assert_eq!(watermarks.log_start, LogicalOffset::new(2));
+            assert_eq!(watermarks.last_stable_offset, LogicalOffset::new(2));
+        }
+
+        let engine = StreamEngine::open(engine_config).expect("reopen reclaimed prefix");
+        let watermarks = engine.watermarks(topic_partition).expect("watermarks");
+        assert_eq!(watermarks.log_start, LogicalOffset::new(2));
+        assert_eq!(watermarks.last_stable_offset, LogicalOffset::new(2));
+        assert!(
+            engine
+                .fetch(fetch_request(2))
+                .expect("empty tail")
+                .is_empty()
+        );
+        let response = engine
+            .append(append_request(3, b"after-retention", None))
+            .expect("append resumes after retained offset");
+        assert_eq!(response.first_offset, LogicalOffset::new(2));
+    }
+
+    #[test]
     fn concurrent_appends_recover_without_per_append_journal_events() {
         let temp = TempDir::new("mpsc-concurrency");
         let engine_config = config(&temp.0);

@@ -2680,13 +2680,17 @@ pub(crate) fn recover_partition_states(
             .get(&topic_partition)
             .copied()
             .unwrap_or(LogicalOffset::new(0));
-        let contiguous_end = state.watermarks().contiguous_log_end;
-        let first_retained = if recovered_log_start == contiguous_end {
+        // Retained packs may begin above offset zero, so contiguity cannot be
+        // calculated correctly until the durable log start has been applied.
+        // Use the recovered sequencer extent to locate the retained boundary,
+        // then rebuild all watermarks from that boundary below.
+        let allocated_end = state.sequencer.next_offset();
+        let first_retained = if recovered_log_start == allocated_end {
             Some(state.batches.next_key())
         } else {
             state.batch_key_at_first_offset(recovered_log_start)
         };
-        if recovered_log_start > contiguous_end || first_retained.is_none() {
+        if recovered_log_start > allocated_end || first_retained.is_none() {
             return Err(EngineError::CorruptState(format!(
                 "invalid recovered log start {recovered_log_start} for {}/{}",
                 topic_partition.topic_id, topic_partition.partition_id
