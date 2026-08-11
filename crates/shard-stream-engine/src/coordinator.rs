@@ -712,6 +712,31 @@ impl CoordinatorPool {
         Ok(())
     }
 
+    pub(crate) fn create_partition_affine_topic(
+        &self,
+        topic: TopicConfig,
+        shards: Vec<ShardId>,
+        replication_policy: PartitionReplicationPolicy,
+    ) -> EngineResult<()> {
+        for partition_id in 0..topic.partitions {
+            let topic_partition =
+                TopicPartition::new(topic.topic_id, LogicalPartitionId::new(partition_id));
+            let owner = shards[partition_id as usize % shards.len()];
+            let (response, receiver) = sync_channel(1);
+            self.send(
+                topic_partition,
+                CoordinatorCommand::Create {
+                    topic_partition,
+                    shards: vec![owner],
+                    replication_policy,
+                    response,
+                },
+            )?;
+            receive(receiver)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn router(&self) -> CoordinatorRouter {
         CoordinatorRouter {
             senders: self

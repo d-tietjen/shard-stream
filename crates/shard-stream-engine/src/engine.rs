@@ -398,6 +398,30 @@ impl StreamEngine {
         self.create_topic_with_policy(topic, self.config.default_replication_policy())
     }
 
+    /// Creates a topic whose logical partitions each have one stable owner
+    /// lane selected round-robin from the configured shard ring.
+    ///
+    /// This mode is intended for stateful partition consumers that keep
+    /// mutable thread-local state alongside the shard-stream owner. Unlike a
+    /// regular topic, successive appends to one partition never rotate across
+    /// lanes.
+    pub fn create_partition_affine_topic(&self, topic: TopicConfig) -> EngineResult<()> {
+        if topic.partitions == 0 {
+            return Err(EngineError::InvalidConfig(
+                "topic partitions must be nonzero".into(),
+            ));
+        }
+        let replication_policy = self.config.default_replication_policy();
+        replication_policy.validate(self.config.replication_factor)?;
+        let shards = topic
+            .shards
+            .clone()
+            .unwrap_or_else(|| self.config.virtual_lane_ids());
+        validate_ring(&self.config, &shards)?;
+        self.coordinators
+            .create_partition_affine_topic(topic, shards, replication_policy)
+    }
+
     pub fn create_topic_with_policy(
         &self,
         topic: TopicConfig,
@@ -2177,6 +2201,49 @@ mod tests {
             chunk_sequence,
         });
         request
+    }
+
+    #[test]
+    fn partition_affine_topics_keep_each_partition_on_one_distributed_lane() {
+        let temp = TempDir::new("partition-affine-topic");
+        let engine = StreamEngine::open(config(&temp.0)).expect("open engine");
+        engine
+            .create_partition_affine_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 6,
+                shards: None,
+            })
+            .expect("create partition-affine topic");
+
+        for partition_id in 0..6 {
+            for append_index in 0..2 {
+                let mut request = append_request(
+                    u128::from(partition_id * 2 + append_index + 1),
+                    b"record",
+                    None,
+                );
+                request.partition_id = LogicalPartitionId::new(partition_id);
+                let appended = engine.append(request).expect("append");
+                assert_eq!(
+                    appended.placement.virtual_lane_id,
+                    ShardId::new(partition_id % 3)
+                );
+            }
+        }
+        drop(engine);
+
+        let recovered = StreamEngine::open(config(&temp.0)).expect("recover engine");
+        recovered
+            .create_partition_affine_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 6,
+                shards: None,
+            })
+            .expect("idempotently recover partition-affine topic");
+        let mut request = append_request(100, b"recovered", None);
+        request.partition_id = LogicalPartitionId::new(4);
+        let appended = recovered.append(request).expect("append after recovery");
+        assert_eq!(appended.placement.virtual_lane_id, ShardId::new(1));
     }
 
     #[test]
