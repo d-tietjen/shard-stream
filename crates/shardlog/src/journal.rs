@@ -4,7 +4,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::{
-    LogicalOffset, LogicalPartitionId, RecordId, RingEpoch, ShardId, TopicId, TopicPartition,
+    BatchId, LogicalOffset, LogicalPartitionId, PlacementSequence, RecordId, RingEpoch, ShardId,
+    TopicId, TopicPartition,
 };
 
 use crate::codec::{Decoder, push_u8, push_u32, push_u64, push_u128};
@@ -22,6 +23,7 @@ const GROUP_COMMIT_KIND: u8 = 7;
 const GROUP_ABORT_KIND: u8 = 8;
 const CREATE_PARTITION_KIND: u8 = 9;
 const UPDATE_REPLICATION_POLICY_KIND: u8 = 10;
+const TRUNCATE_CHECKPOINT_KIND: u8 = 11;
 
 pub const DIGEST_XXH3_128: u8 = 1;
 
@@ -69,6 +71,13 @@ pub enum JournalEvent {
     Truncate {
         topic_partition: TopicPartition,
         log_start: LogicalOffset,
+    },
+    TruncateCheckpoint {
+        topic_partition: TopicPartition,
+        log_start: LogicalOffset,
+        next_batch_id: BatchId,
+        next_offset: LogicalOffset,
+        next_placement_sequence: PlacementSequence,
     },
     GroupCommit {
         topic_partition: TopicPartition,
@@ -287,6 +296,28 @@ fn encode_event(event: &JournalEvent) -> StorageResult<Vec<u8>> {
             push_u64(&mut body, log_start.get());
             (TRUNCATE_KIND, body)
         }
+        JournalEvent::TruncateCheckpoint {
+            topic_partition,
+            log_start,
+            next_batch_id,
+            next_offset,
+            next_placement_sequence,
+        } => {
+            if next_offset < log_start
+                || next_batch_id.get() != u128::from(next_placement_sequence.get())
+            {
+                return Err(StorageError::InvalidInput(
+                    "truncate checkpoint sequencer boundary is invalid".into(),
+                ));
+            }
+            let mut body = Vec::with_capacity(60);
+            push_topic_partition(&mut body, *topic_partition);
+            push_u64(&mut body, log_start.get());
+            push_u128(&mut body, next_batch_id.get());
+            push_u64(&mut body, next_offset.get());
+            push_u64(&mut body, next_placement_sequence.get());
+            (TRUNCATE_CHECKPOINT_KIND, body)
+        }
         JournalEvent::GroupCommit {
             topic_partition,
             transaction_id,
@@ -389,6 +420,29 @@ fn decode_event(path: &Path, offset: u64, kind: u8, body: &[u8]) -> StorageResul
             topic_partition: decode_topic_partition(&mut decoder)?,
             log_start: LogicalOffset::new(decoder.u64()?),
         },
+        TRUNCATE_CHECKPOINT_KIND => {
+            let topic_partition = decode_topic_partition(&mut decoder)?;
+            let log_start = LogicalOffset::new(decoder.u64()?);
+            let next_batch_id = BatchId::new(decoder.u128()?);
+            let next_offset = LogicalOffset::new(decoder.u64()?);
+            let next_placement_sequence = PlacementSequence::new(decoder.u64()?);
+            if next_offset < log_start
+                || next_batch_id.get() != u128::from(next_placement_sequence.get())
+            {
+                return Err(StorageError::corrupt(
+                    path,
+                    offset,
+                    "truncate checkpoint sequencer boundary is invalid",
+                ));
+            }
+            JournalEvent::TruncateCheckpoint {
+                topic_partition,
+                log_start,
+                next_batch_id,
+                next_offset,
+                next_placement_sequence,
+            }
+        }
         GROUP_COMMIT_KIND => JournalEvent::GroupCommit {
             topic_partition: decode_topic_partition(&mut decoder)?,
             transaction_id: decoder.u128()?,
@@ -572,6 +626,13 @@ mod tests {
             JournalEvent::Truncate {
                 topic_partition: TopicPartition::new(TopicId::new(9), LogicalPartitionId::new(2)),
                 log_start: LogicalOffset::new(13),
+            },
+            JournalEvent::TruncateCheckpoint {
+                topic_partition: TopicPartition::new(TopicId::new(9), LogicalPartitionId::new(2)),
+                log_start: LogicalOffset::new(13),
+                next_batch_id: BatchId::new(7),
+                next_offset: LogicalOffset::new(13),
+                next_placement_sequence: PlacementSequence::new(7),
             },
             JournalEvent::GroupCommit {
                 topic_partition: TopicPartition::new(TopicId::new(9), LogicalPartitionId::new(2)),

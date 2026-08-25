@@ -11,6 +11,8 @@ This public distribution includes:
 - ordered and completion-order fetch;
 - idempotent producer epochs, sequences, and stable event IDs;
 - partition-scoped atomic append groups and durable retention checkpoints;
+- an optional crash-safe, partition-checkpointed durable append sink for
+  embedded compositions;
 - immutable object-tier packs;
 - REST, gRPC/HTTP2, optional HTTP/3, and an optional conservative Kafka
   protocol adapter;

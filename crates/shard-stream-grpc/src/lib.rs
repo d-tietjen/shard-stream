@@ -362,7 +362,8 @@ fn engine_status(error: EngineError) -> Status {
         | EngineError::ReplicaInFlight(_)
         | EngineError::WorkerStopped(_)
         | EngineError::DurabilityUnavailable { .. }
-        | EngineError::ObjectDurabilityUnavailable => Status::unavailable(error.to_string()),
+        | EngineError::ObjectDurabilityUnavailable
+        | EngineError::DurableSinkUnavailable(_) => Status::unavailable(error.to_string()),
         EngineError::OffsetOutOfRange { .. } => Status::out_of_range(error.to_string()),
         EngineError::RetentionPinned { .. } => Status::failed_precondition(error.to_string()),
         EngineError::UnsupportedDurability(_) => Status::unimplemented(error.to_string()),
@@ -376,9 +377,9 @@ fn engine_status(error: EngineError) -> Status {
         | EngineError::AtomicGroupSequenceOutOfOrder { .. }
         | EngineError::AtomicGroupChunkMismatch(_)
         | EngineError::Sequencer(_) => Status::failed_precondition(error.to_string()),
-        EngineError::CorruptState(_) | EngineError::Storage(_) => {
-            Status::internal(error.to_string())
-        }
+        EngineError::DurableSinkCheckpoint(_)
+        | EngineError::CorruptState(_)
+        | EngineError::Storage(_) => Status::internal(error.to_string()),
     }
 }
 

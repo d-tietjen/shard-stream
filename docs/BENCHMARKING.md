@@ -25,6 +25,23 @@ latency percentiles, the final durable sync, and optional pass/fail gates.
 Never compare runs without recording the filesystem, hardware, batch size,
 record count, concurrency, shard count, and durability spelling.
 
+The harness also accepts `--sink-mode none|noop|slow|failed`.
+`--sink-delay-us` controls the slow callback. Failed mode uses availability
+policy so it measures bounded notification dropping rather than intentionally
+blocking forever at the lag limit. Sink backlog, checkpoint age, retries,
+failures, and dirty partitions are included in the JSON.
+
+Run the five-pair regression gate against the checked-out `origin/main` with:
+
+```shell
+./bench/run-durable-sink-bench.sh
+```
+
+The median disabled path must retain at least 98% of main throughput and stay
+within 5% of main p99 append latency. The enabled no-op sink must retain at
+least 95% of throughput and stay within 10% of p99. Override workload sizes
+with the `SHARD_STREAM_DURABLE_SINK_BENCH_*` environment variables.
+
 Run the shard-count matrix with:
 
 ```shell

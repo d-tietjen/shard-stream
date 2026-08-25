@@ -23,8 +23,13 @@ use crate::coordinator::{
     CommittedBatchSet, CompleteAppend, ControlJournal, CoordinatorPool, CoordinatorRouter,
     ReserveOutcome, VisibilityMode, recover_partition_states, retention_hints,
 };
+use crate::durable_sink::DurableSinkDispatcher;
 use crate::worker::{FetchCompletion, ShardHandle};
-use crate::{EngineConfig, EngineError, EngineResult, PartitionReplicationPolicy, TopicConfig};
+use crate::{
+    DurableAppend, DurableAppendDelivery, DurableAtomicDecision, DurableAtomicGroup,
+    DurableSinkCheckpoint, DurableSinkConfig, DurableSinkRecoveryMode, DurableSinkStats,
+    EngineConfig, EngineError, EngineResult, PartitionReplicationPolicy, TopicConfig,
+};
 
 const MAX_FETCH_PLAN_BATCHES_PER_SHARD: usize = 4_096;
 
@@ -94,6 +99,7 @@ pub struct StreamEngine {
     write_fence: Option<Arc<dyn WriteFence>>,
     replication: Option<Arc<dyn ReplicationTransport>>,
     retention_guard: Option<Arc<dyn RetentionGuard>>,
+    durable_sink: Option<DurableSinkDispatcher>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -221,21 +227,21 @@ impl StreamEngine {
     }
 
     pub fn open(config: EngineConfig) -> EngineResult<Self> {
-        Self::open_inner(config, None, None, None)
+        Self::open_inner(config, None, None, None, None, false)
     }
 
     pub fn open_with_fence(
         config: EngineConfig,
         write_fence: Arc<dyn WriteFence>,
     ) -> EngineResult<Self> {
-        Self::open_inner(config, Some(write_fence), None, None)
+        Self::open_inner(config, Some(write_fence), None, None, None, false)
     }
 
     pub fn open_with_replication(
         config: EngineConfig,
         replication: Arc<dyn ReplicationTransport>,
     ) -> EngineResult<Self> {
-        Self::open_inner(config, None, Some(replication), None)
+        Self::open_inner(config, None, Some(replication), None, None, false)
     }
 
     /// Opens an engine with independently optional fencing and replication.
@@ -249,7 +255,7 @@ impl StreamEngine {
         write_fence: Option<Arc<dyn WriteFence>>,
         replication: Option<Arc<dyn ReplicationTransport>>,
     ) -> EngineResult<Self> {
-        Self::open_inner(config, write_fence, replication, None)
+        Self::open_inner(config, write_fence, replication, None, None, false)
     }
 
     pub fn open_with_all_components(
@@ -258,7 +264,43 @@ impl StreamEngine {
         replication: Option<Arc<dyn ReplicationTransport>>,
         retention_guard: Option<Arc<dyn RetentionGuard>>,
     ) -> EngineResult<Self> {
-        Self::open_inner(config, write_fence, replication, retention_guard)
+        Self::open_inner(
+            config,
+            write_fence,
+            replication,
+            retention_guard,
+            None,
+            false,
+        )
+    }
+
+    /// Opens an RF1 engine with a cluster-shared durable append sink.
+    ///
+    /// Recovered RF1 partitions are replayed automatically. RF>1 composition
+    /// uses `open_with_all_components_and_durable_sink` and activates only the
+    /// partitions currently led by this broker through `resume_durable_sink`.
+    pub fn open_with_durable_sink(
+        config: EngineConfig,
+        durable_sink: DurableSinkConfig,
+    ) -> EngineResult<Self> {
+        Self::open_inner(config, None, None, None, Some(durable_sink), true)
+    }
+
+    pub fn open_with_all_components_and_durable_sink(
+        config: EngineConfig,
+        write_fence: Option<Arc<dyn WriteFence>>,
+        replication: Option<Arc<dyn ReplicationTransport>>,
+        retention_guard: Option<Arc<dyn RetentionGuard>>,
+        durable_sink: Option<DurableSinkConfig>,
+    ) -> EngineResult<Self> {
+        Self::open_inner(
+            config,
+            write_fence,
+            replication,
+            retention_guard,
+            durable_sink,
+            false,
+        )
     }
 
     fn open_inner(
@@ -266,6 +308,8 @@ impl StreamEngine {
         write_fence: Option<Arc<dyn WriteFence>>,
         replication: Option<Arc<dyn ReplicationTransport>>,
         retention_guard: Option<Arc<dyn RetentionGuard>>,
+        durable_sink: Option<DurableSinkConfig>,
+        auto_resume_durable_sink: bool,
     ) -> EngineResult<Self> {
         config.validate()?;
         if config.replication_factor > 1 && replication.is_none() {
@@ -275,6 +319,18 @@ impl StreamEngine {
             ));
         }
         std::fs::create_dir_all(&config.data_dir).map_err(shardlog::StorageError::from)?;
+        let durable_sink = durable_sink
+            .map(|sink| {
+                DurableSinkDispatcher::open(
+                    sink,
+                    &config.shard_ids(),
+                    config.queue_bytes_per_shard,
+                    config.max_batch_bytes,
+                )
+            })
+            .transpose()?;
+        let auto_recover_sink =
+            auto_resume_durable_sink && config.replication_factor == 1 && durable_sink.is_some();
 
         let (journal, recovered) =
             CoordinatorJournal::open(config.data_dir.join("coordinator.ssj"))?;
@@ -284,10 +340,15 @@ impl StreamEngine {
         for shard_id in config.shard_ids() {
             let (handle, entries) = ShardHandle::spawn(&config, shard_id)?;
             for entry in entries {
-                let key = (
-                    TopicPartition::new(entry.reservation.topic_id, entry.reservation.partition_id),
-                    entry.reservation.batch_id,
-                );
+                let topic_partition =
+                    TopicPartition::new(entry.reservation.topic_id, entry.reservation.partition_id);
+                if retained_log_starts
+                    .get(&topic_partition)
+                    .is_some_and(|log_start| entry.reservation.last_offset < *log_start)
+                {
+                    continue;
+                }
+                let key = (topic_partition, entry.reservation.batch_id);
                 if catalog.insert(key, entry).is_some() {
                     return Err(EngineError::CorruptState(format!(
                         "batch {} appears in more than one extent",
@@ -298,13 +359,9 @@ impl StreamEngine {
             shards.push(handle);
         }
 
-        let mut recovered_partitions = catalog
-            .keys()
-            .map(|(topic_partition, _)| *topic_partition)
-            .collect::<Vec<_>>();
-        recovered_partitions.sort_unstable();
-        recovered_partitions.dedup();
         let recovered_states = recover_partition_states(&config, &recovered.events, &catalog, 1)?;
+        let mut recovered_partitions = recovered_states.keys().copied().collect::<Vec<_>>();
+        recovered_partitions.sort_unstable();
         let journal = ControlJournal::spawn(journal)?;
         let coordinators =
             CoordinatorPool::spawn(config.shard_count as usize, recovered_states, &journal)?;
@@ -324,7 +381,11 @@ impl StreamEngine {
             write_fence,
             replication,
             retention_guard,
+            durable_sink,
         };
+        if auto_recover_sink {
+            engine.resume_durable_sink(&engine.recovered_partitions)?;
+        }
         for (topic_partition, log_start) in retained_log_starts {
             if log_start.get() > 0 {
                 engine.collect_garbage(topic_partition, log_start)?;
@@ -335,6 +396,30 @@ impl StreamEngine {
 
     pub fn create_topic(&self, topic: TopicConfig) -> EngineResult<()> {
         self.create_topic_with_policy(topic, self.config.default_replication_policy())
+    }
+
+    /// Creates a topic whose logical partitions each have one stable owner
+    /// lane selected round-robin from the configured shard ring.
+    ///
+    /// This mode is intended for stateful partition consumers that keep
+    /// mutable thread-local state alongside the shard-stream owner. Unlike a
+    /// regular topic, successive appends to one partition never rotate across
+    /// lanes.
+    pub fn create_partition_affine_topic(&self, topic: TopicConfig) -> EngineResult<()> {
+        if topic.partitions == 0 {
+            return Err(EngineError::InvalidConfig(
+                "topic partitions must be nonzero".into(),
+            ));
+        }
+        let replication_policy = self.config.default_replication_policy();
+        replication_policy.validate(self.config.replication_factor)?;
+        let shards = topic
+            .shards
+            .clone()
+            .unwrap_or_else(|| self.config.virtual_lane_ids());
+        validate_ring(&self.config, &shards)?;
+        self.coordinators
+            .create_partition_affine_topic(topic, shards, replication_policy)
     }
 
     pub fn create_topic_with_policy(
@@ -416,6 +501,27 @@ impl StreamEngine {
     }
 
     pub fn append(&self, request: AppendRequest) -> EngineResult<AppendResponse> {
+        self.append_inner(request, None)
+    }
+
+    /// Appends durably while forwarding bounded process-local bytes to the
+    /// configured durable sink.
+    ///
+    /// `sink_context` is never authoritative: replay receives only the stored
+    /// append payload. Its bytes count against durable-sink backpressure.
+    pub fn append_with_durable_sink_context(
+        &self,
+        request: AppendRequest,
+        sink_context: Bytes,
+    ) -> EngineResult<AppendResponse> {
+        self.append_inner(request, Some(sink_context))
+    }
+
+    fn append_inner(
+        &self,
+        request: AppendRequest,
+        sink_context: Option<Bytes>,
+    ) -> EngineResult<AppendResponse> {
         if request.durability == Durability::Object && self.config.object_store_dir.is_none() {
             return Err(EngineError::UnsupportedDurability(
                 "object acknowledgement requires object_store_dir",
@@ -435,6 +541,25 @@ impl StreamEngine {
                 .check_write(topic_partition, leader_epoch)
                 .map_err(|error| EngineError::Fenced(error.to_string()))?;
         }
+        let (mut sink_charge, sink_payload) = if let Some(durable_sink) = &self.durable_sink {
+            durable_sink.validate_append(&request.payload, record_count)?;
+            (
+                durable_sink.reserve(
+                    request
+                        .payload
+                        .len()
+                        .checked_add(sink_context.as_ref().map_or(0, Bytes::len))
+                        .ok_or_else(|| {
+                            EngineError::InvalidConfig(
+                                "append plus sink context exceeds usize".into(),
+                            )
+                        })?,
+                )?,
+                Some(request.payload.clone()),
+            )
+        } else {
+            (None, None)
+        };
         let payload_digest = if request.producer.is_some() || request.atomic_group.is_some() {
             xxhash_rust::xxh3::xxh3_128(&request.payload).to_le_bytes()
         } else {
@@ -564,6 +689,19 @@ impl StreamEngine {
         let response = append_response(request.request_id, reservation);
         match append_result {
             Ok(mut durability) => {
+                if let (Some(durable_sink), Some(payload)) = (&self.durable_sink, sink_payload) {
+                    durable_sink.enqueue(
+                        durable_append(
+                            &self.config,
+                            reservation,
+                            request.producer.and_then(|producer| producer.event_id),
+                            request.atomic_group,
+                            payload,
+                            sink_context,
+                        ),
+                        sink_charge.take(),
+                    );
+                }
                 let mut replication_error = replication_start_error;
                 if let Some(ticket) = replication_ticket {
                     match ticket.wait() {
@@ -964,6 +1102,125 @@ impl StreamEngine {
         self.recovered_partitions.clone()
     }
 
+    /// Replays retained WAL data for partitions currently led by this broker.
+    ///
+    /// Live follower application is intentionally silent. A promoted follower
+    /// calls this method with its new leader assignments so any event missed by
+    /// the previous leader is recovered through the cluster-shared checkpoint.
+    pub fn resume_durable_sink(&self, partitions: &[TopicPartition]) -> EngineResult<()> {
+        let Some(durable_sink) = &self.durable_sink else {
+            return Ok(());
+        };
+        let max_bytes = u32::try_from(self.config.max_fetch_bytes).map_err(|_| {
+            EngineError::InvalidConfig("max_fetch_bytes exceeds the sink recovery limit".into())
+        })?;
+        for &topic_partition in partitions {
+            let mut checkpoint = durable_sink.checkpoint(topic_partition)?;
+            let mut recovered_decisions = HashMap::new();
+            let watermarks = self.watermarks(topic_partition)?;
+            if checkpoint.next_offset < watermarks.log_start {
+                return Err(EngineError::DurableSinkCheckpoint(format!(
+                    "checkpoint offset {} for {}/{} is behind retained log start {}",
+                    checkpoint.next_offset,
+                    topic_partition.topic_id,
+                    topic_partition.partition_id,
+                    watermarks.log_start
+                )));
+            }
+            if checkpoint.next_offset > watermarks.contiguous_log_end {
+                return Err(EngineError::DurableSinkCheckpoint(format!(
+                    "checkpoint offset {} for {}/{} is ahead of durable log end {}",
+                    checkpoint.next_offset,
+                    topic_partition.topic_id,
+                    topic_partition.partition_id,
+                    watermarks.contiguous_log_end
+                )));
+            }
+            let target_end = watermarks.contiguous_log_end;
+            while checkpoint.next_offset < target_end {
+                let batches = self.fetch_stored_internal(
+                    FetchRequest {
+                        request_id: 0,
+                        topic_id: topic_partition.topic_id,
+                        partition_id: topic_partition.partition_id,
+                        start_offset: checkpoint.next_offset,
+                        max_bytes,
+                        mode: FetchMode::Ordered,
+                    },
+                    true,
+                )?;
+                if batches.is_empty() {
+                    return Err(EngineError::CorruptState(format!(
+                        "durable sink recovery found no batch at offset {} for {}/{}",
+                        checkpoint.next_offset,
+                        topic_partition.topic_id,
+                        topic_partition.partition_id
+                    )));
+                }
+                for batch in batches {
+                    if batch.reservation.first_offset >= target_end {
+                        break;
+                    }
+                    let next = checkpoint.after(batch.reservation)?;
+                    let recovered_group = batch.atomic_group.map(|group| DurableAtomicGroup {
+                        topic_partition,
+                        transaction_id: group.transaction_id,
+                    });
+                    durable_sink.enqueue_replay(durable_append_from_stored(&self.config, batch))?;
+                    if let Some(group) = recovered_group {
+                        let inspection =
+                            self.inspect_atomic_group(topic_partition, group.transaction_id)?;
+                        if inspection.state != AtomicGroupState::Unresolved {
+                            recovered_decisions.insert(
+                                group,
+                                DurableAtomicDecision {
+                                    group,
+                                    outcome: inspection.state,
+                                },
+                            );
+                        }
+                    }
+                    checkpoint = next;
+                }
+            }
+            for decision in recovered_decisions.values().copied() {
+                durable_sink.enqueue_replay_decision(decision)?;
+            }
+            durable_sink.clear_dirty(topic_partition);
+            if durable_sink.recovery_mode() == DurableSinkRecoveryMode::Blocking {
+                durable_sink.wait_for(checkpoint)?;
+                for group in recovered_decisions.keys().copied() {
+                    durable_sink.wait_for_decision(group)?;
+                }
+            }
+            let log_start = self.watermarks(topic_partition)?.log_start;
+            self.collect_garbage(topic_partition, log_start)?;
+        }
+
+        let mut pending_decisions = Vec::new();
+        for group in durable_sink.pending_atomic_groups()? {
+            if !partitions.contains(&group.topic_partition) {
+                continue;
+            }
+            let inspection =
+                self.inspect_atomic_group(group.topic_partition, group.transaction_id)?;
+            if inspection.state != AtomicGroupState::Unresolved {
+                let decision = DurableAtomicDecision {
+                    group,
+                    outcome: inspection.state,
+                };
+                durable_sink.enqueue_replay_decision(decision)?;
+                pending_decisions.push(group);
+            }
+        }
+        if durable_sink.recovery_mode() == DurableSinkRecoveryMode::Blocking {
+            for group in pending_decisions {
+                durable_sink.wait_for_decision(group)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Replays recovered local WAL batches through the asynchronous replication
     /// transport. Recovery starts with leader-only durability, so a crash does
     /// not turn a local extent into a false RF3 watermark. The transport's
@@ -1148,11 +1405,30 @@ impl StreamEngine {
         topic_partition: TopicPartition,
         transaction_id: u128,
     ) -> EngineResult<AtomicGroupInspection> {
-        self.coordinators.finalize_atomic_group(
+        let mut sink_charge = self
+            .durable_sink
+            .as_ref()
+            .map(DurableSinkDispatcher::reserve_decision)
+            .transpose()?
+            .flatten();
+        let inspection = self.coordinators.finalize_atomic_group(
             topic_partition,
             transaction_id,
             AtomicGroupState::Committed,
-        )
+        )?;
+        if let Some(durable_sink) = &self.durable_sink {
+            durable_sink.enqueue_decision(
+                DurableAtomicDecision {
+                    group: DurableAtomicGroup {
+                        topic_partition,
+                        transaction_id,
+                    },
+                    outcome: AtomicGroupState::Committed,
+                },
+                sink_charge.take(),
+            );
+        }
+        Ok(inspection)
     }
 
     /// Syncs an abort marker. Aborted chunks consume offsets but are never
@@ -1162,11 +1438,30 @@ impl StreamEngine {
         topic_partition: TopicPartition,
         transaction_id: u128,
     ) -> EngineResult<AtomicGroupInspection> {
-        self.coordinators.finalize_atomic_group(
+        let mut sink_charge = self
+            .durable_sink
+            .as_ref()
+            .map(DurableSinkDispatcher::reserve_decision)
+            .transpose()?
+            .flatten();
+        let inspection = self.coordinators.finalize_atomic_group(
             topic_partition,
             transaction_id,
             AtomicGroupState::Aborted,
-        )
+        )?;
+        if let Some(durable_sink) = &self.durable_sink {
+            durable_sink.enqueue_decision(
+                DurableAtomicDecision {
+                    group: DurableAtomicGroup {
+                        topic_partition,
+                        transaction_id,
+                    },
+                    outcome: AtomicGroupState::Aborted,
+                },
+                sink_charge.take(),
+            );
+        }
+        Ok(inspection)
     }
 
     /// Waits without blocking the partition coordinator until `through` is
@@ -1220,6 +1515,15 @@ impl StreamEngine {
         topic_partition: TopicPartition,
         log_start: LogicalOffset,
     ) -> EngineResult<PartitionWatermarks> {
+        if let Some(durable_sink) = &self.durable_sink {
+            let checkpoint = durable_sink.checkpoint(topic_partition)?;
+            if log_start > checkpoint.next_offset {
+                return Err(EngineError::RetentionPinned {
+                    requested: log_start,
+                    pinned_at: checkpoint.next_offset,
+                });
+            }
+        }
         if let Some(guard) = &self.retention_guard {
             guard.validate_advance(topic_partition, log_start)?;
         }
@@ -1263,6 +1567,39 @@ impl StreamEngine {
             .map_or_else(ReplicationStats::default, |replication| replication.stats())
     }
 
+    #[must_use]
+    pub fn durable_sink_stats(&self) -> DurableSinkStats {
+        self.durable_sink
+            .as_ref()
+            .map_or_else(DurableSinkStats::default, DurableSinkDispatcher::stats)
+    }
+
+    pub fn durable_sink_checkpoint(
+        &self,
+        topic_partition: TopicPartition,
+    ) -> EngineResult<Option<DurableSinkCheckpoint>> {
+        self.durable_sink
+            .as_ref()
+            .map(|sink| sink.checkpoint(topic_partition))
+            .transpose()
+    }
+
+    /// Blocks until the configured durable sink reaches `target`.
+    ///
+    /// Unlike repeatedly loading [`Self::durable_sink_checkpoint`], this waits
+    /// on the sink's progress notification and consumes no polling interval.
+    pub fn wait_for_durable_sink_checkpoint(
+        &self,
+        target: DurableSinkCheckpoint,
+    ) -> EngineResult<()> {
+        self.durable_sink
+            .as_ref()
+            .ok_or_else(|| {
+                EngineError::DurableSinkUnavailable("engine has no configured durable sink".into())
+            })?
+            .wait_for(target)
+    }
+
     fn shard_for_lane(&self, lane_id: ShardId) -> EngineResult<&ShardHandle> {
         let shard_id = self.config.physical_shard_for_lane(lane_id);
         self.shards
@@ -1274,13 +1611,54 @@ impl StreamEngine {
     fn collect_garbage(
         &self,
         topic_partition: TopicPartition,
-        log_start: LogicalOffset,
+        mut log_start: LogicalOffset,
     ) -> EngineResult<()> {
+        if let Some(durable_sink) = &self.durable_sink {
+            log_start = log_start.min(durable_sink.checkpoint(topic_partition)?.next_offset);
+        }
         for shard in &self.shards {
             shard.garbage_collect(topic_partition, log_start)?;
         }
         Ok(())
     }
+}
+
+fn durable_append(
+    config: &EngineConfig,
+    reservation: Reservation,
+    producer_event_id: Option<RecordId>,
+    atomic_group: Option<AtomicGroupIdentity>,
+    payload: Bytes,
+    transient_context: Option<Bytes>,
+) -> DurableAppend {
+    DurableAppend {
+        event_id: RecordId::for_batch(
+            reservation.topic_id,
+            reservation.partition_id,
+            reservation.batch_id,
+        ),
+        physical_shard_id: config.physical_shard_for_lane(reservation.placement.virtual_lane_id),
+        reservation,
+        producer_event_id,
+        atomic_group,
+        delivery: DurableAppendDelivery::Publish,
+        payload,
+        transient_context,
+    }
+}
+
+fn durable_append_from_stored(config: &EngineConfig, batch: StoredBatch) -> DurableAppend {
+    durable_append(
+        config,
+        batch.reservation,
+        batch.producer.and_then(|producer| producer.event_id),
+        batch.atomic_group.map(|group| AtomicGroupIdentity {
+            transaction_id: group.transaction_id,
+            chunk_sequence: group.chunk_sequence,
+        }),
+        batch.payload,
+        None,
+    )
 }
 
 fn materialize_stored_batches(
@@ -1404,14 +1782,19 @@ fn validate_ring(config: &EngineConfig, shards: &[ShardId]) -> EngineResult<()> 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
     use std::fs;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, OnceLock};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use shard_stream_core::{LeaderEpoch, PlacementSequence, TopicId, VirtualLaneId};
     use shard_stream_protocol::{Durability, FetchMode, ProducerIdentity};
     use shardlog::{JournalEvent, ShardStore};
+
+    use crate::{
+        DurableAppendSink, DurableAppendSinkFactory, DurableSinkApply, DurableSinkOptions,
+    };
 
     struct DirectReplication {
         follower: Arc<StreamEngine>,
@@ -1523,6 +1906,199 @@ mod tests {
 
     use super::*;
 
+    #[derive(Debug, Default)]
+    struct RecordingSinkState {
+        checkpoints: HashMap<TopicPartition, DurableSinkCheckpoint>,
+        appends: Vec<DurableAppend>,
+        staged: HashSet<DurableAtomicGroup>,
+        decisions: Vec<DurableAtomicDecision>,
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingSinkControl {
+        state: Mutex<RecordingSinkState>,
+        failures_remaining: AtomicUsize,
+        stale_conflicts_remaining: AtomicUsize,
+        advancing_conflict_once: AtomicBool,
+        panic_once: AtomicBool,
+        block: AtomicBool,
+        entered: AtomicBool,
+        failed_partition: Mutex<Option<TopicPartition>>,
+    }
+
+    #[derive(Debug)]
+    struct RecordingSink {
+        control: Arc<RecordingSinkControl>,
+    }
+
+    #[derive(Debug)]
+    struct RecordingSinkFactory {
+        control: Arc<RecordingSinkControl>,
+    }
+
+    impl DurableAppendSink for RecordingSink {
+        fn apply(
+            &self,
+            expected: DurableSinkCheckpoint,
+            appends: &[DurableAppend],
+            next: DurableSinkCheckpoint,
+        ) -> EngineResult<DurableSinkApply> {
+            self.control.entered.store(true, Ordering::Release);
+            while self.control.block.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            if self.control.panic_once.swap(false, Ordering::AcqRel) {
+                panic!("recording sink injected panic");
+            }
+            if self
+                .control
+                .failures_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(EngineError::DurableSinkUnavailable(
+                    "recording sink injected failure".into(),
+                ));
+            }
+            if self
+                .control
+                .failed_partition
+                .lock()
+                .map_err(|_| {
+                    EngineError::CorruptState("recording sink failure lock poisoned".into())
+                })?
+                .is_some_and(|partition| partition == expected.topic_partition)
+            {
+                return Err(EngineError::DurableSinkUnavailable(
+                    "recording sink partition failure".into(),
+                ));
+            }
+            let mut state =
+                self.control.state.lock().map_err(|_| {
+                    EngineError::CorruptState("recording sink lock poisoned".into())
+                })?;
+            let actual = state
+                .checkpoints
+                .get(&expected.topic_partition)
+                .copied()
+                .unwrap_or_else(|| DurableSinkCheckpoint::initial(expected.topic_partition));
+            if actual != expected {
+                return Ok(DurableSinkApply::CheckpointConflict(actual));
+            }
+            if self
+                .control
+                .stale_conflicts_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Ok(DurableSinkApply::CheckpointConflict(actual));
+            }
+            if self
+                .control
+                .advancing_conflict_once
+                .swap(false, Ordering::AcqRel)
+            {
+                state.appends.extend_from_slice(appends);
+                state.checkpoints.insert(next.topic_partition, next);
+                return Ok(DurableSinkApply::CheckpointConflict(next));
+            }
+            for append in appends {
+                if append.delivery == DurableAppendDelivery::Stage
+                    && let Some(group) = append.atomic_group
+                {
+                    state.staged.insert(DurableAtomicGroup {
+                        topic_partition: append.topic_partition(),
+                        transaction_id: group.transaction_id,
+                    });
+                }
+                state.appends.push(append.clone());
+            }
+            state.checkpoints.insert(next.topic_partition, next);
+            Ok(DurableSinkApply::Applied)
+        }
+    }
+
+    impl DurableAppendSinkFactory for RecordingSinkFactory {
+        fn validate_append(&self, payload: &[u8], _record_count: NonZeroU32) -> EngineResult<()> {
+            if payload == b"reject" {
+                return Err(EngineError::InvalidConfig(
+                    "recording sink rejected append".into(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn load_checkpoint(
+            &self,
+            topic_partition: TopicPartition,
+        ) -> EngineResult<Option<DurableSinkCheckpoint>> {
+            Ok(self
+                .control
+                .state
+                .lock()
+                .map_err(|_| EngineError::CorruptState("recording sink lock poisoned".into()))?
+                .checkpoints
+                .get(&topic_partition)
+                .copied())
+        }
+
+        fn open_shard(&self, _shard_id: ShardId) -> EngineResult<Arc<dyn DurableAppendSink>> {
+            Ok(Arc::new(RecordingSink {
+                control: Arc::clone(&self.control),
+            }))
+        }
+
+        fn pending_atomic_groups(&self) -> EngineResult<Vec<DurableAtomicGroup>> {
+            Ok(self
+                .control
+                .state
+                .lock()
+                .map_err(|_| EngineError::CorruptState("recording sink lock poisoned".into()))?
+                .staged
+                .iter()
+                .copied()
+                .collect())
+        }
+
+        fn supports_committed_only(&self) -> bool {
+            true
+        }
+
+        fn finalize_atomic_group(&self, decision: DurableAtomicDecision) -> EngineResult<()> {
+            let mut state =
+                self.control.state.lock().map_err(|_| {
+                    EngineError::CorruptState("recording sink lock poisoned".into())
+                })?;
+            state.staged.remove(&decision.group);
+            if !state.decisions.contains(&decision) {
+                state.decisions.push(decision);
+            }
+            Ok(())
+        }
+    }
+
+    fn recording_sink_config(
+        control: &Arc<RecordingSinkControl>,
+        options: DurableSinkOptions,
+    ) -> DurableSinkConfig {
+        DurableSinkConfig::new(Arc::new(RecordingSinkFactory {
+            control: Arc::clone(control),
+        }))
+        .with_options(options)
+    }
+
+    fn wait_for_test(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !condition() {
+            assert!(Instant::now() < deadline, "condition did not become true");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     #[derive(Debug)]
     struct ExactEpochFence;
 
@@ -1625,6 +2201,642 @@ mod tests {
             chunk_sequence,
         });
         request
+    }
+
+    #[test]
+    fn partition_affine_topics_keep_each_partition_on_one_distributed_lane() {
+        let temp = TempDir::new("partition-affine-topic");
+        let engine = StreamEngine::open(config(&temp.0)).expect("open engine");
+        engine
+            .create_partition_affine_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 6,
+                shards: None,
+            })
+            .expect("create partition-affine topic");
+
+        for partition_id in 0..6 {
+            for append_index in 0..2 {
+                let mut request = append_request(
+                    u128::from(partition_id * 2 + append_index + 1),
+                    b"record",
+                    None,
+                );
+                request.partition_id = LogicalPartitionId::new(partition_id);
+                let appended = engine.append(request).expect("append");
+                assert_eq!(
+                    appended.placement.virtual_lane_id,
+                    ShardId::new(partition_id % 3)
+                );
+            }
+        }
+        drop(engine);
+
+        let recovered = StreamEngine::open(config(&temp.0)).expect("recover engine");
+        recovered
+            .create_partition_affine_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 6,
+                shards: None,
+            })
+            .expect("idempotently recover partition-affine topic");
+        let mut request = append_request(100, b"recovered", None);
+        request.partition_id = LogicalPartitionId::new(4);
+        let appended = recovered.append(request).expect("append after recovery");
+        assert_eq!(appended.placement.virtual_lane_id, ShardId::new(1));
+    }
+
+    #[test]
+    fn durable_sink_validates_orders_maps_physical_shards_and_retries_failures() {
+        let temp = TempDir::new("durable-sink-live");
+        let control = Arc::new(RecordingSinkControl {
+            failures_remaining: AtomicUsize::new(1),
+            panic_once: AtomicBool::new(true),
+            ..RecordingSinkControl::default()
+        });
+        let mut engine_config = config(&temp.0);
+        engine_config.shard_count = 1;
+        engine_config.virtual_lane_count = 4;
+        let engine = StreamEngine::open_with_durable_sink(
+            engine_config,
+            recording_sink_config(&control, DurableSinkOptions::default()),
+        )
+        .expect("open with sink");
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("create topic");
+
+        engine
+            .append(append_request(1, b"first", None))
+            .expect("sink failure cannot reverse durable append");
+        engine
+            .append(append_request(2, b"second", None))
+            .expect("second append");
+        assert!(matches!(
+            engine.append(append_request(3, b"reject", None)),
+            Err(EngineError::InvalidConfig(_))
+        ));
+
+        wait_for_test(|| {
+            control
+                .state
+                .lock()
+                .expect("state")
+                .checkpoints
+                .values()
+                .any(|checkpoint| checkpoint.next_offset == LogicalOffset::new(2))
+        });
+        let state = control.state.lock().expect("state");
+        assert_eq!(
+            state
+                .appends
+                .iter()
+                .map(|append| append.payload.as_ref())
+                .collect::<Vec<_>>(),
+            vec![b"first".as_slice(), b"second".as_slice()]
+        );
+        assert!(
+            state
+                .appends
+                .iter()
+                .all(|append| append.physical_shard_id == ShardId::new(0))
+        );
+        assert_eq!(
+            state
+                .appends
+                .iter()
+                .map(|append| append.reservation.placement.sequence.get())
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        drop(state);
+        let stats = engine.durable_sink_stats();
+        assert!(stats.failed_attempts >= 2);
+        assert!(stats.retry_attempts >= 1);
+        assert_eq!(engine.fetch(fetch_request(0)).expect("fetch").len(), 2);
+    }
+
+    #[test]
+    fn transient_sink_context_is_forwarded_bounded_and_not_authoritative() {
+        let temp = TempDir::new("durable-sink-transient-context");
+        let control = Arc::new(RecordingSinkControl {
+            block: AtomicBool::new(true),
+            ..RecordingSinkControl::default()
+        });
+        let engine = StreamEngine::open_with_durable_sink(
+            config(&temp.0),
+            recording_sink_config(&control, DurableSinkOptions::default()),
+        )
+        .expect("open with sink");
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("create topic");
+
+        let payload = Bytes::from_static(b"stored");
+        let context = Bytes::from_static(b"already-decoded");
+        engine
+            .append_with_durable_sink_context(append_request(1, &payload, None), context.clone())
+            .expect("authoritative append is durable");
+        wait_for_test(|| control.entered.load(Ordering::Acquire));
+        assert_eq!(
+            engine.durable_sink_stats().pending_bytes,
+            (payload.len() + context.len()) as u64
+        );
+
+        control.block.store(false, Ordering::Release);
+        wait_for_test(|| engine.durable_sink_stats().pending_items == 0);
+        let state = control.state.lock().expect("state");
+        assert_eq!(state.appends.len(), 1);
+        assert_eq!(state.appends[0].payload, payload);
+        assert_eq!(
+            state.appends[0].transient_context.as_deref(),
+            Some(context.as_ref())
+        );
+        drop(state);
+
+        let fetched = engine
+            .fetch(fetch_request(0))
+            .expect("stored payload fetches");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].payload, payload);
+    }
+
+    #[test]
+    fn durable_sink_replays_wal_written_before_sink_installation() {
+        let temp = TempDir::new("durable-sink-replay");
+        let engine_config = config(&temp.0);
+        {
+            let engine = StreamEngine::open(engine_config.clone()).expect("open without sink");
+            engine
+                .create_topic(TopicConfig {
+                    topic_id: TopicId::new(1),
+                    partitions: 1,
+                    shards: None,
+                })
+                .expect("create topic");
+            engine
+                .append(append_request(1, b"before-install", None))
+                .expect("append");
+        }
+
+        let control = Arc::new(RecordingSinkControl::default());
+        let engine = StreamEngine::open_with_durable_sink(
+            engine_config,
+            recording_sink_config(&control, DurableSinkOptions::default()),
+        )
+        .expect("reopen with sink");
+        let checkpoint = engine
+            .durable_sink_checkpoint(TopicPartition::new(
+                TopicId::new(1),
+                LogicalPartitionId::new(0),
+            ))
+            .expect("checkpoint")
+            .expect("sink installed");
+        assert_eq!(checkpoint.next_offset, LogicalOffset::new(1));
+        let state = control.state.lock().expect("state");
+        assert_eq!(state.appends.len(), 1);
+        assert_eq!(state.appends[0].payload.as_ref(), b"before-install");
+        assert!(state.appends[0].transient_context.is_none());
+    }
+
+    #[test]
+    fn promoted_replica_replays_missing_cluster_sink_event() {
+        let temp = TempDir::new("durable-sink-promotion");
+        let follower_path = temp.0.join("follower");
+        let leader_path = temp.0.join("leader");
+        let mut follower_config = config(&follower_path);
+        follower_config.replication_factor = 1;
+        let follower = Arc::new(StreamEngine::open(follower_config.clone()).expect("follower"));
+        follower
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("follower topic");
+
+        let mut leader_config = config(&leader_path);
+        leader_config.replication_factor = 2;
+        leader_config.min_in_sync_replicas = 2;
+        let transport: Arc<dyn ReplicationTransport> = Arc::new(DirectReplication {
+            follower: Arc::clone(&follower),
+            fail_first: AtomicBool::new(false),
+            progress: OnceLock::new(),
+        });
+        {
+            let leader =
+                StreamEngine::open_with_replication(leader_config, transport).expect("leader");
+            leader
+                .create_topic(TopicConfig {
+                    topic_id: TopicId::new(1),
+                    partitions: 1,
+                    shards: None,
+                })
+                .expect("leader topic");
+            let mut request = append_request(1, b"survives-failover", None);
+            request.durability = Durability::AllReplicas;
+            leader.append(request).expect("replicated append");
+        }
+        drop(follower);
+
+        let control = Arc::new(RecordingSinkControl::default());
+        let promoted = StreamEngine::open_with_durable_sink(
+            follower_config,
+            recording_sink_config(&control, DurableSinkOptions::default()),
+        )
+        .expect("promoted follower");
+        assert_eq!(promoted.durable_sink_stats().pending_items, 0);
+        let state = control.state.lock().expect("state");
+        assert_eq!(state.appends.len(), 1);
+        assert_eq!(state.appends[0].payload.as_ref(), b"survives-failover");
+    }
+
+    #[test]
+    fn committed_only_sink_stages_then_finalizes_atomic_groups() {
+        let temp = TempDir::new("durable-sink-atomic");
+        let control = Arc::new(RecordingSinkControl::default());
+        let options = DurableSinkOptions {
+            atomic_visibility: crate::DurableSinkAtomicVisibility::CommittedOnly,
+            ..DurableSinkOptions::default()
+        };
+        let engine = StreamEngine::open_with_durable_sink(
+            config(&temp.0),
+            recording_sink_config(&control, options),
+        )
+        .expect("open");
+        let partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("topic");
+        engine
+            .append(atomic_request(1, 91, 0, b"atomic"))
+            .expect("atomic append");
+        wait_for_test(|| !control.state.lock().expect("state").staged.is_empty());
+        assert_eq!(
+            control.state.lock().expect("state").appends[0].delivery,
+            DurableAppendDelivery::Stage
+        );
+        engine
+            .commit_atomic_group(partition, 91)
+            .expect("commit group");
+        wait_for_test(|| {
+            control
+                .state
+                .lock()
+                .expect("state")
+                .decisions
+                .iter()
+                .any(|decision| decision.outcome == AtomicGroupState::Committed)
+        });
+        assert!(control.state.lock().expect("state").staged.is_empty());
+    }
+
+    #[test]
+    fn durable_sink_checkpoint_pins_retention_until_delivery() {
+        let temp = TempDir::new("durable-sink-retention");
+        let control = Arc::new(RecordingSinkControl {
+            block: AtomicBool::new(true),
+            ..RecordingSinkControl::default()
+        });
+        let options = DurableSinkOptions {
+            recovery_timeout: Duration::from_millis(100),
+            ..DurableSinkOptions::default()
+        };
+        let engine = StreamEngine::open_with_durable_sink(
+            config(&temp.0),
+            recording_sink_config(&control, options),
+        )
+        .expect("open");
+        let partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("topic");
+        engine
+            .append(append_request(1, b"pinned", None))
+            .expect("append");
+        wait_for_test(|| control.entered.load(Ordering::Acquire));
+        assert!(matches!(
+            engine.truncate_partition(partition, LogicalOffset::new(1)),
+            Err(EngineError::RetentionPinned { .. })
+        ));
+        control.block.store(false, Ordering::Release);
+        wait_for_test(|| {
+            control
+                .state
+                .lock()
+                .expect("state")
+                .checkpoints
+                .get(&partition)
+                .is_some_and(|checkpoint| checkpoint.next_offset == LogicalOffset::new(1))
+        });
+        engine
+            .truncate_partition(partition, LogicalOffset::new(1))
+            .expect("retention advances after checkpoint");
+    }
+
+    #[test]
+    fn durable_sink_retries_nonadvancing_conflicts_and_accepts_external_commit() {
+        let temp = TempDir::new("durable-sink-conflicts");
+        let control = Arc::new(RecordingSinkControl {
+            stale_conflicts_remaining: AtomicUsize::new(1),
+            advancing_conflict_once: AtomicBool::new(true),
+            ..RecordingSinkControl::default()
+        });
+        let engine = StreamEngine::open_with_durable_sink(
+            config(&temp.0),
+            recording_sink_config(&control, DurableSinkOptions::default()),
+        )
+        .expect("open");
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("topic");
+        engine
+            .append(append_request(1, b"one-logical-event", None))
+            .expect("append");
+
+        wait_for_test(|| {
+            control
+                .state
+                .lock()
+                .expect("state")
+                .checkpoints
+                .values()
+                .any(|checkpoint| checkpoint.next_offset == LogicalOffset::new(1))
+        });
+        assert_eq!(control.state.lock().expect("state").appends.len(), 1);
+        let stats = engine.durable_sink_stats();
+        assert_eq!(stats.checkpoint_conflicts, 1);
+        assert!(stats.failed_attempts >= 1);
+    }
+
+    #[test]
+    fn durable_sink_retry_backoff_does_not_stall_healthy_partitions() {
+        let temp = TempDir::new("durable-sink-retry-isolation");
+        let failed_partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        let healthy_partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(1));
+        let control = Arc::new(RecordingSinkControl {
+            failed_partition: Mutex::new(Some(failed_partition)),
+            ..RecordingSinkControl::default()
+        });
+        let options = DurableSinkOptions {
+            worker_count: 1,
+            ..DurableSinkOptions::default()
+        };
+        let engine = StreamEngine::open_with_durable_sink(
+            config(&temp.0),
+            recording_sink_config(&control, options),
+        )
+        .expect("open");
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 2,
+                shards: None,
+            })
+            .expect("topic");
+        engine
+            .append(append_request(1, b"permanently-failing", None))
+            .expect("durable failed-partition append");
+        wait_for_test(|| engine.durable_sink_stats().retry_attempts >= 6);
+
+        let mut healthy = append_request(2, b"healthy", None);
+        healthy.partition_id = LogicalPartitionId::new(1);
+        let started = Instant::now();
+        engine.append(healthy).expect("durable healthy append");
+        wait_for_test(|| {
+            control
+                .state
+                .lock()
+                .expect("state")
+                .checkpoints
+                .get(&healthy_partition)
+                .is_some_and(|checkpoint| checkpoint.next_offset == LogicalOffset::new(1))
+        });
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "failed partition retry backoff stalled a healthy partition"
+        );
+    }
+
+    #[test]
+    fn availability_mode_drops_only_notification_and_rescans_retained_wal() {
+        let temp = TempDir::new("durable-sink-availability");
+        let control = Arc::new(RecordingSinkControl {
+            block: AtomicBool::new(true),
+            ..RecordingSinkControl::default()
+        });
+        let options = DurableSinkOptions {
+            lag_policy: crate::DurableSinkLagPolicy::Availability,
+            max_pending_items: 1,
+            ..DurableSinkOptions::default()
+        };
+        let engine = StreamEngine::open_with_durable_sink(
+            config(&temp.0),
+            recording_sink_config(&control, options),
+        )
+        .expect("open");
+        let partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("topic");
+        engine
+            .append(append_request(1, b"queued", None))
+            .expect("first append");
+        wait_for_test(|| control.entered.load(Ordering::Acquire));
+        engine
+            .append(append_request(2, b"rescan", None))
+            .expect("availability append");
+        assert_eq!(engine.durable_sink_stats().dirty_partitions, 1);
+        assert_eq!(engine.durable_sink_stats().dropped_notifications, 1);
+
+        control.block.store(false, Ordering::Release);
+        engine
+            .resume_durable_sink(&[partition])
+            .expect("rescan retained WAL");
+        let state = control.state.lock().expect("state");
+        assert_eq!(
+            state
+                .appends
+                .iter()
+                .map(|append| append.payload.as_ref())
+                .collect::<Vec<_>>(),
+            vec![b"queued".as_slice(), b"rescan".as_slice()]
+        );
+        drop(state);
+        assert_eq!(engine.durable_sink_stats().dirty_partitions, 0);
+    }
+
+    #[test]
+    fn backpressure_happens_before_reserving_an_offset() {
+        let temp = TempDir::new("durable-sink-backpressure");
+        let control = Arc::new(RecordingSinkControl {
+            block: AtomicBool::new(true),
+            ..RecordingSinkControl::default()
+        });
+        let options = DurableSinkOptions {
+            max_pending_items: 1,
+            ..DurableSinkOptions::default()
+        };
+        let engine = Arc::new(
+            StreamEngine::open_with_durable_sink(
+                config(&temp.0),
+                recording_sink_config(&control, options),
+            )
+            .expect("open"),
+        );
+        let partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("topic");
+        engine
+            .append(append_request(1, b"blocked-sink", None))
+            .expect("first append");
+        wait_for_test(|| control.entered.load(Ordering::Acquire));
+
+        let second_engine = Arc::clone(&engine);
+        let second =
+            std::thread::spawn(move || second_engine.append(append_request(2, b"later", None)));
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            engine
+                .watermarks(partition)
+                .expect("watermarks")
+                .allocated_end,
+            LogicalOffset::new(1)
+        );
+        control.block.store(false, Ordering::Release);
+        second
+            .join()
+            .expect("append thread")
+            .expect("second append");
+        wait_for_test(|| {
+            control
+                .state
+                .lock()
+                .expect("state")
+                .checkpoints
+                .get(&partition)
+                .is_some_and(|checkpoint| checkpoint.next_offset == LogicalOffset::new(2))
+        });
+    }
+
+    #[test]
+    fn durable_sink_shutdown_is_bounded_when_callback_hangs() {
+        let temp = TempDir::new("durable-sink-shutdown");
+        let control = Arc::new(RecordingSinkControl {
+            block: AtomicBool::new(true),
+            ..RecordingSinkControl::default()
+        });
+        let engine = StreamEngine::open_with_durable_sink(
+            config(&temp.0),
+            recording_sink_config(&control, DurableSinkOptions::default()),
+        )
+        .expect("open");
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("topic");
+        engine
+            .append(append_request(1, b"unfinished", None))
+            .expect("append");
+        wait_for_test(|| control.entered.load(Ordering::Acquire));
+
+        let started = Instant::now();
+        drop(engine);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "engine destruction waited for sink callback"
+        );
+        control.block.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn durable_sink_sequences_concurrent_cross_shard_completions() {
+        let temp = TempDir::new("durable-sink-cross-shard-order");
+        let control = Arc::new(RecordingSinkControl::default());
+        let engine = Arc::new(
+            StreamEngine::open_with_durable_sink(
+                config(&temp.0),
+                recording_sink_config(&control, DurableSinkOptions::default()),
+            )
+            .expect("open"),
+        );
+        let partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("topic");
+
+        std::thread::scope(|scope| {
+            for worker in 0..8_u128 {
+                let engine = Arc::clone(&engine);
+                scope.spawn(move || {
+                    for sequence in 0..16_u128 {
+                        let request_id = worker * 16 + sequence;
+                        engine
+                            .append(append_request(request_id, &request_id.to_le_bytes(), None))
+                            .expect("concurrent append");
+                    }
+                });
+            }
+        });
+        engine
+            .resume_durable_sink(&[partition])
+            .expect("wait for ordered sink");
+
+        let state = control.state.lock().expect("state");
+        assert_eq!(state.appends.len(), 128);
+        assert_eq!(
+            state
+                .appends
+                .iter()
+                .map(|append| append.reservation.placement.sequence.get())
+                .collect::<Vec<_>>(),
+            (0..128).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            state
+                .appends
+                .iter()
+                .map(|append| append.event_id)
+                .collect::<HashSet<_>>()
+                .len(),
+            128
+        );
     }
 
     #[test]
@@ -2848,6 +4060,56 @@ mod tests {
             engine.fetch(fetch_request(2)).expect("retained fetch")[0].payload,
             vec![3]
         );
+    }
+
+    #[test]
+    fn recovery_applies_log_start_before_validating_a_fully_reclaimed_prefix() {
+        let temp = TempDir::new("retention-empty-prefix-recovery");
+        let mut engine_config = config(&temp.0);
+        engine_config.shard_count = 1;
+        engine_config.target_pack_bytes = 1;
+        let topic_partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        {
+            let engine = StreamEngine::open(engine_config.clone()).expect("open");
+            engine
+                .create_topic(TopicConfig {
+                    topic_id: TopicId::new(1),
+                    partitions: 1,
+                    shards: None,
+                })
+                .expect("create");
+            for request_id in 1..=2 {
+                engine
+                    .append(append_request(request_id, &[request_id as u8], None))
+                    .expect("append");
+            }
+            engine.sync().expect("sync");
+        }
+        {
+            // Reopen first so both tiny source packs are immutable and the
+            // retention pass can physically remove the complete prefix.
+            let engine = StreamEngine::open(engine_config.clone()).expect("reopen before truncate");
+            let watermarks = engine
+                .truncate_partition(topic_partition, LogicalOffset::new(2))
+                .expect("truncate complete prefix");
+            assert_eq!(watermarks.log_start, LogicalOffset::new(2));
+            assert_eq!(watermarks.last_stable_offset, LogicalOffset::new(2));
+        }
+
+        let engine = StreamEngine::open(engine_config).expect("reopen reclaimed prefix");
+        let watermarks = engine.watermarks(topic_partition).expect("watermarks");
+        assert_eq!(watermarks.log_start, LogicalOffset::new(2));
+        assert_eq!(watermarks.last_stable_offset, LogicalOffset::new(2));
+        assert!(
+            engine
+                .fetch(fetch_request(2))
+                .expect("empty tail")
+                .is_empty()
+        );
+        let response = engine
+            .append(append_request(3, b"after-retention", None))
+            .expect("append resumes after retained offset");
+        assert_eq!(response.first_offset, LogicalOffset::new(2));
     }
 
     #[test]

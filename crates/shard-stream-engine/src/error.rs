@@ -39,6 +39,8 @@ pub enum EngineError {
     },
     ReplicaInFlight(BatchId),
     ObjectDurabilityUnavailable,
+    DurableSinkUnavailable(String),
+    DurableSinkCheckpoint(String),
     Fenced(String),
     OffsetOutOfRange {
         requested: LogicalOffset,
@@ -78,7 +80,9 @@ impl EngineError {
     pub const fn is_corruption(&self) -> bool {
         matches!(
             self,
-            Self::CorruptState(_) | Self::Storage(StorageError::Corrupt { .. })
+            Self::DurableSinkCheckpoint(_)
+                | Self::CorruptState(_)
+                | Self::Storage(StorageError::Corrupt { .. })
         )
     }
 }
@@ -136,6 +140,12 @@ impl fmt::Display for EngineError {
                     formatter,
                     "object-store durability is temporarily unavailable"
                 )
+            }
+            Self::DurableSinkUnavailable(message) => {
+                write!(formatter, "durable sink unavailable: {message}")
+            }
+            Self::DurableSinkCheckpoint(message) => {
+                write!(formatter, "invalid durable sink checkpoint: {message}")
             }
             Self::Fenced(message) => write!(formatter, "writer fenced: {message}"),
             Self::OffsetOutOfRange {

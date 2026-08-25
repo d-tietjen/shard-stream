@@ -1253,9 +1253,9 @@ fn engine_error(error: EngineError) -> ResponseError {
         | EngineError::ReplicaReorderLimited { .. }
         | EngineError::ReplicaBufferLimited { .. }
         | EngineError::ReplicaInFlight(_) => ResponseError::ThrottlingQuotaExceeded,
-        EngineError::WorkerStopped(_) | EngineError::ObjectDurabilityUnavailable => {
-            ResponseError::NotEnoughReplicas
-        }
+        EngineError::WorkerStopped(_)
+        | EngineError::ObjectDurabilityUnavailable
+        | EngineError::DurableSinkUnavailable(_) => ResponseError::NotEnoughReplicas,
         EngineError::DurabilityUnavailable { .. } => ResponseError::NotEnoughReplicasAfterAppend,
         EngineError::OffsetOutOfRange { .. } => ResponseError::OffsetOutOfRange,
         EngineError::RetentionPinned { .. } => ResponseError::PolicyViolation,
@@ -1272,7 +1272,9 @@ fn engine_error(error: EngineError) -> ResponseError {
         | EngineError::AtomicGroupSequenceOutOfOrder { .. }
         | EngineError::AtomicGroupChunkMismatch(_)
         | EngineError::Sequencer(_) => ResponseError::InvalidRequest,
-        EngineError::CorruptState(_) | EngineError::Storage(_) => ResponseError::UnknownServerError,
+        EngineError::DurableSinkCheckpoint(_)
+        | EngineError::CorruptState(_)
+        | EngineError::Storage(_) => ResponseError::UnknownServerError,
     }
 }
 

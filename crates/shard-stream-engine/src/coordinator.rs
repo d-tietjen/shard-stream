@@ -712,6 +712,31 @@ impl CoordinatorPool {
         Ok(())
     }
 
+    pub(crate) fn create_partition_affine_topic(
+        &self,
+        topic: TopicConfig,
+        shards: Vec<ShardId>,
+        replication_policy: PartitionReplicationPolicy,
+    ) -> EngineResult<()> {
+        for partition_id in 0..topic.partitions {
+            let topic_partition =
+                TopicPartition::new(topic.topic_id, LogicalPartitionId::new(partition_id));
+            let owner = shards[partition_id as usize % shards.len()];
+            let (response, receiver) = sync_channel(1);
+            self.send(
+                topic_partition,
+                CoordinatorCommand::Create {
+                    topic_partition,
+                    shards: vec![owner],
+                    replication_policy,
+                    response,
+                },
+            )?;
+            receive(receiver)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn router(&self) -> CoordinatorRouter {
         CoordinatorRouter {
             senders: self
@@ -2138,9 +2163,35 @@ fn truncate(
     if log_start == state.log_start {
         return Ok(watermarks);
     }
-    journal.append(JournalEvent::Truncate {
+    let sequencer = state.sequencer.state();
+    let (next_batch_id, next_offset, next_placement_sequence) =
+        state.batches.get(first_retained).map_or_else(
+            || {
+                (
+                    BatchId::new(sequencer.next_batch_id),
+                    LogicalOffset::new(sequencer.next_offset),
+                    PlacementSequence::new(sequencer.next_placement_sequence),
+                )
+            },
+            |first| {
+                (
+                    first.reservation.batch_id,
+                    first.reservation.first_offset,
+                    first.reservation.placement.sequence,
+                )
+            },
+        );
+    if next_offset != log_start {
+        return Err(EngineError::InvalidConfig(
+            "retention cannot discard an unresolved sequencer tail".into(),
+        ));
+    }
+    journal.append(JournalEvent::TruncateCheckpoint {
         topic_partition,
         log_start,
+        next_batch_id,
+        next_offset,
+        next_placement_sequence,
     })?;
     state.log_start = log_start;
     state.batches.truncate_before(first_retained);
@@ -2328,18 +2379,31 @@ fn mark_batch(
 pub(crate) fn retention_hints(events: &[JournalEvent]) -> HashMap<TopicPartition, LogicalOffset> {
     let mut hints = HashMap::new();
     for event in events {
-        if let JournalEvent::Truncate {
-            topic_partition,
-            log_start,
-        } = event
-        {
-            hints
-                .entry(*topic_partition)
-                .and_modify(|current: &mut LogicalOffset| *current = (*current).max(*log_start))
-                .or_insert(*log_start);
+        match event {
+            JournalEvent::Truncate {
+                topic_partition,
+                log_start,
+            }
+            | JournalEvent::TruncateCheckpoint {
+                topic_partition,
+                log_start,
+                ..
+            } => {
+                hints
+                    .entry(*topic_partition)
+                    .and_modify(|current: &mut LogicalOffset| *current = (*current).max(*log_start))
+                    .or_insert(*log_start);
+            }
+            _ => {}
         }
     }
     hints
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RecoveredTruncation {
+    log_start: LogicalOffset,
+    sequencer_floor: Option<(u128, u64, u64)>,
 }
 
 fn record_recovered_group_outcome(
@@ -2377,7 +2441,7 @@ pub(crate) fn recover_partition_states(
     }
     let mut rings: HashMap<TopicPartition, BTreeMap<RingEpoch, Vec<ShardId>>> = HashMap::new();
     let mut replication_policies = HashMap::new();
-    let mut log_starts = HashMap::new();
+    let mut truncations: HashMap<TopicPartition, RecoveredTruncation> = HashMap::new();
     let mut group_outcomes = HashMap::new();
     for event in events {
         match event {
@@ -2475,9 +2539,9 @@ pub(crate) fn recover_partition_states(
                         topic_partition.topic_id, topic_partition.partition_id
                     )));
                 }
-                let previous = log_starts
+                let previous = truncations
                     .get(topic_partition)
-                    .copied()
+                    .map(|checkpoint| checkpoint.log_start)
                     .unwrap_or(LogicalOffset::new(0));
                 if *log_start < previous {
                     return Err(EngineError::CorruptState(format!(
@@ -2485,7 +2549,51 @@ pub(crate) fn recover_partition_states(
                         topic_partition.topic_id, topic_partition.partition_id
                     )));
                 }
-                log_starts.insert(*topic_partition, *log_start);
+                truncations.insert(
+                    *topic_partition,
+                    RecoveredTruncation {
+                        log_start: *log_start,
+                        sequencer_floor: None,
+                    },
+                );
+            }
+            JournalEvent::TruncateCheckpoint {
+                topic_partition,
+                log_start,
+                next_batch_id,
+                next_offset,
+                next_placement_sequence,
+            } => {
+                if !rings.contains_key(topic_partition) {
+                    return Err(EngineError::CorruptState(format!(
+                        "retention checkpoint for unconfigured partition {}/{}",
+                        topic_partition.topic_id, topic_partition.partition_id
+                    )));
+                }
+                let previous = truncations
+                    .get(topic_partition)
+                    .map(|checkpoint| checkpoint.log_start)
+                    .unwrap_or(LogicalOffset::new(0));
+                if *log_start < previous
+                    || next_offset < log_start
+                    || next_batch_id.get() != u128::from(next_placement_sequence.get())
+                {
+                    return Err(EngineError::CorruptState(format!(
+                        "invalid retention checkpoint for {}/{}",
+                        topic_partition.topic_id, topic_partition.partition_id
+                    )));
+                }
+                truncations.insert(
+                    *topic_partition,
+                    RecoveredTruncation {
+                        log_start: *log_start,
+                        sequencer_floor: Some((
+                            next_batch_id.get(),
+                            next_offset.get(),
+                            next_placement_sequence.get(),
+                        )),
+                    },
+                );
             }
             JournalEvent::GroupCommit {
                 topic_partition,
@@ -2541,6 +2649,25 @@ pub(crate) fn recover_partition_states(
         replication_policy.validate(config.replication_factor)?;
         let partition_recovered_durable_replicas =
             recovered_durable_replicas.min(replication_policy.replication_factor);
+        let truncation = truncations
+            .remove(&topic_partition)
+            .unwrap_or(RecoveredTruncation {
+                log_start: LogicalOffset::new(0),
+                sequencer_floor: None,
+            });
+        let recovered_log_start = truncation.log_start;
+        let (mut next_batch_id, mut next_offset, mut next_placement_sequence) =
+            truncation.sequencer_floor.unwrap_or((0, 0, 0));
+        if next_offset > recovered_log_start.get()
+            && entries
+                .first()
+                .is_none_or(|entry| entry.reservation.first_offset.get() != next_offset)
+        {
+            return Err(EngineError::CorruptState(format!(
+                "retention checkpoint has no retained boundary for {}/{}",
+                topic_partition.topic_id, topic_partition.partition_id
+            )));
+        }
         let mut state = PartitionState::empty(
             TopicSequencer::new(
                 topic_partition.topic_id,
@@ -2550,9 +2677,16 @@ pub(crate) fn recover_partition_states(
             )?,
             replication_policy,
         );
-        let mut next_batch_id = 0u128;
-        let mut next_offset = 0u64;
-        let mut next_placement_sequence = 0u64;
+        if truncation.sequencer_floor.is_some() {
+            state.batches = DenseOrderedMap::new(next_batch_id);
+            state.log_start = recovered_log_start;
+            state.next_contiguous_batch = next_batch_id;
+            state.contiguous_log_end = recovered_log_start;
+            state.next_stable_batch = next_batch_id;
+            state.last_stable_offset = recovered_log_start;
+            state.next_replicated_batch = next_batch_id;
+            state.replicated_high_watermark = recovered_log_start;
+        }
 
         for entry in entries {
             let reservation = entry.reservation;
@@ -2676,17 +2810,17 @@ pub(crate) fn recover_partition_states(
             next_offset,
             next_placement_sequence,
         })?;
-        let recovered_log_start = log_starts
-            .get(&topic_partition)
-            .copied()
-            .unwrap_or(LogicalOffset::new(0));
-        let contiguous_end = state.watermarks().contiguous_log_end;
-        let first_retained = if recovered_log_start == contiguous_end {
+        // Retained packs may begin above offset zero, so contiguity cannot be
+        // calculated correctly until the durable log start has been applied.
+        // Use the recovered sequencer extent to locate the retained boundary,
+        // then rebuild all watermarks from that boundary below.
+        let allocated_end = state.sequencer.next_offset();
+        let first_retained = if recovered_log_start == allocated_end {
             Some(state.batches.next_key())
         } else {
             state.batch_key_at_first_offset(recovered_log_start)
         };
-        if recovered_log_start > contiguous_end || first_retained.is_none() {
+        if recovered_log_start > allocated_end || first_retained.is_none() {
             return Err(EngineError::CorruptState(format!(
                 "invalid recovered log start {recovered_log_start} for {}/{}",
                 topic_partition.topic_id, topic_partition.partition_id
