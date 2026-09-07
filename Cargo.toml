@@ -17,7 +17,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Devon Tietjen <devon@eden.dev>"]
 homepage = "https://github.com/d-tietjen/shard-stream"
@@ -41,7 +41,7 @@ fast-telemetry = "0.9.0"
 fast-telemetry-export = { version = "0.9.0", default-features = false }
 fs2 = "0.4"
 hashbrown = { version = "0.17.1", default-features = false, features = ["inline-more"] }
-ordered-segment-map = { path = "crates/ordered-segment-map", version = "0.1.0" }
+ordered-segment-map = { path = "crates/ordered-segment-map", version = "0.2.0" }
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
@@ -59,14 +59,14 @@ rustls-pemfile = "2.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_urlencoded = "0.7"
-shard-stream-client = { path = "crates/shard-stream-client", version = "0.1.0" }
-shard-stream-core = { path = "crates/shard-stream-core", version = "0.1.0" }
-shard-stream-engine = { path = "crates/shard-stream-engine", version = "0.1.0" }
-shard-stream-kafka = { path = "crates/shard-stream-kafka", version = "0.1.0" }
-shard-stream-protocol = { path = "crates/shard-stream-protocol", version = "0.1.0" }
-shard-stream-runtime = { path = "crates/shard-stream-runtime", version = "0.1.0" }
-shard-stream-storage = { path = "crates/shard-stream-storage", version = "0.1.0" }
-shardlog = { path = "crates/shardlog", version = "0.1.0" }
+shard-stream-client = { path = "crates/shard-stream-client", version = "0.2.0" }
+shard-stream-core = { path = "crates/shard-stream-core", version = "0.2.0" }
+shard-stream-engine = { path = "crates/shard-stream-engine", version = "0.2.0" }
+shard-stream-kafka = { path = "crates/shard-stream-kafka", version = "0.2.0" }
+shard-stream-protocol = { path = "crates/shard-stream-protocol", version = "0.2.0" }
+shard-stream-runtime = { path = "crates/shard-stream-runtime", version = "0.2.0" }
+shard-stream-storage = { path = "crates/shard-stream-storage", version = "0.2.0" }
+shardlog = { path = "crates/shardlog", version = "0.2.0" }
 tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-stream = { version = "0.1", features = ["net"] }
