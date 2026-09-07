@@ -1301,7 +1301,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "ordered-segment-map"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hashbrown 0.17.1",
  "indexmap",
@@ -2018,7 +2018,7 @@ dependencies = [
 
 [[package]]
 name = "shard-stream-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -2036,7 +2036,7 @@ dependencies = [
 
 [[package]]
 name = "shard-stream-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "reqwest",
@@ -2048,7 +2048,7 @@ dependencies = [
 
 [[package]]
 name = "shard-stream-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "shardlog",
@@ -2056,7 +2056,7 @@ dependencies = [
 
 [[package]]
 name = "shard-stream-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "ordered-segment-map",
@@ -2068,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "shard-stream-grpc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "prost",
@@ -2086,7 +2086,7 @@ dependencies = [
 
 [[package]]
 name = "shard-stream-h3"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "eden_logger",
@@ -2108,7 +2108,7 @@ dependencies = [
 
 [[package]]
 name = "shard-stream-kafka"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2127,7 +2127,7 @@ dependencies = [
 
 [[package]]
 name = "shard-stream-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -2137,7 +2137,7 @@ dependencies = [
 
 [[package]]
 name = "shard-stream-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -2150,7 +2150,7 @@ dependencies = [
 
 [[package]]
 name = "shard-stream-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "bytes",
@@ -2170,14 +2170,14 @@ dependencies = [
 
 [[package]]
 name = "shard-stream-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "shardlog",
 ]
 
 [[package]]
 name = "shardlog"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "bytes",
