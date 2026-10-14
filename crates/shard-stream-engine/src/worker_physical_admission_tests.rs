@@ -177,7 +177,7 @@ impl Fixture {
 
     fn readback(&mut self) -> Vec<StoredBatch> {
         self.stop();
-        let store = ShardStore::open(ShardStoreConfig {
+        let mut store = ShardStore::open(ShardStoreConfig {
             directory: self.directory.clone(),
             shard_id: ShardId::new(0),
             target_pack_bytes: 64 * 1024,
