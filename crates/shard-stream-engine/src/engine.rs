@@ -823,7 +823,7 @@ impl StreamEngine {
             let epoch = batch.reservation.placement.leader_epoch.get();
             match source {
                 Some(source) => write_fence.prepare_replica_write(topic_partition, epoch, source),
-                None => write_fence.prepare_write(topic_partition, epoch),
+                None => write_fence.prepare_unbound_replica_write(topic_partition, epoch),
             }
             .map_err(|error| EngineError::Fenced(error.to_string()))
         })?;
@@ -2348,6 +2348,43 @@ mod tests {
                 ));
             }
             self.pending.prepare_write(partition, epoch)
+        }
+    }
+
+    #[derive(Debug)]
+    struct FixtureUnboundReplicaFence(FixturePendingFence);
+
+    impl WriteFence for FixtureUnboundReplicaFence {
+        fn check_write(
+            &self,
+            partition: TopicPartition,
+            epoch: u64,
+        ) -> Result<(), shard_stream_core::WriteFenceError> {
+            self.0.check_write(partition, epoch)
+        }
+
+        fn requires_physical_admission(&self) -> bool {
+            true
+        }
+
+        fn prepare_write(
+            &self,
+            partition: TopicPartition,
+            epoch: u64,
+        ) -> Result<Option<Arc<dyn PendingWriteAdmission>>, shard_stream_core::WriteFenceError>
+        {
+            self.0.prepare_write(partition, epoch)
+        }
+
+        fn prepare_unbound_replica_write(
+            &self,
+            _partition: TopicPartition,
+            _epoch: u64,
+        ) -> Result<Option<Arc<dyn PendingWriteAdmission>>, shard_stream_core::WriteFenceError>
+        {
+            Err(shard_stream_core::WriteFenceError::new(
+                "fixture replica requires authenticated sender context",
+            ))
         }
     }
 
@@ -3920,6 +3957,124 @@ mod tests {
                 .expect("unchanged WAL")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn unbound_replica_cannot_reuse_current_local_leader_permission() {
+        let directory = TempDir::new("unbound-current-leader");
+        let leader = StreamEngine::open_with_fence(
+            config(&directory.0.join("source")),
+            Arc::new(ExactEpochFence),
+        )
+        .expect("real source leader");
+        leader
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("source topic");
+        let mut request = append_request(1, b"actual reserved source payload", None);
+        request.leader_epoch = Some(7);
+        let receipt = leader.append(request).expect("actual source reservation");
+        let batch = ReplicaAppend {
+            reservation: Reservation {
+                topic_id: TopicId::new(1),
+                partition_id: LogicalPartitionId::new(0),
+                batch_id: receipt.batch_id,
+                first_offset: receipt.first_offset,
+                last_offset: receipt.last_offset,
+                record_count: NonZeroU32::new(1).expect("actual record count"),
+                placement: receipt.placement,
+            },
+            producer: None,
+            atomic_group: None,
+            extension_context: None,
+            payload_digest: [0; 16],
+            payload: Bytes::from_static(b"actual reserved source payload"),
+        };
+        let pending = Arc::new(FixturePendingAdmission::default());
+        let engine = Arc::new(
+            StreamEngine::open_with_fence(
+                config(&directory.0.join("local-leader")),
+                Arc::new(FixtureUnboundReplicaFence(FixturePendingFence {
+                    admission: pending.clone(),
+                    declared: true,
+                })),
+            )
+            .expect("actual guarded local leader"),
+        );
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("local topic");
+        let queue = crate::DurableApplyQueue::spawn(
+            engine.clone(),
+            crate::DurableApplyConfig {
+                worker_count: 1,
+                queue_slots_per_worker: 4,
+                max_pending_per_partition: 4,
+                max_gap_batches: 4,
+                max_pending_bytes_per_partition: 1024,
+            },
+        )
+        .expect("actual bounded replica queue");
+        let partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        let before = engine.watermarks(partition).expect("initial frontiers");
+        for _ in 0..2 {
+            let error = queue
+                .append(batch.clone())
+                .expect_err("replica needs its own admission path");
+            assert!(matches!(error, EngineError::Fenced(ref reason)
+                if reason.contains("authenticated sender context")));
+        }
+        let unverified_context = ReplicaSourceIdentity {
+            broker_id: shard_stream_core::BrokerId::new(9),
+            incarnation: 3,
+            credential_fingerprint: [5; 32],
+        };
+        let error = queue
+            .append_from_peer(batch, unverified_context)
+            .expect_err("default context handling cannot authenticate supplied fields");
+        assert!(matches!(error, EngineError::Fenced(ref reason)
+            if reason.contains("authenticated sender context")));
+        assert_eq!(
+            engine.watermarks(partition).expect("refused frontiers"),
+            before
+        );
+        assert!(
+            engine
+                .fetch(fetch_request(0))
+                .expect("refused WAL")
+                .is_empty()
+        );
+        assert_eq!(pending.physical_admissions.load(Ordering::Relaxed), 0);
+        assert_eq!(pending.active.load(Ordering::Acquire), 0);
+
+        let mut local = append_request(2, b"actual authorized local leader", None);
+        local.leader_epoch = Some(7);
+        let accepted = engine
+            .append(local)
+            .expect("local leader permission preserved");
+        assert_eq!(accepted.first_offset, LogicalOffset::new(0));
+        let mut later = append_request(3, b"continued local leader progress", None);
+        later.leader_epoch = Some(7);
+        let continued = engine.append(later).expect("later fitting append");
+        assert_eq!(continued.first_offset, LogicalOffset::new(1));
+        let fetched = engine.fetch(fetch_request(0)).expect("actual leader WAL");
+        assert_eq!(fetched.len(), 2);
+        assert_eq!(
+            fetched[0].payload,
+            Bytes::from_static(b"actual authorized local leader")
+        );
+        assert_eq!(fetched[0].placement, accepted.placement);
+        assert_eq!(pending.physical_admissions.load(Ordering::Relaxed), 2);
+        assert_eq!(pending.active.load(Ordering::Acquire), 0);
+        // The fixed fence qualifies role-specific engine routing, not a real
+        // TLS credential, controller lease or distributed authority.
     }
 
     #[test]

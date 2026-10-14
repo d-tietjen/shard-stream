@@ -67,8 +67,13 @@ limits; a host must bound its own ticket and guard allocations.
 from a verified transport to `prepare_replica_write`. Identity fields alone
 are not authentication or leader authority. The host must verify credential
 binding, sender membership, current remote-leader authority and the exact
-reservation lineage. Legacy replica entry points and default preparation
-retain their existing check-only behavior. A retransmitted old placement must
+reservation lineage. Replica entry points without verified context call
+`prepare_unbound_replica_write`, whose default preserves existing write
+preparation. A host requiring authenticated replica authority must explicitly
+refuse this path even while it has local-leader permission. The default
+context preparation also uses this unbound path because it does not verify
+the supplied fields. Existing check-only implementations remain compatible.
+A retransmitted old placement must
 be explicitly authorized as historical lineage or refused; it must never be
 restamped as a new current-term append. An exact duplicate acquires no new
 physical guard and retains its original persisted coordinates.

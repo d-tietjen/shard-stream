@@ -92,18 +92,34 @@ pub trait WriteFence: Send + Sync + fmt::Debug {
         Ok(None)
     }
 
+    /// Prepares a replica append without authenticated sender context.
+    ///
+    /// The default preserves existing implementations by using their write
+    /// preparation. A host requiring verified replica identity must refuse
+    /// this path explicitly, including when it is the current local leader.
+    /// Local-leader permission alone must not authenticate an incoming replica.
+    fn prepare_unbound_replica_write(
+        &self,
+        topic_partition: TopicPartition,
+        writer_epoch: u64,
+    ) -> Result<Option<Arc<dyn PendingWriteAdmission>>, WriteFenceError> {
+        self.prepare_write(topic_partition, writer_epoch)
+    }
+
     /// Prepares an authenticated replica append with trusted sender context.
     ///
     /// A host override verifies current remote-leader authority without granting
     /// a follower a local writable-leader lease. The default preserves the
-    /// existing leader check and does not authenticate the supplied context.
+    /// existing unbound preparation and does not authenticate the supplied
+    /// context. Refusing unbound replicas therefore also refuses the default
+    /// handling of an unverified context.
     fn prepare_replica_write(
         &self,
         topic_partition: TopicPartition,
         writer_epoch: u64,
         _source: &ReplicaSourceIdentity,
     ) -> Result<Option<Arc<dyn PendingWriteAdmission>>, WriteFenceError> {
-        self.prepare_write(topic_partition, writer_epoch)
+        self.prepare_unbound_replica_write(topic_partition, writer_epoch)
     }
 }
 
