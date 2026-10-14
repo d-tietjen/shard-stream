@@ -7,8 +7,8 @@ use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
 use shard_stream_core::{
-    BatchId, LogicalOffset, LogicalPartitionId, Placement, RecordId, Reservation, RingEpoch,
-    ShardId, TopicPartition, WriteFence,
+    BatchId, LeaderEpoch, LogicalOffset, LogicalPartitionId, Placement, RecordId, Reservation,
+    RingEpoch, ShardId, TopicPartition, WriteFence,
 };
 use shard_stream_protocol::{
     AppendRequest, AppendResponse, AtomicGroupIdentity, Durability, FetchMode, FetchRequest,
@@ -533,14 +533,17 @@ impl StreamEngine {
                 EngineError::InvalidConfig(format!("invalid append request: {error}"))
             })?;
         let topic_partition = TopicPartition::new(request.topic_id, request.partition_id);
-        if let Some(write_fence) = &self.write_fence {
+        let admitted_leader_epoch = if let Some(write_fence) = &self.write_fence {
             let leader_epoch = request.leader_epoch.ok_or_else(|| {
                 EngineError::Fenced("leader_epoch is required by the write fence".into())
             })?;
             write_fence
                 .check_write(topic_partition, leader_epoch)
                 .map_err(|error| EngineError::Fenced(error.to_string()))?;
-        }
+            Some(LeaderEpoch::new(leader_epoch))
+        } else {
+            None
+        };
         let (mut sink_charge, sink_payload) = if let Some(durable_sink) = &self.durable_sink {
             durable_sink.validate_append(&request.payload, record_count)?;
             (
@@ -576,6 +579,7 @@ impl StreamEngine {
             payload_bytes,
             payload_digest,
             request.durability,
+            admitted_leader_epoch,
         )?;
         let replication_policy = match reserve_outcome {
             ReserveOutcome::Duplicate {
@@ -1784,11 +1788,13 @@ fn validate_ring(config: &EngineConfig, shards: &[ShardId]) -> EngineResult<()> 
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::fs;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use shard_stream_core::{LeaderEpoch, PlacementSequence, TopicId, VirtualLaneId};
+    use shard_stream_core::{
+        LeaderEpoch, PlacementSequence, SequencerError, TopicId, VirtualLaneId,
+    };
     use shard_stream_protocol::{Durability, FetchMode, ProducerIdentity};
     use shardlog::{JournalEvent, ShardStore};
 
@@ -2113,6 +2119,28 @@ mod tests {
             } else {
                 Err(shard_stream_core::WriteFenceError::new(format!(
                     "expected epoch 7, received epoch {leader_epoch}"
+                )))
+            }
+        }
+    }
+
+    // This local admission fixture tests engine coordinates, not a distributed
+    // authority or synchronization between a lease transition and physical I/O.
+    #[derive(Debug)]
+    struct FixtureEpochFence(AtomicU64);
+
+    impl WriteFence for FixtureEpochFence {
+        fn check_write(
+            &self,
+            _topic_partition: TopicPartition,
+            leader_epoch: u64,
+        ) -> Result<(), shard_stream_core::WriteFenceError> {
+            let expected = self.0.load(Ordering::Acquire);
+            if expected == leader_epoch {
+                Ok(())
+            } else {
+                Err(shard_stream_core::WriteFenceError::new(format!(
+                    "expected fixture epoch {expected}, received {leader_epoch}"
                 )))
             }
         }
@@ -3200,8 +3228,267 @@ mod tests {
             engine.append(request.clone()),
             Err(EngineError::Fenced(_))
         ));
+        let partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        assert_eq!(
+            engine
+                .watermarks(partition)
+                .expect("refused frontier")
+                .allocated_end,
+            LogicalOffset::new(0)
+        );
+        assert!(
+            engine
+                .fetch(fetch_request(0))
+                .expect("refused WAL")
+                .is_empty()
+        );
         request.leader_epoch = Some(7);
-        engine.append(request).expect("current epoch");
+        let receipt = engine.append(request).expect("current epoch");
+        assert_eq!(receipt.placement.leader_epoch, LeaderEpoch::new(7));
+    }
+
+    #[test]
+    fn admitted_fenced_epoch_reaches_real_wal_sink_and_replica_coordinates() {
+        let leader_directory = TempDir::new("admitted-epoch-leader");
+        let follower_directory = TempDir::new("admitted-epoch-follower");
+        let follower = Arc::new(
+            StreamEngine::open(config(&follower_directory.0)).expect("real follower engine"),
+        );
+        let topic = TopicConfig {
+            topic_id: TopicId::new(1),
+            partitions: 1,
+            shards: None,
+        };
+        follower
+            .create_topic(topic.clone())
+            .expect("follower topic");
+        let control = Arc::new(RecordingSinkControl::default());
+        let mut leader_config = config(&leader_directory.0);
+        leader_config.replication_factor = 2;
+        leader_config.min_in_sync_replicas = 2;
+        let leader = StreamEngine::open_with_all_components_and_durable_sink(
+            leader_config,
+            Some(Arc::new(ExactEpochFence)),
+            Some(Arc::new(DirectReplication {
+                follower: Arc::clone(&follower),
+                fail_first: AtomicBool::new(false),
+                progress: OnceLock::new(),
+            })),
+            None,
+            Some(recording_sink_config(
+                &control,
+                DurableSinkOptions::default(),
+            )),
+        )
+        .expect("real fenced leader and sink");
+        leader.create_topic(topic).expect("leader topic");
+        let partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        let mut request = append_request(1, b"admitted epoch reaches physical storage", None);
+        request.leader_epoch = Some(7);
+        request.durability = Durability::Quorum;
+        let receipt = leader.append(request).expect("genuine engine append");
+        assert_eq!(receipt.placement.leader_epoch, LeaderEpoch::new(7));
+        leader
+            .wait_for_durable_sink_checkpoint(DurableSinkCheckpoint {
+                topic_partition: partition,
+                next_placement_sequence: PlacementSequence::new(1),
+                next_offset: LogicalOffset::new(1),
+            })
+            .expect("actual sink applied the reserved placement");
+        for engine in [&leader, follower.as_ref()] {
+            let wal = engine
+                .fetch(fetch_request(0))
+                .expect("checksummed WAL readback");
+            assert_eq!(wal.len(), 1);
+            assert_eq!(wal[0].placement, receipt.placement);
+            assert_eq!(wal[0].first_offset, receipt.first_offset);
+            assert_eq!(wal[0].last_offset, receipt.last_offset);
+            assert_eq!(
+                wal[0].payload,
+                Bytes::from_static(b"admitted epoch reaches physical storage")
+            );
+        }
+        let applied = control.state.lock().expect("actual recorded sink state");
+        assert_eq!(applied.appends.len(), 1);
+        assert_eq!(applied.appends[0].reservation.placement, receipt.placement);
+        // This real second-WAL transport does not qualify an external host's
+        // authenticated replica admission or an authority-transition guard.
+    }
+
+    #[test]
+    fn admitted_epoch_rotation_preserves_exact_producer_retry_and_recovered_wal() {
+        let directory = TempDir::new("admitted-epoch-recovery");
+        let fence = Arc::new(FixtureEpochFence(AtomicU64::new(7)));
+        let first_producer = ProducerIdentity {
+            producer_id: 55,
+            epoch: 0,
+            first_sequence: 0,
+            event_id: Some(RecordId::for_producer_event(
+                TopicId::new(1),
+                LogicalPartitionId::new(0),
+                55,
+                0,
+                0,
+            )),
+        };
+        let mut first_request = append_request(1, b"first exact identity", Some(first_producer));
+        first_request.leader_epoch = Some(7);
+        let first_receipt;
+        let second_receipt;
+        {
+            let engine = StreamEngine::open_with_fence(config(&directory.0), fence.clone())
+                .expect("real fenced engine");
+            engine
+                .create_topic(TopicConfig {
+                    topic_id: TopicId::new(1),
+                    partitions: 1,
+                    shards: None,
+                })
+                .expect("fresh topic without seeded epochs");
+            first_receipt = engine
+                .append(first_request.clone())
+                .expect("first physical append");
+            fence.0.store(8, Ordering::Release);
+            first_request.leader_epoch = Some(8);
+            assert_eq!(
+                engine
+                    .append(first_request.clone())
+                    .expect("exact current-admission retry"),
+                first_receipt
+            );
+            let mut second = append_request(
+                2,
+                b"second physical identity",
+                Some(ProducerIdentity {
+                    first_sequence: 1,
+                    event_id: Some(RecordId::for_producer_event(
+                        TopicId::new(1),
+                        LogicalPartitionId::new(0),
+                        55,
+                        0,
+                        1,
+                    )),
+                    ..first_producer
+                }),
+            );
+            second.leader_epoch = Some(8);
+            second_receipt = engine.append(second).expect("new epoch physical append");
+            assert_eq!(first_receipt.placement.leader_epoch, LeaderEpoch::new(7));
+            assert_eq!(second_receipt.placement.leader_epoch, LeaderEpoch::new(8));
+        }
+        let engine = StreamEngine::open_with_fence(config(&directory.0), fence.clone())
+            .expect("reopen actual persisted epochs and producer receipts");
+        let partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        assert_eq!(
+            engine.append(first_request).expect("recovered exact retry"),
+            first_receipt
+        );
+        let before = engine.watermarks(partition).expect("recovered frontiers");
+        let wal = engine
+            .fetch(fetch_request(0))
+            .expect("recovered checksummed WAL");
+        assert_eq!(wal.len(), 2);
+        assert_eq!(wal[0].placement, first_receipt.placement);
+        assert_eq!(wal[1].placement, second_receipt.placement);
+        // Even an installed admission hook that regresses cannot stamp a new
+        // physical reservation below the epoch recovered from the real WAL.
+        fence.0.store(7, Ordering::Release);
+        fence
+            .check_write(partition, 7)
+            .expect("hook accepts the regressed fixture token");
+        let mut stale = append_request(3, b"must not regress recovered placement", None);
+        stale.leader_epoch = Some(7);
+        assert!(matches!(
+            engine.append(stale),
+            Err(EngineError::Sequencer(SequencerError::StaleLeaderEpoch { current, proposed }))
+                if current == LeaderEpoch::new(8) && proposed == LeaderEpoch::new(7)
+        ));
+        assert_eq!(
+            engine.watermarks(partition).expect("refused frontiers"),
+            before
+        );
+        assert_eq!(engine.fetch(fetch_request(0)).expect("unchanged WAL"), wal);
+        fence.0.store(9, Ordering::Release);
+        let mut next = append_request(4, b"later physical progress", None);
+        next.leader_epoch = Some(9);
+        let progressed = engine
+            .append(next)
+            .expect("newer admitted epoch after refusal");
+        assert_eq!(progressed.first_offset, LogicalOffset::new(2));
+        assert_eq!(progressed.placement.leader_epoch, LeaderEpoch::new(9));
+        let recovered = engine
+            .fetch(fetch_request(0))
+            .expect("later checksummed WAL");
+        assert_eq!(recovered.len(), 3);
+        assert_eq!(&recovered[..2], wal.as_slice());
+    }
+
+    #[test]
+    fn admitted_epoch_rotation_retains_exact_atomic_chunk_receipt() {
+        let directory = TempDir::new("admitted-epoch-atomic-retry");
+        let fence = Arc::new(FixtureEpochFence(AtomicU64::new(7)));
+        let engine = StreamEngine::open_with_fence(config(&directory.0), fence.clone())
+            .expect("real atomic fenced engine");
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("fresh atomic topic");
+        let mut first = atomic_request(1, 99, 0, b"first atomic chunk");
+        first.leader_epoch = Some(7);
+        let first_receipt = engine.append(first.clone()).expect("actual first chunk");
+        fence.0.store(8, Ordering::Release);
+        let mut second = atomic_request(2, 99, 1, b"second atomic chunk");
+        second.leader_epoch = Some(8);
+        let second_receipt = engine.append(second).expect("actual second chunk");
+        first.leader_epoch = Some(8);
+        assert_eq!(
+            engine
+                .append(first)
+                .expect("old atomic identity under current admission"),
+            first_receipt
+        );
+        let partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        engine
+            .commit_atomic_group(partition, 99)
+            .expect("commit real atomic chunks");
+        let wal = engine
+            .fetch(fetch_request(0))
+            .expect("committed actual WAL");
+        assert_eq!(wal.len(), 2);
+        assert_eq!(wal[0].placement, first_receipt.placement);
+        assert_eq!(wal[1].placement, second_receipt.placement);
+        assert_eq!(first_receipt.placement.leader_epoch, LeaderEpoch::new(7));
+        assert_eq!(second_receipt.placement.leader_epoch, LeaderEpoch::new(8));
+    }
+
+    #[test]
+    fn unfenced_supplied_epoch_keeps_existing_placement_behavior() {
+        let directory = TempDir::new("unfenced-epoch-compatibility");
+        let engine = StreamEngine::open(config(&directory.0)).expect("ordinary unfenced engine");
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("ordinary topic");
+        let mut supplied = append_request(1, b"untrusted supplied epoch", None);
+        supplied.leader_epoch = Some(91);
+        let first = engine
+            .append(supplied)
+            .expect("existing unfenced supplied-token behavior");
+        let second = engine
+            .append(append_request(2, b"no epoch", None))
+            .expect("unfenced None behavior");
+        assert_eq!(first.placement.leader_epoch, LeaderEpoch::new(0));
+        assert_eq!(second.placement.leader_epoch, LeaderEpoch::new(0));
+        let wal = engine.fetch(fetch_request(0)).expect("ordinary actual WAL");
+        assert_eq!(wal.len(), 2);
+        assert_eq!(wal[0].placement, first.placement);
+        assert_eq!(wal[1].placement, second.placement);
     }
 
     #[test]

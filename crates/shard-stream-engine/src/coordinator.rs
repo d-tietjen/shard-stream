@@ -499,6 +499,7 @@ enum CoordinatorCommand {
         payload_bytes: u64,
         payload_digest: [u8; 16],
         durability: Durability,
+        admitted_leader_epoch: Option<LeaderEpoch>,
         response: SyncSender<EngineResult<ReserveOutcome>>,
     },
     ReserveReplica {
@@ -764,6 +765,7 @@ impl CoordinatorPool {
         payload_bytes: u64,
         payload_digest: [u8; 16],
         durability: Durability,
+        admitted_leader_epoch: Option<LeaderEpoch>,
     ) -> EngineResult<ReserveOutcome> {
         let (response, receiver) = sync_channel(1);
         self.send(
@@ -777,6 +779,7 @@ impl CoordinatorPool {
                 payload_bytes,
                 payload_digest,
                 durability,
+                admitted_leader_epoch,
                 response,
             },
         )?;
@@ -1226,6 +1229,7 @@ fn run_coordinator(
                 payload_bytes,
                 payload_digest,
                 durability,
+                admitted_leader_epoch,
                 response,
             } => {
                 let result = state_mut(&mut states, topic_partition).and_then(|state| {
@@ -1238,6 +1242,7 @@ fn run_coordinator(
                         payload_bytes,
                         payload_digest,
                         durability,
+                        admitted_leader_epoch,
                     )
                 });
                 let _ = response.send(result);
@@ -1521,6 +1526,7 @@ fn reserve(
     payload_bytes: u64,
     payload_digest: [u8; 16],
     durability: Durability,
+    admitted_leader_epoch: Option<LeaderEpoch>,
 ) -> EngineResult<ReserveOutcome> {
     if let Some((response, durable_replicas, object_durable)) = check_producer(
         state,
@@ -1548,6 +1554,11 @@ fn reserve(
         )?
     {
         return Ok(duplicate);
+    }
+    // Existing receipts retain their exact placement. Only a new physical
+    // append observes the epoch accepted by the engine's installed fence.
+    if let Some(leader_epoch) = admitted_leader_epoch {
+        state.sequencer.observe_leader_epoch(leader_epoch)?;
     }
     let previous = state.sequencer.state();
     let reservation = state.sequencer.reserve(record_count)?;

@@ -9,7 +9,12 @@ do not provide distributed behavior by themselves.
 - `ReplicationTransport` receives immutable reserved batches, reports bounded
   asynchronous progress, and supplies synchronous durable-copy counts.
 - `WriteFence` validates a writer epoch before the engine reserves durable
-  state.
+  state. Each new fenced reservation carries that accepted epoch into its
+  placement, WAL, replication batch and durable sink event. The coordinator
+  rejects a new reservation below its already observed epoch. Exact producer
+  and atomic-chunk retries keep their original receipt and placement, including
+  after restart. Without a fence, a supplied request epoch keeps its existing
+  non-authoritative behavior and does not advance the placement epoch.
 - `AssignmentProvider` supplies an immutable assignment view.
 - `RetentionGuard` can reject a retention advance that would violate an
   external reader or migration invariant.
@@ -22,6 +27,16 @@ Opening an `EngineConfig` with RF>1 requires an injected
 manufacture local follower copies. A transport implementation must bound
 admission by bytes and work items, make retries idempotent, and only report
 copies that reached its durable boundary.
+
+The accepted epoch is reservation identity, not a retained ownership guard.
+`WriteFence::check_write` returns before sink preflight/backpressure and
+coordinator reservation; physical append queues can add another wait before
+WAL mutation. The existing hook does not synchronize those operations with
+authority revocation, assignment publication, draining, or lease expiry. A
+composing host that requires ownership changes to fence an already checked or
+queued append needs a separate shared physical-admission/transition contract.
+An additional unsynchronized check does not supply that guarantee. Epoch
+propagation does not establish current ownership, HA quorum, or indexed replay.
 
 ## Durable append sink
 
