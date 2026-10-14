@@ -4014,17 +4014,45 @@ mod tests {
             .append_from_peer(batch.clone(), source)
             .expect("actual guarded replica");
         assert_eq!(applied.placement, receipt.placement);
+        let partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        let before = follower
+            .watermarks(partition)
+            .expect("actual applied frontiers");
+        let wal_before = follower
+            .fetch(fetch_request(0))
+            .expect("actual applied WAL");
+        let cached = queue
+            .append_from_peer(batch, source)
+            .expect("cached replica");
         assert_eq!(
-            queue
-                .append_from_peer(batch, source)
-                .expect("cached replica"),
-            applied
+            (
+                cached.request_id,
+                cached.batch_id,
+                cached.record_id,
+                cached.first_offset,
+                cached.last_offset,
+                cached.placement,
+            ),
+            (
+                applied.request_id,
+                applied.batch_id,
+                applied.record_id,
+                applied.first_offset,
+                applied.last_offset,
+                applied.placement,
+            )
+        );
+        assert!(cached.visible_through <= before.last_stable_offset);
+        assert_eq!(
+            follower.watermarks(partition).expect("cached frontiers"),
+            before
         );
         assert_eq!(pending.physical_admissions.load(Ordering::Relaxed), 1);
         assert_eq!(pending.active.load(Ordering::Acquire), 0);
         let fetched = follower
             .fetch(fetch_request(0))
             .expect("actual replica WAL");
+        assert_eq!(fetched, wal_before);
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0].placement, receipt.placement);
         assert_eq!(
