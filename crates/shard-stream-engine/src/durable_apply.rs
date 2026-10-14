@@ -5,7 +5,7 @@ use std::sync::mpsc::{SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use shard_stream_core::{BatchId, TopicPartition};
+use shard_stream_core::{BatchId, ReplicaSourceIdentity, TopicPartition};
 use shard_stream_protocol::{AppendResponse, ReplicaAppend};
 
 use crate::engine::ReplicaAppendPlan;
@@ -53,11 +53,13 @@ impl DurableApplyConfig {
 
 struct AdmissionCommand {
     batch: ReplicaAppend,
+    source: Option<ReplicaSourceIdentity>,
     response: SyncSender<EngineResult<AppendResponse>>,
 }
 
 struct PendingBatch {
     batch: ReplicaAppend,
+    source: Option<ReplicaSourceIdentity>,
     waiters: Vec<SyncSender<EngineResult<AppendResponse>>>,
 }
 
@@ -206,6 +208,27 @@ impl DurableApplyQueue {
     }
 
     pub fn append(&self, batch: ReplicaAppend) -> EngineResult<AppendResponse> {
+        self.append_with_source(batch, None)
+    }
+
+    /// Applies a replica batch with identity supplied by a verified transport.
+    ///
+    /// The host must construct `source` from the actual authenticated connection.
+    /// This queue does not authenticate its fields or infer a sender from the
+    /// payload. An installed fence must explicitly validate replica authority.
+    pub fn append_from_peer(
+        &self,
+        batch: ReplicaAppend,
+        source: ReplicaSourceIdentity,
+    ) -> EngineResult<AppendResponse> {
+        self.append_with_source(batch, Some(source))
+    }
+
+    fn append_with_source(
+        &self,
+        batch: ReplicaAppend,
+        source: Option<ReplicaSourceIdentity>,
+    ) -> EngineResult<AppendResponse> {
         let topic_partition =
             TopicPartition::new(batch.reservation.topic_id, batch.reservation.partition_id);
         let index = partition_worker(topic_partition, self.admission_workers.len());
@@ -215,7 +238,11 @@ impl DurableApplyQueue {
             .ok_or_else(|| EngineError::CorruptState("durable apply worker stopped".into()))?;
         let (response, receiver) = sync_channel(1);
         sender
-            .send(AdmissionCommand { batch, response })
+            .send(AdmissionCommand {
+                batch,
+                source,
+                response,
+            })
             .map_err(|_| EngineError::CorruptState("durable apply worker stopped".into()))?;
         receiver
             .recv()
@@ -257,6 +284,7 @@ fn admit(
             engine,
             append_senders,
             command.batch,
+            command.source,
             vec![command.response],
         );
         return;
@@ -297,11 +325,12 @@ fn admit(
                 state.pending_bytes = state.pending_bytes.saturating_add(received_bytes);
                 entry.insert(PendingBatch {
                     batch: command.batch,
+                    source: command.source,
                     waiters: vec![command.response],
                 });
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => {
-                if entry.get().batch == command.batch {
+                if entry.get().batch == command.batch && entry.get().source == command.source {
                     entry.get_mut().waiters.push(command.response);
                 } else {
                     let _ = command.response.send(Err(EngineError::CorruptState(format!(
@@ -318,6 +347,7 @@ fn admit(
         engine,
         append_senders,
         command.batch,
+        command.source,
         vec![command.response],
     ) {
         state.next_batch_id = state.next_batch_id.saturating_add(1);
@@ -334,7 +364,13 @@ fn drain_contiguous(
         state.pending_bytes = state
             .pending_bytes
             .saturating_sub(pending.batch.payload.len());
-        if reserve_and_dispatch(engine, append_senders, pending.batch, pending.waiters) {
+        if reserve_and_dispatch(
+            engine,
+            append_senders,
+            pending.batch,
+            pending.source,
+            pending.waiters,
+        ) {
             state.next_batch_id = state.next_batch_id.saturating_add(1);
         } else {
             break;
@@ -346,9 +382,10 @@ fn reserve_and_dispatch(
     engine: &StreamEngine,
     append_senders: &[SyncSender<DurableApplyWork>],
     batch: ReplicaAppend,
+    source: Option<ReplicaSourceIdentity>,
     waiters: Vec<SyncSender<EngineResult<AppendResponse>>>,
 ) -> bool {
-    let plan = match engine.plan_replica_append(&batch) {
+    let plan = match engine.plan_replica_append_from_peer(&batch, source.as_ref()) {
         Ok(ReplicaAppendPlan::Duplicate(response)) => {
             respond_all(waiters, Ok(response));
             return true;

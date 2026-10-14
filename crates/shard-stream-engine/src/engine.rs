@@ -2,13 +2,14 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::num::NonZeroU32;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{Receiver, channel, sync_channel};
 use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
 use shard_stream_core::{
-    BatchId, LeaderEpoch, LogicalOffset, LogicalPartitionId, Placement, RecordId, Reservation,
-    RingEpoch, ShardId, TopicPartition, WriteFence,
+    BatchId, LeaderEpoch, LogicalOffset, LogicalPartitionId, PendingWriteAdmission, Placement,
+    RecordId, ReplicaSourceIdentity, Reservation, RingEpoch, ShardId, TopicPartition, WriteFence,
 };
 use shard_stream_protocol::{
     AppendRequest, AppendResponse, AtomicGroupIdentity, Durability, FetchMode, FetchRequest,
@@ -97,6 +98,7 @@ pub struct StreamEngine {
     coordinators: CoordinatorPool,
     journal: ControlJournal,
     write_fence: Option<Arc<dyn WriteFence>>,
+    requires_physical_admission: bool,
     replication: Option<Arc<dyn ReplicationTransport>>,
     retention_guard: Option<Arc<dyn RetentionGuard>>,
     durable_sink: Option<DurableSinkDispatcher>,
@@ -173,6 +175,7 @@ pub(crate) enum ReplicaAppendPlan {
         response: AppendResponse,
         producer: Option<ProducerSequence>,
         atomic_group: Option<AtomicGroupSequence>,
+        admission: Option<Arc<dyn PendingWriteAdmission>>,
     },
 }
 
@@ -312,6 +315,21 @@ impl StreamEngine {
         auto_resume_durable_sink: bool,
     ) -> EngineResult<Self> {
         config.validate()?;
+        let requires_physical_admission = write_fence
+            .as_ref()
+            .is_some_and(|fence| fence.requires_physical_admission());
+        if requires_physical_admission {
+            for bytes in [config.max_batch_bytes, config.max_fetch_bytes] {
+                if crate::worker::append_command_charge(bytes, true)
+                    .is_none_or(|charge| charge > config.queue_bytes_per_shard)
+                {
+                    return Err(EngineError::InvalidConfig(
+                        "guarded request ceilings plus admission metadata exceed shard capacity"
+                            .into(),
+                    ));
+                }
+            }
+        }
         if config.replication_factor > 1 && replication.is_none() {
             return Err(EngineError::InvalidConfig(
                 "RF>1 requires an injected replication transport; the public engine only provides RF1 storage"
@@ -379,6 +397,7 @@ impl StreamEngine {
             coordinators,
             journal,
             write_fence,
+            requires_physical_admission,
             replication,
             retention_guard,
             durable_sink,
@@ -533,17 +552,18 @@ impl StreamEngine {
                 EngineError::InvalidConfig(format!("invalid append request: {error}"))
             })?;
         let topic_partition = TopicPartition::new(request.topic_id, request.partition_id);
-        let admitted_leader_epoch = if let Some(write_fence) = &self.write_fence {
+        let (admitted_leader_epoch, admission) = if let Some(write_fence) = &self.write_fence {
             let leader_epoch = request.leader_epoch.ok_or_else(|| {
                 EngineError::Fenced("leader_epoch is required by the write fence".into())
             })?;
-            write_fence
-                .check_write(topic_partition, leader_epoch)
+            let admission = write_fence
+                .prepare_write(topic_partition, leader_epoch)
                 .map_err(|error| EngineError::Fenced(error.to_string()))?;
-            Some(LeaderEpoch::new(leader_epoch))
+            (Some(LeaderEpoch::new(leader_epoch)), admission)
         } else {
-            None
+            (None, None)
         };
+        self.validate_admission_contract(admission.as_ref())?;
         let (mut sink_charge, sink_payload) = if let Some(durable_sink) = &self.durable_sink {
             durable_sink.validate_append(&request.payload, record_count)?;
             (
@@ -570,6 +590,15 @@ impl StreamEngine {
         };
         let payload_bytes = u64::try_from(request.payload.len())
             .map_err(|_| EngineError::InvalidConfig("append payload exceeds u64".into()))?;
+        if admission.is_some()
+            && crate::worker::append_command_charge(request.payload.len(), true)
+                .is_none_or(|charge| charge > self.config.queue_bytes_per_shard)
+        {
+            return Err(EngineError::InvalidConfig(
+                "append plus physical admission metadata exceeds shard capacity".into(),
+            ));
+        }
+        validate_pending_admission(admission.as_ref())?;
         let reserve_outcome = self.coordinators.reserve(
             topic_partition,
             request.request_id,
@@ -689,6 +718,7 @@ impl StreamEngine {
                 }),
                 request.payload,
                 request.durability == Durability::Object,
+                admission,
             );
         let response = append_response(request.request_id, reservation);
         match append_result {
@@ -774,16 +804,30 @@ impl StreamEngine {
         &self,
         batch: &ReplicaAppend,
     ) -> EngineResult<ReplicaAppendPlan> {
+        self.plan_replica_append_from_peer(batch, None)
+    }
+
+    /// Plans a reserved replica batch with optional trusted transport context.
+    ///
+    /// The installed fence owns role/lineage validation; the context's presence
+    /// alone is not authentication. Pending permission survives the physical
+    /// queue, while exact duplicates acquire no new physical guard.
+    pub(crate) fn plan_replica_append_from_peer(
+        &self,
+        batch: &ReplicaAppend,
+        source: Option<&ReplicaSourceIdentity>,
+    ) -> EngineResult<ReplicaAppendPlan> {
         let topic_partition =
             TopicPartition::new(batch.reservation.topic_id, batch.reservation.partition_id);
-        if let Some(write_fence) = &self.write_fence {
-            write_fence
-                .check_write(
-                    topic_partition,
-                    batch.reservation.placement.leader_epoch.get(),
-                )
-                .map_err(|error| EngineError::Fenced(error.to_string()))?;
-        }
+        let admission = self.write_fence.as_ref().map_or(Ok(None), |write_fence| {
+            let epoch = batch.reservation.placement.leader_epoch.get();
+            match source {
+                Some(source) => write_fence.prepare_replica_write(topic_partition, epoch, source),
+                None => write_fence.prepare_write(topic_partition, epoch),
+            }
+            .map_err(|error| EngineError::Fenced(error.to_string()))
+        })?;
+        self.validate_admission_contract(admission.as_ref())?;
         let producer = batch.producer.map(|producer| ProducerSequence {
             producer_id: producer.producer_id,
             epoch: producer.epoch,
@@ -799,6 +843,16 @@ impl StreamEngine {
         });
         let payload_bytes = u64::try_from(batch.payload.len())
             .map_err(|_| EngineError::InvalidConfig("replica payload exceeds u64".into()))?;
+        if admission.is_some()
+            && (batch.payload.len() > self.config.max_batch_bytes
+                || crate::worker::append_command_charge(batch.payload.len(), true)
+                    .is_none_or(|charge| charge > self.config.queue_bytes_per_shard))
+        {
+            return Err(EngineError::InvalidConfig(
+                "replica append plus physical admission metadata exceeds shard capacity".into(),
+            ));
+        }
+        validate_pending_admission(admission.as_ref())?;
         self.coordinators
             .observe_leader_epoch(topic_partition, batch.reservation.placement.leader_epoch)?;
         let response = match self.coordinators.reserve_replica(
@@ -818,7 +872,20 @@ impl StreamEngine {
             response,
             producer,
             atomic_group,
+            admission,
         })
+    }
+
+    fn validate_admission_contract(
+        &self,
+        admission: Option<&Arc<dyn PendingWriteAdmission>>,
+    ) -> EngineResult<()> {
+        if admission.is_some() != self.requires_physical_admission {
+            return Err(EngineError::Fenced(
+                "physical admission ticket disagrees with the installed fence contract".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn execute_replica_append(
@@ -847,6 +914,7 @@ impl StreamEngine {
                     response,
                     producer,
                     atomic_group,
+                    admission,
                 } => {
                     let shard =
                         match self.shard_for_lane(batch.reservation.placement.virtual_lane_id) {
@@ -863,6 +931,7 @@ impl StreamEngine {
                         atomic_group,
                         batch.payload.clone(),
                         false,
+                        admission,
                         completion,
                     ) {
                         Ok(()) => pending.push((index, batch, response, receiver)),
@@ -875,16 +944,12 @@ impl StreamEngine {
             }
         }
         for (index, batch, response, receiver) in pending {
-            let append_result = receiver
-                .recv()
-                .map_err(|_| {
-                    crate::worker::AppendFailure::ambiguous(EngineError::WorkerStopped(
-                        batch.reservation.placement.virtual_lane_id,
-                    ))
-                })
-                .and_then(|result| {
-                    result.map_err(|error| crate::worker::AppendFailure::ambiguous(error.into()))
-                });
+            let append_result = match receiver.recv() {
+                Ok(result) => result,
+                Err(_) => Err(crate::worker::AppendFailure::ambiguous(
+                    EngineError::WorkerStopped(batch.reservation.placement.virtual_lane_id),
+                )),
+            };
             results[index] = Some(self.finish_replica_append(&batch, response, append_result));
         }
         results
@@ -1748,6 +1813,17 @@ fn select_fetch_plan(
     })
 }
 
+fn validate_pending_admission(
+    admission: Option<&Arc<dyn PendingWriteAdmission>>,
+) -> EngineResult<()> {
+    if let Some(admission) = admission {
+        catch_unwind(AssertUnwindSafe(|| admission.validate_before_reserve()))
+            .map_err(|_| EngineError::Fenced("pre-reservation write admission panicked".into()))?
+            .map_err(|error| EngineError::Fenced(error.to_string()))?;
+    }
+    Ok(())
+}
+
 fn append_response(request_id: u128, reservation: Reservation) -> AppendResponse {
     AppendResponse {
         request_id,
@@ -2143,6 +2219,135 @@ mod tests {
                     "expected fixture epoch {expected}, received {leader_epoch}"
                 )))
             }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FixturePendingAdmission {
+        refuse_before_reserve: AtomicBool,
+        panic_before_reserve: AtomicBool,
+        refuse_physical: AtomicBool,
+        active: Arc<AtomicUsize>,
+        physical_admissions: AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct FixtureSettlementGuard(Arc<AtomicUsize>);
+
+    impl shard_stream_core::PhysicalWriteGuard for FixtureSettlementGuard {}
+
+    impl Drop for FixtureSettlementGuard {
+        fn drop(&mut self) {
+            assert_eq!(self.0.fetch_sub(1, Ordering::AcqRel), 1);
+        }
+    }
+
+    impl PendingWriteAdmission for FixturePendingAdmission {
+        fn validate_before_reserve(&self) -> Result<(), shard_stream_core::WriteFenceError> {
+            if self.panic_before_reserve.swap(false, Ordering::AcqRel) {
+                panic!("bounded pre-reservation fixture panic");
+            }
+            if self.refuse_before_reserve.load(Ordering::Acquire) {
+                return Err(shard_stream_core::WriteFenceError::new(
+                    "bounded fixture early refusal",
+                ));
+            }
+            Ok(())
+        }
+
+        fn try_admit_physical(
+            &self,
+            reservation: &Reservation,
+        ) -> Result<
+            Box<dyn shard_stream_core::PhysicalWriteGuard>,
+            shard_stream_core::WriteFenceError,
+        > {
+            if reservation.topic_id != TopicId::new(1)
+                || reservation.partition_id != LogicalPartitionId::new(0)
+                || reservation.placement.leader_epoch != LeaderEpoch::new(7)
+                || reservation.placement.ring_epoch != RingEpoch::new(1)
+                || self.refuse_physical.load(Ordering::Acquire)
+            {
+                return Err(shard_stream_core::WriteFenceError::new(
+                    "bounded fixture physical refusal",
+                ));
+            }
+            self.active
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                    (active == 0).then_some(1)
+                })
+                .map_err(|_| {
+                    shard_stream_core::WriteFenceError::new("bounded fixture guard capacity")
+                })?;
+            self.physical_admissions.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(FixtureSettlementGuard(Arc::clone(&self.active))))
+        }
+    }
+
+    #[derive(Debug)]
+    struct FixturePendingFence {
+        admission: Arc<FixturePendingAdmission>,
+        declared: bool,
+    }
+
+    impl WriteFence for FixturePendingFence {
+        fn check_write(
+            &self,
+            partition: TopicPartition,
+            epoch: u64,
+        ) -> Result<(), shard_stream_core::WriteFenceError> {
+            ExactEpochFence.check_write(partition, epoch)
+        }
+
+        fn requires_physical_admission(&self) -> bool {
+            self.declared
+        }
+
+        fn prepare_write(
+            &self,
+            partition: TopicPartition,
+            epoch: u64,
+        ) -> Result<Option<Arc<dyn PendingWriteAdmission>>, shard_stream_core::WriteFenceError>
+        {
+            self.check_write(partition, epoch)?;
+            Ok(Some(self.admission.clone()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct FixtureReplicaContextFence {
+        source: ReplicaSourceIdentity,
+        pending: FixturePendingFence,
+    }
+
+    impl WriteFence for FixtureReplicaContextFence {
+        fn check_write(
+            &self,
+            _partition: TopicPartition,
+            _epoch: u64,
+        ) -> Result<(), shard_stream_core::WriteFenceError> {
+            Err(shard_stream_core::WriteFenceError::new(
+                "fixture follower has no local leader permission",
+            ))
+        }
+
+        fn requires_physical_admission(&self) -> bool {
+            true
+        }
+
+        fn prepare_replica_write(
+            &self,
+            partition: TopicPartition,
+            epoch: u64,
+            source: &ReplicaSourceIdentity,
+        ) -> Result<Option<Arc<dyn PendingWriteAdmission>>, shard_stream_core::WriteFenceError>
+        {
+            if source != &self.source {
+                return Err(shard_stream_core::WriteFenceError::new(
+                    "fixture context mismatch",
+                ));
+            }
+            self.pending.prepare_write(partition, epoch)
         }
     }
 
@@ -3489,6 +3694,323 @@ mod tests {
         assert_eq!(wal.len(), 2);
         assert_eq!(wal[0].placement, first.placement);
         assert_eq!(wal[1].placement, second.placement);
+    }
+
+    #[test]
+    fn guarded_exact_capacity_is_validated_before_storage_and_preserves_legacy_bound() {
+        let directory = TempDir::new("guarded-capacity");
+        let ceiling = 64 * 1024;
+        let mut limits = config(&directory.0.join("invalid"));
+        limits.max_batch_bytes = ceiling;
+        limits.max_fetch_bytes = ceiling;
+        limits.queue_bytes_per_shard = ceiling + crate::config::COMMAND_OVERHEAD_BYTES;
+        let admission = Arc::new(FixturePendingAdmission::default());
+        let fence = Arc::new(FixturePendingFence {
+            admission,
+            declared: true,
+        });
+        assert!(matches!(
+            StreamEngine::open_with_fence(limits.clone(), fence.clone()),
+            Err(EngineError::InvalidConfig(_))
+        ));
+        assert!(
+            !limits.data_dir.exists(),
+            "incompatible strong config must not open storage"
+        );
+        limits.data_dir = directory.0.join("guarded");
+        limits.queue_bytes_per_shard += crate::worker::ADMISSION_METADATA_BYTES;
+        let engine =
+            StreamEngine::open_with_fence(limits.clone(), fence).expect("exact strong bound");
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("actual guarded topic");
+        assert_eq!(engine.maximum_batch_bytes(), ceiling);
+        let mut request = append_request(1, &vec![8; ceiling], None);
+        request.leader_epoch = Some(7);
+        let receipt = engine
+            .append(request)
+            .expect("advertised maximum fits actual physical charge");
+        assert_eq!(receipt.placement.leader_epoch, LeaderEpoch::new(7));
+        let mut next = append_request(2, b"later fitting progress", None);
+        next.leader_epoch = Some(7);
+        assert_eq!(
+            engine
+                .append(next)
+                .expect("later guarded progress")
+                .first_offset,
+            LogicalOffset::new(1)
+        );
+        drop(engine);
+        limits.data_dir = directory.0.join("legacy");
+        limits.queue_bytes_per_shard -= crate::worker::ADMISSION_METADATA_BYTES;
+        let legacy = StreamEngine::open_with_fence(limits, Arc::new(ExactEpochFence))
+            .expect("legacy None admission retains its exact original bound");
+        legacy
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("actual legacy topic");
+        let mut request = append_request(1, &vec![9; ceiling], None);
+        request.leader_epoch = Some(7);
+        legacy
+            .append(request)
+            .expect("legacy maximum remains accepted");
+    }
+
+    #[test]
+    fn guarded_early_refusal_has_no_allocation_and_late_refusal_preserves_real_abort_lineage() {
+        let directory = TempDir::new("guarded-refusal-lineage");
+        let admission = Arc::new(FixturePendingAdmission::default());
+        let fence = Arc::new(FixturePendingFence {
+            admission: admission.clone(),
+            declared: true,
+        });
+        let engine = StreamEngine::open_with_fence(config(&directory.0), fence.clone())
+            .expect("real guarded engine");
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("actual topic");
+        let partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        let mut refused = append_request(1, b"refused", None);
+        refused.leader_epoch = Some(7);
+        let before = engine
+            .watermarks(partition)
+            .expect("actual initial frontiers");
+        admission
+            .refuse_before_reserve
+            .store(true, Ordering::Release);
+        assert!(matches!(
+            engine.append(refused.clone()),
+            Err(EngineError::Fenced(_))
+        ));
+        admission
+            .refuse_before_reserve
+            .store(false, Ordering::Release);
+        admission
+            .panic_before_reserve
+            .store(true, Ordering::Release);
+        assert!(matches!(
+            engine.append(refused.clone()),
+            Err(EngineError::Fenced(_))
+        ));
+        assert_eq!(
+            engine
+                .watermarks(partition)
+                .expect("early refused frontiers"),
+            before
+        );
+        assert!(
+            engine
+                .fetch(fetch_request(0))
+                .expect("early refused WAL")
+                .is_empty()
+        );
+        admission.refuse_physical.store(true, Ordering::Release);
+        assert!(matches!(
+            engine.append(refused),
+            Err(EngineError::Fenced(_))
+        ));
+        let aborted = engine
+            .watermarks(partition)
+            .expect("actual terminal abort frontiers");
+        assert_eq!(aborted.allocated_end, LogicalOffset::new(1));
+        assert_eq!(aborted.contiguous_log_end, LogicalOffset::new(1));
+        assert_eq!(aborted.last_stable_offset, LogicalOffset::new(1));
+        assert!(
+            engine
+                .fetch(fetch_request(0))
+                .expect("no unauthorized data WAL")
+                .is_empty()
+        );
+        admission.refuse_physical.store(false, Ordering::Release);
+        let mut next = append_request(2, b"later real WAL after abort", None);
+        next.leader_epoch = Some(7);
+        let receipt = engine.append(next).expect("actual later physical progress");
+        assert_eq!(receipt.first_offset, LogicalOffset::new(1));
+        let wal = engine
+            .fetch(fetch_request(0))
+            .expect("actual data excludes refused slot");
+        assert_eq!(wal.len(), 1);
+        assert_eq!(wal[0].first_offset, LogicalOffset::new(1));
+        drop(engine);
+        let reopened = StreamEngine::open_with_fence(config(&directory.0), fence)
+            .expect("recover interior abort gap");
+        let recovered = reopened
+            .fetch(fetch_request(0))
+            .expect("recovered actual data");
+        assert_eq!(recovered, wal);
+        assert_eq!(
+            reopened
+                .watermarks(partition)
+                .expect("recovered allocated frontier")
+                .allocated_end,
+            LogicalOffset::new(2)
+        );
+        assert_eq!(admission.active.load(Ordering::Acquire), 0);
+        // No sink is installed: this test cannot qualify abort-gap checkpoint
+        // advancement, lease transitions or an external replica authority.
+    }
+
+    #[test]
+    fn undeclared_physical_ticket_refuses_before_reservation() {
+        let directory = TempDir::new("undeclared-guard");
+        let fence = Arc::new(FixturePendingFence {
+            admission: Arc::new(FixturePendingAdmission::default()),
+            declared: false,
+        });
+        let engine =
+            StreamEngine::open_with_fence(config(&directory.0), fence).expect("legacy declaration");
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("actual topic");
+        let partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        let mut request =
+            append_request(1, b"ticket cannot bypass declared capacity contract", None);
+        request.leader_epoch = Some(7);
+        assert!(matches!(
+            engine.append(request),
+            Err(EngineError::Fenced(_))
+        ));
+        assert_eq!(
+            engine
+                .watermarks(partition)
+                .expect("unchanged allocation")
+                .allocated_end,
+            LogicalOffset::new(0)
+        );
+        assert!(
+            engine
+                .fetch(fetch_request(0))
+                .expect("unchanged WAL")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn trusted_replica_context_reaches_real_queue_without_granting_local_leader_permission() {
+        let directory = TempDir::new("guarded-replica-context");
+        let leader = StreamEngine::open_with_fence(
+            config(&directory.0.join("leader")),
+            Arc::new(ExactEpochFence),
+        )
+        .expect("real leader");
+        leader
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("leader topic");
+        let mut request = append_request(1, b"actual leader payload", None);
+        request.leader_epoch = Some(7);
+        let receipt = leader.append(request).expect("genuine leader reservation");
+        let source = ReplicaSourceIdentity {
+            broker_id: shard_stream_core::BrokerId::new(9),
+            incarnation: 3,
+            credential_fingerprint: [5; 32],
+        };
+        let pending = Arc::new(FixturePendingAdmission::default());
+        let follower = Arc::new(
+            StreamEngine::open_with_fence(
+                config(&directory.0.join("follower")),
+                Arc::new(FixtureReplicaContextFence {
+                    source,
+                    pending: FixturePendingFence {
+                        admission: pending.clone(),
+                        declared: true,
+                    },
+                }),
+            )
+            .expect("real guarded follower"),
+        );
+        follower
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("follower topic");
+        let queue =
+            crate::DurableApplyQueue::spawn(follower.clone(), crate::DurableApplyConfig::default())
+                .expect("actual follower queue");
+        let batch = ReplicaAppend {
+            reservation: Reservation {
+                topic_id: TopicId::new(1),
+                partition_id: LogicalPartitionId::new(0),
+                batch_id: receipt.batch_id,
+                first_offset: receipt.first_offset,
+                last_offset: receipt.last_offset,
+                record_count: NonZeroU32::new(1).expect("actual record count"),
+                placement: receipt.placement,
+            },
+            producer: None,
+            atomic_group: None,
+            extension_context: None,
+            payload_digest: [0; 16],
+            payload: Bytes::from_static(b"actual leader payload"),
+        };
+        assert!(matches!(
+            queue.append(batch.clone()),
+            Err(EngineError::Fenced(_))
+        ));
+        let mut wrong_source = source;
+        wrong_source.incarnation += 1;
+        assert!(matches!(
+            queue.append_from_peer(batch.clone(), wrong_source),
+            Err(EngineError::Fenced(_))
+        ));
+        assert_eq!(
+            follower
+                .watermarks(TopicPartition::new(
+                    TopicId::new(1),
+                    LogicalPartitionId::new(0)
+                ))
+                .expect("refused follower"),
+            PartitionWatermarks {
+                log_start: LogicalOffset::new(0),
+                allocated_end: LogicalOffset::new(0),
+                contiguous_log_end: LogicalOffset::new(0),
+                replicated_high_watermark: LogicalOffset::new(0),
+                last_stable_offset: LogicalOffset::new(0),
+            }
+        );
+        let applied = queue
+            .append_from_peer(batch.clone(), source)
+            .expect("actual guarded replica");
+        assert_eq!(applied.placement, receipt.placement);
+        assert_eq!(
+            queue
+                .append_from_peer(batch, source)
+                .expect("cached replica"),
+            applied
+        );
+        assert_eq!(pending.physical_admissions.load(Ordering::Relaxed), 1);
+        assert_eq!(pending.active.load(Ordering::Acquire), 0);
+        let fetched = follower
+            .fetch(fetch_request(0))
+            .expect("actual replica WAL");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].placement, receipt.placement);
+        assert_eq!(
+            fetched[0].payload,
+            Bytes::from_static(b"actual leader payload")
+        );
+        // The fixed context verifies plumbing only; it is not a TLS identity,
+        // current remote lease or distributed ownership qualification.
     }
 
     #[test]

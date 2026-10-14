@@ -110,6 +110,17 @@ impl<T> Budgeted<T> {
         self.item.take().expect("budgeted item is present")
     }
 
+    /// Transfers the item and its byte charge into independently owned values.
+    ///
+    /// The returned charge retains admission until it is dropped. A physical
+    /// consumer must own it until settlement, including when its caller exits.
+    pub fn into_parts(mut self) -> (T, Budgeted<()>) {
+        let item = self.item.take().expect("budgeted item is present");
+        let charged_bytes = std::mem::replace(&mut self.charged_bytes, 0);
+        let charge = Budgeted::new((), charged_bytes, Arc::clone(&self.budget));
+        (item, charge)
+    }
+
     pub fn try_map<U, E>(mut self, map: impl FnOnce(T) -> Result<U, E>) -> Result<Budgeted<U>, E> {
         let item = self.item.take().expect("budgeted item is present");
         let mapped = map(item)?;

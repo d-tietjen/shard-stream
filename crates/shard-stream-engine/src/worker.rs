@@ -1,15 +1,17 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use shard_stream_core::{
-    ByteBoundedSender, LogicalOffset, Reservation, ShardId, TopicPartition, TrySendError,
-    byte_bounded_channel,
+    Budgeted, ByteBoundedSender, LogicalOffset, PendingWriteAdmission, PhysicalWriteGuard,
+    Reservation, ShardId, TopicPartition, TrySendError, byte_bounded_channel,
 };
 use shardlog::{
     AtomicGroupSequence, ExtentCatalogEntry, LocalObjectTier, ProducerSequence, ShardStore,
@@ -25,6 +27,23 @@ const MIN_APPEND_GROUP_LINGER: Duration = Duration::from_micros(200);
 const APPEND_GROUP_IDLE_RESET: Duration = Duration::from_millis(4);
 const SYNC_QUEUE_SLOTS: usize = 8;
 const MAX_SYNC_BATCH: usize = 8;
+/// Fixed command fields retained with a guarded append through settlement.
+pub(crate) const ADMISSION_METADATA_BYTES: usize = std::mem::size_of::<(
+    Option<Arc<dyn PendingWriteAdmission>>,
+    Option<Box<dyn PhysicalWriteGuard>>,
+    Option<Budgeted<()>>,
+)>();
+
+/// Computes the declared command charge without claiming a process RAM bound.
+pub(crate) fn append_command_charge(payload_bytes: usize, guarded: bool) -> Option<usize> {
+    payload_bytes
+        .checked_add(COMMAND_OVERHEAD_BYTES)?
+        .checked_add(if guarded { ADMISSION_METADATA_BYTES } else { 0 })
+}
+
+#[cfg(test)]
+#[path = "worker_physical_admission_tests.rs"]
+mod physical_admission_tests;
 
 struct AppendGroupTuner {
     linger: Duration,
@@ -64,6 +83,7 @@ impl AppendGroupTuner {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct AppendFailure {
     pub(crate) error: EngineError,
     pub(crate) definitely_not_written: bool,
@@ -91,7 +111,10 @@ struct AppendCommand {
     atomic_group: Option<AtomicGroupSequence>,
     payload: Bytes,
     object_durable: bool,
-    response: SyncSender<StorageResult<AppendDurability>>,
+    admission: Option<Arc<dyn PendingWriteAdmission>>,
+    _physical_guard: Option<Box<dyn PhysicalWriteGuard>>,
+    _byte_charge: Option<Budgeted<()>>,
+    response: SyncSender<Result<AppendDurability, AppendFailure>>,
 }
 
 struct SyncRequest {
@@ -232,6 +255,7 @@ impl ShardHandle {
         atomic_group: Option<AtomicGroupSequence>,
         payload: Bytes,
         object_durable: bool,
+        admission: Option<Arc<dyn PendingWriteAdmission>>,
     ) -> Result<AppendDurability, AppendFailure> {
         let (response, receiver) = sync_channel(1);
         self.begin_append(
@@ -240,12 +264,12 @@ impl ShardHandle {
             atomic_group,
             payload,
             object_durable,
+            admission,
             response,
         )?;
         receiver
             .recv()
             .map_err(|_| AppendFailure::ambiguous(EngineError::WorkerStopped(self.shard_id)))?
-            .map_err(|error| AppendFailure::ambiguous(error.into()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -256,12 +280,11 @@ impl ShardHandle {
         atomic_group: Option<AtomicGroupSequence>,
         payload: Bytes,
         object_durable: bool,
-        response: SyncSender<StorageResult<AppendDurability>>,
+        admission: Option<Arc<dyn PendingWriteAdmission>>,
+        response: SyncSender<Result<AppendDurability, AppendFailure>>,
     ) -> Result<(), AppendFailure> {
-        let charged_bytes = payload
-            .len()
-            .checked_add(COMMAND_OVERHEAD_BYTES)
-            .ok_or_else(|| {
+        let charged_bytes =
+            append_command_charge(payload.len(), admission.is_some()).ok_or_else(|| {
                 AppendFailure::rejected(EngineError::AdmissionLimited {
                     shard_id: self.shard_id,
                     reason: "append byte charge overflow",
@@ -274,6 +297,9 @@ impl ShardHandle {
                 atomic_group,
                 payload,
                 object_durable,
+                admission,
+                _physical_guard: None,
+                _byte_charge: None,
                 response,
             }),
             charged_bytes,
@@ -454,7 +480,7 @@ fn run_worker(
         let command = match deferred.take() {
             Some(command) => command,
             None => match receiver.recv_timeout(max_pack_age.min(Duration::from_millis(100))) {
-                Ok(command) => command.into_inner(),
+                Ok(command) => retain_physical_charge(command),
                 Err(RecvTimeoutError::Timeout) => {
                     let _ = stores.seal_aged_pack(max_pack_age);
                     continue;
@@ -474,7 +500,7 @@ fn run_worker(
                         break;
                     }
                     match receiver.recv_timeout(deadline.saturating_duration_since(now)) {
-                        Ok(command) => match command.into_inner() {
+                        Ok(command) => match retain_physical_charge(command) {
                             ShardCommand::Append(command) => appends.push(command),
                             command => {
                                 deferred = Some(command);
@@ -484,6 +510,19 @@ fn run_worker(
                         Err(_) => break,
                     }
                 }
+                let mut admitted = Vec::with_capacity(appends.len());
+                for mut command in appends {
+                    match admit_physical(&mut command) {
+                        Ok(()) => admitted.push(command),
+                        Err(error) => {
+                            send_append_result(command, Err(error));
+                        }
+                    }
+                }
+                if admitted.is_empty() {
+                    continue;
+                }
+                let appends = admitted;
                 let AppendGroupOutput {
                     outcomes,
                     sync_file,
@@ -542,6 +581,38 @@ fn run_worker(
     }
 }
 
+fn retain_physical_charge(command: Budgeted<ShardCommand>) -> ShardCommand {
+    if !matches!(&*command, ShardCommand::Append(append) if append.admission.is_some()) {
+        return command.into_inner();
+    }
+    let (command, charge) = command.into_parts();
+    match command {
+        ShardCommand::Append(mut command) => {
+            if command.admission.is_some() {
+                command._byte_charge = Some(charge);
+            }
+            ShardCommand::Append(command)
+        }
+        command => command,
+    }
+}
+
+fn admit_physical(command: &mut AppendCommand) -> Result<(), AppendFailure> {
+    command._physical_guard = command
+        .admission
+        .as_ref()
+        .map_or(Ok(None), |admission| {
+            catch_unwind(AssertUnwindSafe(|| {
+                admission.try_admit_physical(&command.reservation)
+            }))
+            .map_err(|_| "physical write admission panicked".to_owned())?
+            .map(Some)
+            .map_err(|error| error.to_string())
+        })
+        .map_err(|error| AppendFailure::rejected(EngineError::Fenced(error)))?;
+    Ok(())
+}
+
 fn enqueue_sync(
     sync_sender: &SyncSender<SyncRequest>,
     file: File,
@@ -588,8 +659,29 @@ fn send_append_results(
     outcomes: Vec<StorageResult<AppendDurability>>,
 ) {
     for (command, result) in commands.into_iter().zip(outcomes) {
-        let _ = command.response.send(result);
+        send_append_result(
+            command,
+            result.map_err(|error| AppendFailure::ambiguous(error.into())),
+        );
     }
+}
+
+fn send_append_result(command: AppendCommand, result: Result<AppendDurability, AppendFailure>) {
+    let AppendCommand {
+        response,
+        admission,
+        payload,
+        _physical_guard: guard,
+        _byte_charge: charge,
+        ..
+    } = command;
+    // Physical work has settled or was refused before mutation. Release owned
+    // input, authority and capacity before the caller observes this result.
+    drop(guard);
+    drop(payload);
+    drop(admission);
+    drop(charge);
+    let _ = response.send(result);
 }
 
 fn sync_worker_stopped_error() -> StorageError {

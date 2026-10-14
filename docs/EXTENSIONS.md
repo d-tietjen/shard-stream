@@ -28,15 +28,60 @@ manufacture local follower copies. A transport implementation must bound
 admission by bytes and work items, make retries idempotent, and only report
 copies that reached its durable boundary.
 
-The accepted epoch is reservation identity, not a retained ownership guard.
-`WriteFence::check_write` returns before sink preflight/backpressure and
-coordinator reservation; physical append queues can add another wait before
-WAL mutation. The existing hook does not synchronize those operations with
-authority revocation, assignment publication, draining, or lease expiry. A
-composing host that requires ownership changes to fence an already checked or
-queued append needs a separate shared physical-admission/transition contract.
-An additional unsynchronized check does not supply that guarantee. Epoch
-propagation does not establish current ownership, HA quorum, or indexed replay.
+The accepted epoch is reservation identity. The default `WriteFence`
+preparation calls `check_write` and returns no pending ticket, preserving
+existing implementations. This check returns before sink preflight,
+backpressure and reservation; an additional unsynchronized check cannot fence
+a later queued WAL mutation against authority revocation.
+
+A host requiring that boundary declares the immutable
+`requires_physical_admission` contract and implements `prepare_write` with a
+`PendingWriteAdmission`. A pending ticket owns no physical permission.
+`validate_before_reserve` rejects authority already revoked during preflight
+or capacity waits. The shard calls `try_admit_physical` with the actual
+reservation before any append preparation or data WAL mutation. The host must
+join current partition, epoch, ring, role and genuine lease validity to its
+shared transition state and return an owned `PhysicalWriteGuard`. Pending
+revocation must stop new admissions, and conflicting effective ownership must
+not publish while an admitted operation's guard remains live. Admission and
+guard destruction must use bounded local state without I/O or synchronous
+transition waits. This is a local linearization boundary, not a wall-clock
+guarantee that fsync finishes before lease expiry or a distributed finality
+proof.
+
+The engine moves the guard and byte charge with the physical append command,
+including batching and the sync queue, until physical settlement. Dropping a
+producer response cannot release them early. Guard ownership ends before a
+subsequent durable-index acknowledgement wait. Physical admission refusal or
+panic occurs before data WAL mutation and uses the existing definitely-not-
+written failure path; a storage or sync-dispatch failure remains ambiguous.
+Before storage opens, a guarded constructor verifies that both configured
+request ceilings plus command and fixed admission metadata fit the shard byte
+budget. A guarded operation checks its actual charge before reservation, and
+a ticket inconsistent with the installation contract is refused. The reported
+maximum payload remains the configured maximum when that guarded
+configuration is valid. These are command/input budgets, not process RAM
+limits; a host must bound its own ticket and guard allocations.
+
+`DurableApplyQueue::append_from_peer` carries `ReplicaSourceIdentity` obtained
+from a verified transport to `prepare_replica_write`. Identity fields alone
+are not authentication or leader authority. The host must verify credential
+binding, sender membership, current remote-leader authority and the exact
+reservation lineage. Legacy replica entry points and default preparation
+retain their existing check-only behavior. A retransmitted old placement must
+be explicitly authorized as historical lineage or refused; it must never be
+restamped as a new current-term append. An exact duplicate acquires no new
+physical guard and retains its original persisted coordinates.
+
+These contracts alone do not supply a host authority implementation, HA quorum
+or indexed replay. A late physical refusal retains the existing abort
+algorithm: an allocated slot becomes an in-memory abort without rewinding the
+normal sequencer. A later durable extent permits recovery of an interior gap;
+an unpersisted tail can disappear during restart. In-memory aborts are not
+durable sink checkpoint evidence. The current sink does not advance across
+such a gap, and a safe checkpoint-only advancement requires durable abort
+lineage restored before checkpoint trust. Neither an aborted frontier nor a
+guarded WAL append proves source completeness.
 
 ## Durable append sink
 

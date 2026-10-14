@@ -10,7 +10,9 @@ pub use channel::{
     Budgeted, ByteBoundedReceiver, ByteBoundedSender, ChannelConfigError, ChannelStats,
     TrySendError, byte_bounded_channel,
 };
-pub use fencing::{WriteFence, WriteFenceError};
+pub use fencing::{
+    PendingWriteAdmission, PhysicalWriteGuard, ReplicaSourceIdentity, WriteFence, WriteFenceError,
+};
 pub use ids::{
     AssignmentEpoch, BatchId, BrokerId, LeaderEpoch, LogicalOffset, LogicalPartitionId, OriginId,
     PhysicalShardId, PlacementSequence, RecordId, RingEpoch, ShardId, StreamOffset, TopicId,
