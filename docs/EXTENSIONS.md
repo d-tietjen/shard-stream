@@ -83,6 +83,10 @@ such a gap, and a safe checkpoint-only advancement requires durable abort
 lineage restored before checkpoint trust. Neither an aborted frontier nor a
 guarded WAL append proves source completeness.
 
+The response's visibility watermark remains conservative under the existing
+recovery policy; it is separate from persisted batch, record, offset and
+placement identity and need not equal its earlier live response value.
+
 ## Durable append sink
 
 `DurableSinkConfig` adds asynchronous, at-least-once delivery after the local

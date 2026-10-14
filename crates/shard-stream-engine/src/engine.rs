@@ -3584,11 +3584,33 @@ mod tests {
         let engine = StreamEngine::open_with_fence(config(&directory.0), fence.clone())
             .expect("reopen actual persisted epochs and producer receipts");
         let partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
-        assert_eq!(
-            engine.append(first_request).expect("recovered exact retry"),
-            first_receipt
-        );
         let before = engine.watermarks(partition).expect("recovered frontiers");
+        let recovered = engine.append(first_request).expect("recovered exact retry");
+        // Visibility is a conservative live watermark, not persisted batch
+        // identity. Recovery must preserve every durable receipt coordinate.
+        assert_eq!(
+            (
+                recovered.request_id,
+                recovered.batch_id,
+                recovered.record_id,
+                recovered.first_offset,
+                recovered.last_offset,
+                recovered.placement,
+            ),
+            (
+                first_receipt.request_id,
+                first_receipt.batch_id,
+                first_receipt.record_id,
+                first_receipt.first_offset,
+                first_receipt.last_offset,
+                first_receipt.placement,
+            )
+        );
+        assert!(recovered.visible_through <= before.last_stable_offset);
+        assert_eq!(
+            engine.watermarks(partition).expect("retry frontiers"),
+            before
+        );
         let wal = engine
             .fetch(fetch_request(0))
             .expect("recovered checksummed WAL");
