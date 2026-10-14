@@ -89,6 +89,25 @@ pub trait WriteFence: Send + Sync + fmt::Debug {
         writer_epoch: u64,
     ) -> Result<(), WriteFenceError>;
 
+    /// Checks current replica authority without acquiring a physical ticket.
+    ///
+    /// Guarded bound replicas use this before exact duplicate lookup and again
+    /// before returning an immutable cached receipt. Implementations verify the
+    /// trusted source's current remote-leader role using bounded local state,
+    /// without ticket capacity, metadata I/O or local-leader permission. A
+    /// successful check cannot authorize a new physical operation. The default
+    /// refuses until a strong host implements its actual replica authority.
+    fn check_replica_write(
+        &self,
+        _topic_partition: TopicPartition,
+        _writer_epoch: u64,
+        _source: &ReplicaSourceIdentity,
+    ) -> Result<(), WriteFenceError> {
+        Err(WriteFenceError::new(
+            "read-only replica authority is not implemented",
+        ))
+    }
+
     /// Declares an immutable installation requirement for physical tickets.
     ///
     /// This is not current readiness. A host returning true must prepare a

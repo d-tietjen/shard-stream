@@ -10,6 +10,8 @@ use shard_stream_core::{PhysicalWriteGuard, WriteFenceError};
 struct ReplicaAdmission {
     inner: FixturePendingAdmission,
     pause_before_physical: Mutex<Option<Arc<ProposalPause>>>,
+    ticket_budget: Option<Arc<AtomicUsize>>,
+    ticket_prepares: AtomicUsize,
 }
 
 impl PendingWriteAdmission for ReplicaAdmission {
@@ -40,6 +42,43 @@ impl PendingWriteAdmission for ReplicaAdmission {
 #[derive(Debug)]
 struct ReplicaFence(Arc<ReplicaAdmission>);
 
+#[derive(Debug)]
+struct ReplicaBudgetTicket {
+    admission: Arc<ReplicaAdmission>,
+    charge: Arc<TestTicketCharge>,
+    admitted: AtomicBool,
+}
+
+#[derive(Debug)]
+struct ReplicaBudgetGuard {
+    _guard: Box<dyn PhysicalWriteGuard>,
+    _charge: Arc<TestTicketCharge>,
+}
+impl PhysicalWriteGuard for ReplicaBudgetGuard {}
+
+impl PendingWriteAdmission for ReplicaBudgetTicket {
+    fn validate_before_reserve(&self) -> Result<(), WriteFenceError> {
+        if self.admitted.load(Ordering::Acquire) {
+            return Err(WriteFenceError::new("fixture replica ticket is single-use"));
+        }
+        self.admission.validate_before_reserve()
+    }
+
+    fn try_admit_physical(
+        &self,
+        reservation: &Reservation,
+    ) -> Result<Box<dyn PhysicalWriteGuard>, WriteFenceError> {
+        let guard = self.admission.try_admit_physical(reservation)?;
+        self.admitted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| WriteFenceError::new("fixture replica ticket is single-use"))?;
+        Ok(Box::new(ReplicaBudgetGuard {
+            _guard: guard,
+            _charge: Arc::clone(&self.charge),
+        }))
+    }
+}
+
 impl WriteFence for ReplicaFence {
     fn check_write(&self, partition: TopicPartition, epoch: u64) -> Result<(), WriteFenceError> {
         ExactEpochFence.check_write(partition, epoch)
@@ -49,17 +88,37 @@ impl WriteFence for ReplicaFence {
         true
     }
 
+    fn check_replica_write(
+        &self,
+        partition: TopicPartition,
+        epoch: u64,
+        source: &ReplicaSourceIdentity,
+    ) -> Result<(), WriteFenceError> {
+        if source != &fixture_source() {
+            return Err(WriteFenceError::new(
+                "neutral fixture current source mismatch",
+            ));
+        }
+        ExactEpochFence.check_write(partition, epoch)
+    }
+
     fn prepare_replica_write(
         &self,
         partition: TopicPartition,
         epoch: u64,
         source: &ReplicaSourceIdentity,
     ) -> Result<Option<Arc<dyn PendingWriteAdmission>>, WriteFenceError> {
-        self.check_write(partition, epoch)?;
-        if source != &fixture_source() {
-            return Err(WriteFenceError::new(
-                "neutral fixture current source mismatch",
-            ));
+        self.check_replica_write(partition, epoch, source)?;
+        self.0.ticket_prepares.fetch_add(1, Ordering::Relaxed);
+        if let Some(budget) = &self.0.ticket_budget {
+            budget
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| WriteFenceError::new("fixture replica ticket capacity is occupied"))?;
+            return Ok(Some(Arc::new(ReplicaBudgetTicket {
+                admission: self.0.clone(),
+                charge: Arc::new(TestTicketCharge(budget.clone())),
+                admitted: AtomicBool::new(false),
+            })));
         }
         Ok(Some(self.0.clone()))
     }
@@ -530,7 +589,11 @@ fn guarded_replica_compare_conflict_changes_no_epoch_producer_or_atomic_state() 
 fn guarded_replica_duplicate_requires_current_source_and_exact_received_identity() {
     let directory = TempDir::new("guarded-replica-duplicate");
     let batch = source_batch(&directory.0.join("leader"), false);
-    let admission = Arc::new(ReplicaAdmission::default());
+    let budget = Arc::new(AtomicUsize::new(0));
+    let admission = Arc::new(ReplicaAdmission {
+        ticket_budget: Some(budget.clone()),
+        ..ReplicaAdmission::default()
+    });
     let receiver = Arc::new(new_receiver(&directory.0.join("receiver"), &admission));
     let queue = DurableApplyQueue::spawn(
         receiver.clone(),
@@ -573,7 +636,27 @@ fn guarded_replica_duplicate_requires_current_source_and_exact_received_identity
         .expect("ordering cursor follows actual first commit");
     assert_eq!(progressed.first_offset, LogicalOffset::new(1));
     assert_eq!(progressed.placement, next.reservation.placement);
+    let fence = ReplicaFence(admission.clone());
+    let held = fence
+        .prepare_replica_write(partition(), 7, &fixture_source())
+        .expect("genuine bounded fixture ticket")
+        .expect("actual owned charge");
+    let guard = held
+        .try_admit_physical(&next.reservation)
+        .expect("real guard for already checksummed coordinates, no new WAL");
+    drop(held);
+    assert_eq!(budget.load(Ordering::Acquire), 1);
+    fence
+        .check_replica_write(partition(), 7, &fixture_source())
+        .expect("read-only current replica authority ignores physical capacity");
     let before = receiver.watermarks(partition()).expect("durable frontier");
+    let epochs = receiver
+        .partition_epochs(partition())
+        .expect("durable epochs");
+    let producer = receiver
+        .producer_progress(partition(), 41)
+        .expect("durable producer cursor");
+    let prepares = admission.ticket_prepares.load(Ordering::Acquire);
     let admissions = admission.inner.physical_admissions.load(Ordering::Acquire);
     let mut wrong_source = fixture_source();
     wrong_source.incarnation += 1;
@@ -583,6 +666,31 @@ fn guarded_replica_duplicate_requires_current_source_and_exact_received_identity
     ));
     let mut changed = batch.clone();
     changed.payload_digest = [8; 16];
+    assert!(matches!(
+        queue.append_from_peer(changed, fixture_source()),
+        Err(EngineError::CorruptState(_))
+    ));
+    let mut changed = batch.clone();
+    changed.payload = Bytes::from_static(b"different payload length");
+    assert!(matches!(
+        queue.append_from_peer(changed, fixture_source()),
+        Err(EngineError::CorruptState(_))
+    ));
+    let mut changed = batch.clone();
+    changed
+        .producer
+        .as_mut()
+        .expect("real source producer")
+        .first_sequence += 1;
+    assert!(matches!(
+        queue.append_from_peer(changed, fixture_source()),
+        Err(EngineError::CorruptState(_))
+    ));
+    let mut changed = batch.clone();
+    changed.atomic_group = Some(AtomicGroupIdentity {
+        transaction_id: 92,
+        chunk_sequence: 0,
+    });
     assert!(matches!(
         queue.append_from_peer(changed, fixture_source()),
         Err(EngineError::CorruptState(_))
@@ -598,6 +706,8 @@ fn guarded_replica_duplicate_requires_current_source_and_exact_received_identity
         admission.inner.physical_admissions.load(Ordering::Acquire),
         admissions
     );
+    assert_eq!(admission.ticket_prepares.load(Ordering::Acquire), prepares);
+    assert_eq!(budget.load(Ordering::Acquire), 1);
     assert_eq!(
         receiver
             .watermarks(partition())
@@ -606,9 +716,101 @@ fn guarded_replica_duplicate_requires_current_source_and_exact_received_identity
     );
     assert_eq!(
         receiver
+            .partition_epochs(partition())
+            .expect("unchanged epochs"),
+        epochs
+    );
+    assert_eq!(
+        receiver
+            .producer_progress(partition(), 41)
+            .expect("unchanged producer cursor"),
+        producer
+    );
+    assert_eq!(
+        receiver
             .fetch_stored(fetch_request(0))
             .expect("actual immutable WAL")
             .len(),
         2
+    );
+    let mut third = append_request(
+        3,
+        b"new input waits for actual host ticket capacity",
+        Some(ProducerIdentity {
+            producer_id: 41,
+            epoch: 1,
+            first_sequence: 2,
+            event_id: None,
+        }),
+    );
+    third.leader_epoch = Some(7);
+    leader.append(third).expect("actual third source WAL");
+    let third = replica_from_stored(
+        leader
+            .fetch_stored(fetch_request(2))
+            .expect("checksummed new input")
+            .pop()
+            .expect("actual third source batch"),
+    );
+    assert!(matches!(
+        queue.append_from_peer(third.clone(), fixture_source()),
+        Err(EngineError::Fenced(_))
+    ));
+    assert_eq!(
+        receiver
+            .watermarks(partition())
+            .expect("no capacity allocation"),
+        before
+    );
+    assert_eq!(
+        receiver
+            .partition_epochs(partition())
+            .expect("no capacity epoch mutation"),
+        epochs
+    );
+    assert_eq!(
+        receiver
+            .producer_progress(partition(), 41)
+            .expect("no capacity producer mutation"),
+        producer
+    );
+    assert_eq!(
+        admission.inner.physical_admissions.load(Ordering::Acquire),
+        admissions
+    );
+    assert_eq!(
+        admission.ticket_prepares.load(Ordering::Acquire),
+        prepares + 1
+    );
+    assert_eq!(
+        receiver
+            .fetch_stored(fetch_request(0))
+            .expect("capacity refusal leaves WAL unchanged")
+            .len(),
+        2
+    );
+    drop(guard);
+    assert_eq!(budget.load(Ordering::Acquire), 0);
+    assert_eq!(admission.inner.active.load(Ordering::Acquire), 0);
+    let later = queue
+        .append_from_peer(third.clone(), fixture_source())
+        .expect("same new input progresses after real guard/charge release");
+    assert_eq!(later.first_offset, LogicalOffset::new(2));
+    assert_eq!(later.placement, third.reservation.placement);
+    assert_eq!(budget.load(Ordering::Acquire), 0);
+    assert_eq!(
+        admission.inner.physical_admissions.load(Ordering::Acquire),
+        admissions + 1
+    );
+    assert_eq!(
+        admission.ticket_prepares.load(Ordering::Acquire),
+        prepares + 2
+    );
+    assert_eq!(
+        receiver
+            .fetch_stored(fetch_request(0))
+            .expect("actual three durable batches")
+            .len(),
+        3
     );
 }

@@ -923,7 +923,8 @@ impl StreamEngine {
     ///
     /// The installed fence owns role/lineage validation; the context's presence
     /// alone is not authentication. Pending permission survives the physical
-    /// queue, while exact duplicates acquire no new physical guard.
+    /// queue. Guarded bound duplicates check current read-only replica authority
+    /// and exact durable identity before acquiring any new ticket or guard.
     pub(crate) fn plan_replica_append_from_peer(
         &self,
         batch: &ReplicaAppend,
@@ -931,6 +932,62 @@ impl StreamEngine {
     ) -> EngineResult<ReplicaAppendPlan> {
         let topic_partition =
             TopicPartition::new(batch.reservation.topic_id, batch.reservation.partition_id);
+        if self.requires_physical_admission
+            && let Some((write_fence, source)) = self.write_fence.as_ref().zip(source)
+        {
+            let epoch = batch.reservation.placement.leader_epoch.get();
+            write_fence
+                .check_replica_write(topic_partition, epoch, source)
+                .map_err(|error| EngineError::Fenced(error.to_string()))?;
+            let payload_bytes = u64::try_from(batch.payload.len())
+                .map_err(|_| EngineError::InvalidConfig("replica payload exceeds u64".into()))?;
+            if batch.payload.len() > self.config.max_batch_bytes
+                || crate::worker::append_command_charge(batch.payload.len(), true)
+                    .is_none_or(|charge| charge > self.config.queue_bytes_per_shard)
+            {
+                return Err(EngineError::InvalidConfig(
+                    "replica append plus physical admission metadata exceeds shard capacity".into(),
+                ));
+            }
+            let prepared = self._replication_progress.prepare_replica(ReplicaIntent {
+                reservation: batch.reservation,
+                producer: batch.producer,
+                atomic_group: batch.atomic_group,
+                payload_bytes,
+                payload_digest: batch.payload_digest,
+            })?;
+            match prepared {
+                PrepareReplicaOutcome::Duplicate(ReserveOutcome::Duplicate {
+                    response, ..
+                }) => {
+                    // The pure RPC may wait. Recheck current authority before
+                    // returning history; this grants no new physical permission.
+                    write_fence
+                        .check_replica_write(topic_partition, epoch, source)
+                        .map_err(|error| EngineError::Fenced(error.to_string()))?;
+                    return Ok(ReplicaAppendPlan::Duplicate(response));
+                }
+                PrepareReplicaOutcome::Duplicate(ReserveOutcome::Reserved { .. }) => {
+                    return Err(EngineError::CorruptState(
+                        "replica duplicate returned new allocation".into(),
+                    ));
+                }
+                PrepareReplicaOutcome::New(prepared) => {
+                    let admission = write_fence
+                        .prepare_replica_write(topic_partition, epoch, source)
+                        .map_err(|error| EngineError::Fenced(error.to_string()))?;
+                    self.validate_admission_contract(admission.as_ref())?;
+                    validate_pending_admission(admission.as_ref())?;
+                    let admission = admission.ok_or_else(|| {
+                        EngineError::Fenced("guarded replica has no physical ticket".into())
+                    })?;
+                    return Ok(ReplicaAppendPlan::Prepared {
+                        prepared: Box::new(prepared),
+                        admission,
+                    });
+                }
+            }
+        }
         let admission = self.write_fence.as_ref().map_or(Ok(None), |write_fence| {
             let epoch = batch.reservation.placement.leader_epoch.get();
             match source {
@@ -2750,6 +2807,20 @@ mod tests {
             true
         }
 
+        fn check_replica_write(
+            &self,
+            partition: TopicPartition,
+            epoch: u64,
+            source: &ReplicaSourceIdentity,
+        ) -> Result<(), shard_stream_core::WriteFenceError> {
+            if source != &self.source {
+                return Err(shard_stream_core::WriteFenceError::new(
+                    "fixture context mismatch",
+                ));
+            }
+            ExactEpochFence.check_write(partition, epoch)
+        }
+
         fn prepare_replica_write(
             &self,
             partition: TopicPartition,
@@ -2757,11 +2828,7 @@ mod tests {
             source: &ReplicaSourceIdentity,
         ) -> Result<Option<Arc<dyn PendingWriteAdmission>>, shard_stream_core::WriteFenceError>
         {
-            if source != &self.source {
-                return Err(shard_stream_core::WriteFenceError::new(
-                    "fixture context mismatch",
-                ));
-            }
+            self.check_replica_write(partition, epoch, source)?;
             self.pending.prepare_write(partition, epoch)
         }
     }
@@ -4925,7 +4992,7 @@ mod tests {
             .append_from_peer(batch, unverified_context)
             .expect_err("default context handling cannot authenticate supplied fields");
         assert!(matches!(error, EngineError::Fenced(ref reason)
-            if reason.contains("authenticated sender context")));
+            if reason.contains("read-only replica authority is not implemented")));
         assert_eq!(
             engine.watermarks(partition).expect("refused frontiers"),
             before

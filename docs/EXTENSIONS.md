@@ -136,7 +136,7 @@ would dispatch new peer WAL is refused until a separate authenticated replay
 lineage contract exists; its old placement must not be restamped.
 
 `DurableApplyQueue::append_from_peer` carries `ReplicaSourceIdentity` obtained
-from a verified transport to `prepare_replica_write`. Identity fields alone
+from a verified transport to the installed fence. Identity fields alone
 are not authentication or leader authority. The host must verify credential
 binding, sender membership, current remote-leader authority and the exact
 reservation lineage. Replica entry points without verified context call
@@ -145,15 +145,25 @@ preparation. A host requiring authenticated replica authority must explicitly
 refuse this path even while it has local-leader permission. The default
 context preparation also uses this unbound path because it does not verify
 the supplied fields. Existing check-only implementations remain compatible.
+For an actually guarded bound receiver, `check_replica_write` first verifies
+current replica authority without acquiring host tickets. Its default refuses
+unsupported strong authority; it never borrows local-leader permission. Pure
+receiver preparation then validates the exact reservation, producer and atomic
+identities, payload length and supplied digest. Before returning a durable
+duplicate, the engine rechecks current read-only authority after that RPC and
+returns the original coordinates without a ticket, physical guard or new WAL.
+New input alone calls `prepare_replica_write` and follows the charged physical
+guard/compare-commit path. The read-only result cannot authorize a new write.
+This transport-neutral engine boundary retains the composing distribution's
+framing/checksum/authentication responsibility; it does not authenticate a
+caller-constructed source or supply TLS, issuer or lease proof.
 A retransmitted old placement must
 be explicitly authorized as historical lineage or refused; it must never be
 restamped as a new current-term append. An exact duplicate acquires no new
 physical guard and retains its original persisted coordinates. Current replica
 source authorization still runs before an immutable ACK; the existing replica
-preparation hook may own a ticket because there is no separate read-only
-replica-authority hook. This unit does not borrow local-leader `check_write`
-as follower authority or promise cached replica delivery under exhausted host
-ticket capacity.
+read-only hook does not consume physical ticket capacity. This preserves an
+eligible cached ACK even while a real host ticket/guard owns that capacity.
 
 For a guarded receiver, `DurableApplyQueue` advances its ordering cursor only
 after the actual committed append result, before draining the next buffered
