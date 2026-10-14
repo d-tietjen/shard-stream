@@ -28,6 +28,17 @@ manufacture local follower copies. A transport implementation must bound
 admission by bytes and work items, make retries idempotent, and only report
 copies that reached its durable boundary.
 
+`TopicSequencer::propose_reservation` computes a fixed-size
+`ReservationProposal` without allocating offsets or observing a prospective
+leader epoch. Its typed coordinates are not a WAL or replication reservation.
+`commit_reservation` compares the proposal with the current allocation, ring
+and prior leader epoch before changing state; a conflict consumes nothing.
+The caller must serialize commit with other sequencer mutations and separately
+retain genuine physical authority. Proposals establish no authority themselves.
+The engine's existing append path still reserves before its physical queue;
+this sequencer primitive alone does not remove late-refusal abort gaps or
+establish durable-index progress after a refused queued append.
+
 The accepted epoch is reservation identity. The default `WriteFence`
 preparation calls `check_write` and returns no pending ticket, preserving
 existing implementations. This check returns before sink preflight,

@@ -18,7 +18,9 @@ pub use ids::{
     PhysicalShardId, PlacementSequence, RecordId, RingEpoch, ShardId, StreamOffset, TopicId,
     TopicPartition, VirtualLaneId,
 };
-pub use sequencer::{Placement, Reservation, SequencerError, SequencerState, TopicSequencer};
+pub use sequencer::{
+    Placement, Reservation, ReservationProposal, SequencerError, SequencerState, TopicSequencer,
+};
 pub use topology::{
     AssignmentProvider, BrokerDescriptor, ExtentDescriptor, PartitionAssignment, ReplicaProgress,
     SingleNodeAssignment,
