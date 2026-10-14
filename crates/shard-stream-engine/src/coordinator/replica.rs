@@ -113,7 +113,7 @@ pub(super) fn prepare(
     }
     Ok(PrepareReplicaOutcome::New(PreparedReplica {
         reservation,
-        prepared,
+        prepared: *prepared,
     }))
 }
 

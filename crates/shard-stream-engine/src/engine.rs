@@ -173,7 +173,7 @@ impl ReplicationProgress {
 pub(crate) enum ReplicaAppendPlan {
     Duplicate(AppendResponse),
     Prepared {
-        prepared: PreparedReplica,
+        prepared: Box<PreparedReplica>,
         admission: Arc<dyn PendingWriteAdmission>,
     },
     Reserved {
@@ -590,7 +590,7 @@ impl StreamEngine {
                     PrepareOutcome::Duplicate(outcome) => {
                         return guarded_cached_response(&request, outcome);
                     }
-                    PrepareOutcome::New(prepared) => prepared_guarded = Some(prepared),
+                    PrepareOutcome::New(prepared) => prepared_guarded = Some(*prepared),
                 }
                 guarded_input = Some((digest, bytes));
             }
@@ -961,7 +961,7 @@ impl StreamEngine {
                 payload_digest: batch.payload_digest,
             })? {
                 PrepareReplicaOutcome::New(prepared) => Ok(ReplicaAppendPlan::Prepared {
-                    prepared,
+                    prepared: Box::new(prepared),
                     admission,
                 }),
                 PrepareReplicaOutcome::Duplicate(ReserveOutcome::Duplicate {
@@ -1049,7 +1049,7 @@ impl StreamEngine {
                         .shard_for_lane(batch.reservation.placement.virtual_lane_id)
                         .and_then(|shard| {
                             shard.begin_prepared_replica(
-                                prepared,
+                                *prepared,
                                 batch.payload.clone(),
                                 admission,
                                 Arc::clone(&self._replication_progress),
@@ -4348,7 +4348,7 @@ mod tests {
             .prepare(intent)
             .expect("pure genuine preparation")
         {
-            PrepareOutcome::New(prepared) => prepared,
+            PrepareOutcome::New(prepared) => *prepared,
             PrepareOutcome::Duplicate(_) => panic!("new fixture input must not be a receipt"),
         }
     }

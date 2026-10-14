@@ -190,7 +190,7 @@ fn prepare(
         ReplicaAppendPlan::Prepared {
             prepared,
             admission,
-        } => (prepared, admission),
+        } => (*prepared, admission),
         _ => panic!("fresh remote input has no existing receipt or receiver reservation"),
     }
 }

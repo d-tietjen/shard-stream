@@ -145,10 +145,10 @@ pub(crate) struct PreparedAppend {
     dense_len: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) enum PrepareOutcome {
     Duplicate(ReserveOutcome),
-    New(PreparedAppend),
+    New(Box<PreparedAppend>),
 }
 
 fn duplicate(state: &PartitionState, intent: AppendIntent) -> EngineResult<Option<ReserveOutcome>> {
@@ -256,7 +256,7 @@ pub(super) fn prepare(
             })
         })
         .transpose()?;
-    Ok(PrepareOutcome::New(PreparedAppend {
+    Ok(PrepareOutcome::New(Box::new(PreparedAppend {
         intent,
         proposal,
         replication_policy: state.replication_policy,
@@ -266,7 +266,7 @@ pub(super) fn prepare(
         atomic_after,
         dense_next_key: state.batches.next_key(),
         dense_len: state.batches.len(),
-    }))
+    })))
 }
 
 pub(super) fn commit(
@@ -415,7 +415,7 @@ mod tests {
         assert_eq!(state.sequencer.next_offset(), LogicalOffset::new(0));
         assert!(state.producers.is_empty());
         assert!(state.atomic_groups.is_empty());
-        (state, prepared)
+        (state, *prepared)
     }
 
     #[test]

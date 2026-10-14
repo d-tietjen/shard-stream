@@ -47,9 +47,9 @@ impl ProposedAppendTicket {
             .take()
             .expect("proposal result receiver is present")
             .recv()
-            .unwrap_or_else(|_| {
-                ProposedAppendOutcome::Unknown(EngineError::WorkerStopped(self.shard_id))
-            })
+            .unwrap_or(ProposedAppendOutcome::Unknown(EngineError::WorkerStopped(
+                self.shard_id,
+            )))
     }
 }
 

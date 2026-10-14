@@ -90,6 +90,13 @@ maximum payload remains the configured maximum when that guarded
 configuration is valid. These are command/input budgets, not process RAM
 limits; a host must bound its own ticket and guard allocations.
 
+Preparation replies and guarded replica plans box their fixed metadata. Shard
+admission moves that metadata into the existing inline charged command, so the
+queued proposal retains the same metadata representation and byte charge.
+The transient preparation/plan allocations and allocator overhead remain
+outside the shard command budget and need process resource and performance
+qualification.
+
 Proposal RPCs use the existing bounded coordinator queue with nonblocking
 queue admission and one preparation plus one commit attempt. Both have a
 one-second response interval. Preparation has no mutations. A commit still in

@@ -1675,7 +1675,7 @@ fn reserve(
     };
     match proposal::prepare(state, intent)? {
         PrepareOutcome::Duplicate(outcome) => Ok(outcome),
-        PrepareOutcome::New(prepared) => proposal::commit(state, prepared, None),
+        PrepareOutcome::New(prepared) => proposal::commit(state, *prepared, None),
     }
 }
 
