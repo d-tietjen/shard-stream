@@ -8,8 +8,9 @@ use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
 use shard_stream_core::{
-    BatchId, LeaderEpoch, LogicalOffset, LogicalPartitionId, PendingWriteAdmission, Placement,
-    RecordId, ReplicaSourceIdentity, Reservation, RingEpoch, ShardId, TopicPartition, WriteFence,
+    BatchId, DirectoryOwnership, LeaderEpoch, LogicalOffset, LogicalPartitionId,
+    PendingWriteAdmission, Placement, RecordId, ReplicaSourceIdentity, Reservation, RingEpoch,
+    ShardId, TopicPartition, WriteFence,
 };
 use shard_stream_protocol::{
     AppendRequest, AppendResponse, AtomicGroupIdentity, Durability, FetchMode, FetchRequest,
@@ -103,6 +104,9 @@ pub struct StreamEngine {
     replication: Option<Arc<dyn ReplicationTransport>>,
     retention_guard: Option<Arc<dyn RetentionGuard>>,
     durable_sink: Option<DurableSinkDispatcher>,
+    // Keep directory custody through destruction of every engine-owned field.
+    // Detached sink workers also retain this exact owner independently.
+    directory_ownership: Option<Arc<DirectoryOwnership>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -249,22 +253,33 @@ impl StreamEngine {
                 .is_some_and(|installed| Arc::ptr_eq(installed, fence))
     }
 
+    /// Checks exact directory-owner installation without filesystem I/O.
+    ///
+    /// This proves retained resource custody only, not process identity,
+    /// authenticated recovery state, lease validity or permission to write.
+    #[must_use]
+    pub fn has_directory_ownership(&self, owner: &Arc<DirectoryOwnership>) -> bool {
+        self.directory_ownership
+            .as_ref()
+            .is_some_and(|installed| Arc::ptr_eq(installed, owner))
+    }
+
     pub fn open(config: EngineConfig) -> EngineResult<Self> {
-        Self::open_inner(config, None, None, None, None, false)
+        Self::open_inner(None, config, None, None, None, None, false)
     }
 
     pub fn open_with_fence(
         config: EngineConfig,
         write_fence: Arc<dyn WriteFence>,
     ) -> EngineResult<Self> {
-        Self::open_inner(config, Some(write_fence), None, None, None, false)
+        Self::open_inner(None, config, Some(write_fence), None, None, None, false)
     }
 
     pub fn open_with_replication(
         config: EngineConfig,
         replication: Arc<dyn ReplicationTransport>,
     ) -> EngineResult<Self> {
-        Self::open_inner(config, None, Some(replication), None, None, false)
+        Self::open_inner(None, config, None, Some(replication), None, None, false)
     }
 
     /// Opens an engine with independently optional fencing and replication.
@@ -278,7 +293,7 @@ impl StreamEngine {
         write_fence: Option<Arc<dyn WriteFence>>,
         replication: Option<Arc<dyn ReplicationTransport>>,
     ) -> EngineResult<Self> {
-        Self::open_inner(config, write_fence, replication, None, None, false)
+        Self::open_inner(None, config, write_fence, replication, None, None, false)
     }
 
     pub fn open_with_all_components(
@@ -288,6 +303,7 @@ impl StreamEngine {
         retention_guard: Option<Arc<dyn RetentionGuard>>,
     ) -> EngineResult<Self> {
         Self::open_inner(
+            None,
             config,
             write_fence,
             replication,
@@ -306,7 +322,7 @@ impl StreamEngine {
         config: EngineConfig,
         durable_sink: DurableSinkConfig,
     ) -> EngineResult<Self> {
-        Self::open_inner(config, None, None, None, Some(durable_sink), true)
+        Self::open_inner(None, config, None, None, None, Some(durable_sink), true)
     }
 
     pub fn open_with_all_components_and_durable_sink(
@@ -317,6 +333,35 @@ impl StreamEngine {
         durable_sink: Option<DurableSinkConfig>,
     ) -> EngineResult<Self> {
         Self::open_inner(
+            None,
+            config,
+            write_fence,
+            replication,
+            retention_guard,
+            durable_sink,
+            false,
+        )
+    }
+
+    /// Opens storage while retaining exclusive custody acquired before host recovery.
+    ///
+    /// The owner must name this exact directory and unchanged lock file. It is
+    /// retained through escaped engine `Arc`s and through physically running
+    /// sink callbacks even when bounded dispatcher destruction detaches them.
+    /// Other constructors keep their existing unowned behavior. This does not
+    /// authenticate incarnation, assignment, lease or checkpoint history.
+    /// Recovered sinks use the same explicit `resume_durable_sink` contract as
+    /// `open_with_all_components_and_durable_sink`.
+    pub fn open_with_owned_components(
+        config: EngineConfig,
+        directory_ownership: Arc<DirectoryOwnership>,
+        write_fence: Option<Arc<dyn WriteFence>>,
+        replication: Option<Arc<dyn ReplicationTransport>>,
+        retention_guard: Option<Arc<dyn RetentionGuard>>,
+        durable_sink: Option<DurableSinkConfig>,
+    ) -> EngineResult<Self> {
+        Self::open_inner(
+            Some(directory_ownership),
             config,
             write_fence,
             replication,
@@ -327,7 +372,10 @@ impl StreamEngine {
     }
 
     fn open_inner(
-        config: EngineConfig,
+        // Parameters drop in reverse order, after locals. Keep custody last
+        // even if validation fails before components move into local state.
+        directory_ownership: Option<Arc<DirectoryOwnership>>,
+        mut config: EngineConfig,
         write_fence: Option<Arc<dyn WriteFence>>,
         replication: Option<Arc<dyn ReplicationTransport>>,
         retention_guard: Option<Arc<dyn RetentionGuard>>,
@@ -335,6 +383,25 @@ impl StreamEngine {
         auto_resume_durable_sink: bool,
     ) -> EngineResult<Self> {
         config.validate()?;
+        if let Some(owner) = &directory_ownership {
+            owner
+                .validate_directory(&config.data_dir)
+                .map_err(|error| {
+                    EngineError::InvalidConfig(format!(
+                        "directory ownership validation failed: {error}"
+                    ))
+                })?;
+            // Resolve relative paths once, while their opened identities agree.
+            config.data_dir =
+                std::fs::canonicalize(&config.data_dir).map_err(shardlog::StorageError::from)?;
+            owner
+                .validate_directory(&config.data_dir)
+                .map_err(|error| {
+                    EngineError::InvalidConfig(format!(
+                        "directory ownership validation failed: {error}"
+                    ))
+                })?;
+        }
         let requires_physical_admission = write_fence
             .as_ref()
             .is_some_and(|fence| fence.requires_physical_admission());
@@ -359,11 +426,12 @@ impl StreamEngine {
         std::fs::create_dir_all(&config.data_dir).map_err(shardlog::StorageError::from)?;
         let durable_sink = durable_sink
             .map(|sink| {
-                DurableSinkDispatcher::open(
+                DurableSinkDispatcher::open_with_ownership(
                     sink,
                     &config.shard_ids(),
                     config.queue_bytes_per_shard,
                     config.max_batch_bytes,
+                    directory_ownership.as_ref().map(Arc::clone),
                 )
             })
             .transpose()?;
@@ -376,7 +444,12 @@ impl StreamEngine {
         let mut shards = Vec::with_capacity(config.shard_count as usize);
         let mut catalog = HashMap::new();
         for shard_id in config.shard_ids() {
-            let (handle, entries) = ShardHandle::spawn(&config, shard_id)?;
+            let (handle, entries) = match &directory_ownership {
+                Some(owner) => {
+                    ShardHandle::spawn_with_ownership(&config, shard_id, Some(Arc::clone(owner)))?
+                }
+                None => ShardHandle::spawn(&config, shard_id)?,
+            };
             for entry in entries {
                 let topic_partition =
                     TopicPartition::new(entry.reservation.topic_id, entry.reservation.partition_id);
@@ -421,6 +494,7 @@ impl StreamEngine {
             replication,
             retention_guard,
             durable_sink,
+            directory_ownership,
         };
         if auto_recover_sink {
             engine.resume_durable_sink(&engine.recovered_partitions)?;
@@ -2179,6 +2253,10 @@ mod tests {
 
     #[path = "replica_proposal_tests.rs"]
     mod replica_proposal_tests;
+
+    #[cfg(unix)]
+    #[path = "directory_ownership_tests.rs"]
+    mod directory_ownership_tests;
 
     struct DirectReplication {
         follower: Arc<StreamEngine>,

@@ -28,6 +28,32 @@ manufacture local follower copies. A transport implementation must bound
 admission by bytes and work items, make retries idempotent, and only report
 copies that reached its durable boundary.
 
+`DirectoryOwnership::acquire` provides nonblocking, advisory exclusive custody
+of a local engine directory on Unix. Acquire it before advancing a process
+identity or opening mutable recovery state. Its sealed `Arc` owns actual
+directory/lock handles and checks file identities, symlinks, lock hardlinks and
+same-directory installation. The lock inode is reused and is never deleted or
+truncated by this API. Filesystem paths must remain unchanged during custody;
+an advisory lock cannot fence an actor unlinking/replacing paths or a process
+using an unowned constructor.
+
+`StreamEngine::open_with_owned_components` validates that exact directory before
+storage opens and retains the owner through the engine's full destruction.
+Escaped engine `Arc`s keep custody. Actual lane/sync and durable-sink workers
+also retain it outside their physical frames, covering constructor failure and
+bounded dispatcher destruction that detaches a blocked sink callback. A worker
+releases custody only after its callback, sink and factory destruction finish.
+A permanently blocked detached callback therefore keeps the directory locked;
+a host must report that physical shutdown is still incomplete. Existing
+constructors keep their unowned behavior and explicit sink-replay contracts.
+`has_directory_ownership` checks the exact installed owner allocation without
+filesystem I/O. It establishes no process incarnation, authenticated recovery,
+lease, replay or write authority. A composing host must retain the same owner in
+its own escaped state, tickets, guards and persistence workers. Arbitrary
+third-party background work is covered only if it explicitly retains that
+owner; this API does not discover it. Authenticated identity/cache handoff and
+current authority recovery remain separate required contracts.
+
 `TopicSequencer::propose_reservation` computes a fixed-size
 `ReservationProposal` without allocating offsets or observing a prospective
 leader epoch. Its typed coordinates are not a WAL or replication reservation.

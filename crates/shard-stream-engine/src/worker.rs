@@ -196,6 +196,14 @@ impl ShardHandle {
         config: &EngineConfig,
         shard_id: ShardId,
     ) -> EngineResult<(Self, Vec<ExtentCatalogEntry>)> {
+        Self::spawn_with_ownership(config, shard_id, None)
+    }
+
+    pub(crate) fn spawn_with_ownership(
+        config: &EngineConfig,
+        shard_id: ShardId,
+        directory_ownership: Option<Arc<shard_stream_core::DirectoryOwnership>>,
+    ) -> EngineResult<(Self, Vec<ExtentCatalogEntry>)> {
         let directory = shard_directory(&config.data_dir, shard_id);
         let primary = ShardStore::open(ShardStoreConfig {
             directory,
@@ -225,9 +233,14 @@ impl ShardHandle {
         }
         let stores = LaneStores { primary, tier };
         let (sync_sender, sync_receiver) = sync_channel(SYNC_QUEUE_SLOTS);
+        let sync_ownership = directory_ownership.as_ref().map(Arc::clone);
         let sync_thread = thread::Builder::new()
             .name(format!("shard-stream-sync-{shard_id}"))
-            .spawn(move || run_sync_worker(sync_receiver))
+            .spawn(move || {
+                let ownership = sync_ownership;
+                run_sync_worker(sync_receiver);
+                drop(ownership);
+            })
             .map_err(|error| {
                 EngineError::InvalidConfig(format!("failed to spawn sync worker: {error}"))
             })?;
@@ -240,13 +253,15 @@ impl ShardHandle {
         let thread = thread::Builder::new()
             .name(format!("shard-stream-lane-{shard_id}"))
             .spawn(move || {
+                let ownership = directory_ownership;
                 run_worker(
                     stores,
                     receiver,
                     append_linger,
                     max_pack_age,
                     append_sync_sender,
-                )
+                );
+                drop(ownership);
             })
             .map_err(|error| {
                 EngineError::InvalidConfig(format!("failed to spawn shard worker: {error}"))

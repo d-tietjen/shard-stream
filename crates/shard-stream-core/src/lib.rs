@@ -1,6 +1,7 @@
 //! Stream-native identifiers, sequencing, placement, and bounded execution.
 
 mod channel;
+mod directory_ownership;
 mod fencing;
 mod ids;
 mod sequencer;
@@ -10,6 +11,7 @@ pub use channel::{
     Budgeted, ByteBoundedReceiver, ByteBoundedSender, ChannelConfigError, ChannelStats,
     TrySendError, byte_bounded_channel,
 };
+pub use directory_ownership::{DirectoryOwnership, DirectoryOwnershipError};
 pub use fencing::{
     PendingWriteAdmission, PhysicalWriteGuard, ReplicaSourceIdentity, WriteFence, WriteFenceError,
 };

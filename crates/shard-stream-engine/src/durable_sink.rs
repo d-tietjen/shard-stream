@@ -557,11 +557,12 @@ impl fmt::Debug for DurableSinkDispatcher {
 }
 
 impl DurableSinkDispatcher {
-    pub(crate) fn open(
+    pub(crate) fn open_with_ownership(
         config: DurableSinkConfig,
         shard_ids: &[ShardId],
         inherited_max_bytes: usize,
         maximum_event_bytes: usize,
+        directory_ownership: Option<Arc<shard_stream_core::DirectoryOwnership>>,
     ) -> EngineResult<Self> {
         let DurableSinkConfig { factory, options } = config;
         if options.max_pending_items == 0 {
@@ -638,9 +639,14 @@ impl DurableSinkDispatcher {
             let worker_factory = Arc::clone(&factory);
             let worker_sinks = Arc::clone(&sinks);
             let worker_shared = Arc::clone(&shared);
+            let worker_ownership = directory_ownership.as_ref().map(Arc::clone);
             let worker = thread::Builder::new()
                 .name(format!("shard-stream-durable-sink-{worker_index}"))
                 .spawn(move || {
+                    // Retain custody outside run_dispatcher's frame: its sink
+                    // and factory destructors must finish before this drops,
+                    // including unwinding and bounded dispatcher detachment.
+                    let ownership = worker_ownership;
                     run_dispatcher(
                         receiver,
                         worker_factory,
@@ -648,6 +654,7 @@ impl DurableSinkDispatcher {
                         options.atomic_visibility,
                         worker_shared,
                     );
+                    drop(ownership);
                 })
                 .map_err(|error| {
                     EngineError::InvalidConfig(format!(
@@ -938,6 +945,7 @@ impl Drop for DurableSinkDispatcher {
         }
         // A third-party callback may be permanently blocked. Detaching keeps
         // engine destruction bounded; WAL replay recovers uncheckpointed work.
+        // Owned workers keep their directory lock until physical destruction.
         self.workers.clear();
     }
 }
