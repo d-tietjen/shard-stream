@@ -28,11 +28,14 @@ const APPEND_GROUP_IDLE_RESET: Duration = Duration::from_millis(4);
 const SYNC_QUEUE_SLOTS: usize = 8;
 const MAX_SYNC_BATCH: usize = 8;
 /// Fixed command fields retained with a guarded append through settlement.
-pub(crate) const ADMISSION_METADATA_BYTES: usize = std::mem::size_of::<(
-    Option<Arc<dyn PendingWriteAdmission>>,
-    Option<Box<dyn PhysicalWriteGuard>>,
-    Option<Budgeted<()>>,
-)>();
+pub(crate) const ADMISSION_METADATA_BYTES: usize =
+    std::mem::size_of::<(
+        Option<Arc<dyn PendingWriteAdmission>>,
+        Option<Box<dyn PhysicalWriteGuard>>,
+        Option<Budgeted<()>>,
+    )>() + std::mem::size_of::<crate::coordinator::PreparedAppend>()
+        + std::mem::size_of::<crate::coordinator::CommitControl>()
+        + std::mem::size_of::<Arc<crate::coordinator::CoordinatorRouter>>();
 
 /// Computes the declared command charge without claiming a process RAM bound.
 pub(crate) fn append_command_charge(payload_bytes: usize, guarded: bool) -> Option<usize> {
@@ -44,6 +47,17 @@ pub(crate) fn append_command_charge(payload_bytes: usize, guarded: bool) -> Opti
 #[cfg(test)]
 #[path = "worker_physical_admission_tests.rs"]
 mod physical_admission_tests;
+
+mod proposal;
+pub(crate) use proposal::ProposedAppendOutcome;
+
+enum AppendReply {
+    Legacy(SyncSender<Result<AppendDurability, AppendFailure>>),
+    Proposed {
+        replication_policy: crate::PartitionReplicationPolicy,
+        response: SyncSender<ProposedAppendOutcome>,
+    },
+}
 
 struct AppendGroupTuner {
     linger: Duration,
@@ -114,7 +128,7 @@ struct AppendCommand {
     admission: Option<Arc<dyn PendingWriteAdmission>>,
     _physical_guard: Option<Box<dyn PhysicalWriteGuard>>,
     _byte_charge: Option<Budgeted<()>>,
-    response: SyncSender<Result<AppendDurability, AppendFailure>>,
+    response: AppendReply,
 }
 
 struct SyncRequest {
@@ -145,6 +159,7 @@ pub(crate) enum FetchCompletion {
 #[allow(clippy::large_enum_variant)]
 enum ShardCommand {
     Append(AppendCommand),
+    ProposedAppend(Box<proposal::ProposedAppendCommand>),
     PlanFetch {
         lane: usize,
         topic_partition: TopicPartition,
@@ -300,7 +315,7 @@ impl ShardHandle {
                 admission,
                 _physical_guard: None,
                 _byte_charge: None,
-                response,
+                response: AppendReply::Legacy(response),
             }),
             charged_bytes,
         )
@@ -488,6 +503,9 @@ fn run_worker(
                 Err(RecvTimeoutError::Disconnected) => break,
             },
         };
+        let Some(command) = proposal::resolve(command) else {
+            continue;
+        };
         match command {
             ShardCommand::Append(first) => {
                 let started = Instant::now();
@@ -500,12 +518,13 @@ fn run_worker(
                         break;
                     }
                     match receiver.recv_timeout(deadline.saturating_duration_since(now)) {
-                        Ok(command) => match retain_physical_charge(command) {
-                            ShardCommand::Append(command) => appends.push(command),
-                            command => {
+                        Ok(command) => match proposal::resolve(retain_physical_charge(command)) {
+                            Some(ShardCommand::Append(command)) => appends.push(command),
+                            Some(command) => {
                                 deferred = Some(command);
                                 break;
                             }
+                            None => continue,
                         },
                         Err(_) => break,
                     }
@@ -577,12 +596,17 @@ fn run_worker(
             } => {
                 let _ = response.send(stores.garbage_collect(topic_partition, log_start));
             }
+            ShardCommand::ProposedAppend(_) => {
+                unreachable!("proposals are resolved before dispatch")
+            }
         }
     }
 }
 
 fn retain_physical_charge(command: Budgeted<ShardCommand>) -> ShardCommand {
-    if !matches!(&*command, ShardCommand::Append(append) if append.admission.is_some()) {
+    if !matches!(&*command, ShardCommand::Append(append) if append.admission.is_some())
+        && !matches!(&*command, ShardCommand::ProposedAppend(_))
+    {
         return command.into_inner();
     }
     let (command, charge) = command.into_parts();
@@ -593,11 +617,18 @@ fn retain_physical_charge(command: Budgeted<ShardCommand>) -> ShardCommand {
             }
             ShardCommand::Append(command)
         }
+        ShardCommand::ProposedAppend(mut command) => {
+            command.byte_charge = Some(charge);
+            ShardCommand::ProposedAppend(command)
+        }
         command => command,
     }
 }
 
 fn admit_physical(command: &mut AppendCommand) -> Result<(), AppendFailure> {
+    if command._physical_guard.is_some() {
+        return Ok(());
+    }
     command._physical_guard = command
         .admission
         .as_ref()
@@ -667,6 +698,8 @@ fn send_append_results(
 }
 
 fn send_append_result(command: AppendCommand, result: Result<AppendDurability, AppendFailure>) {
+    let reservation = command.reservation;
+    let producer = command.producer;
     let AppendCommand {
         response,
         admission,
@@ -681,7 +714,22 @@ fn send_append_result(command: AppendCommand, result: Result<AppendDurability, A
     drop(payload);
     drop(admission);
     drop(charge);
-    let _ = response.send(result);
+    match response {
+        AppendReply::Legacy(response) => {
+            let _ = response.send(result);
+        }
+        AppendReply::Proposed {
+            replication_policy,
+            response,
+        } => {
+            let _ = response.send(ProposedAppendOutcome::Committed {
+                reservation,
+                producer,
+                replication_policy,
+                result,
+            });
+        }
+    }
 }
 
 fn sync_worker_stopped_error() -> StorageError {

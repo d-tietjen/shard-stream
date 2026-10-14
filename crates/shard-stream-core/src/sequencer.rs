@@ -299,6 +299,12 @@ impl TopicSequencer {
         Ok(())
     }
 
+    /// Fixed topic identity without cloning the placement ring or allocating.
+    #[must_use]
+    pub const fn topic_partition(&self) -> crate::TopicPartition {
+        crate::TopicPartition::new(self.topic_id, self.partition_id)
+    }
+
     #[must_use]
     pub const fn next_offset(&self) -> LogicalOffset {
         LogicalOffset::new(self.next_offset)

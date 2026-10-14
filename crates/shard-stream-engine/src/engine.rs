@@ -21,11 +21,12 @@ use shardlog::{
 };
 
 use crate::coordinator::{
-    CommittedBatchSet, CompleteAppend, ControlJournal, CoordinatorPool, CoordinatorRouter,
-    ReserveOutcome, VisibilityMode, recover_partition_states, retention_hints,
+    AppendIntent, CommittedBatchSet, CompleteAppend, ControlJournal, CoordinatorPool,
+    CoordinatorRouter, PrepareOutcome, ReserveOutcome, VisibilityMode, recover_partition_states,
+    retention_hints,
 };
 use crate::durable_sink::DurableSinkDispatcher;
-use crate::worker::{FetchCompletion, ShardHandle};
+use crate::worker::{FetchCompletion, ProposedAppendOutcome, ShardHandle};
 use crate::{
     DurableAppend, DurableAppendDelivery, DurableAtomicDecision, DurableAtomicGroup,
     DurableSinkCheckpoint, DurableSinkConfig, DurableSinkRecoveryMode, DurableSinkStats,
@@ -552,10 +553,43 @@ impl StreamEngine {
                 EngineError::InvalidConfig(format!("invalid append request: {error}"))
             })?;
         let topic_partition = TopicPartition::new(request.topic_id, request.partition_id);
-        let (admitted_leader_epoch, admission) = if let Some(write_fence) = &self.write_fence {
+        let mut prepared_guarded = None;
+        let mut guarded_input = None;
+        let (admitted_leader_epoch, mut admission) = if let Some(write_fence) = &self.write_fence {
             let leader_epoch = request.leader_epoch.ok_or_else(|| {
                 EngineError::Fenced("leader_epoch is required by the write fence".into())
             })?;
+            if self.requires_physical_admission {
+                // Read-only current authority can return an immutable receipt;
+                // it never grants permission for a new physical operation.
+                write_fence
+                    .check_write(topic_partition, leader_epoch)
+                    .map_err(|error| EngineError::Fenced(error.to_string()))?;
+                let digest = if request.producer.is_some() || request.atomic_group.is_some() {
+                    xxhash_rust::xxh3::xxh3_128(&request.payload).to_le_bytes()
+                } else {
+                    [0; 16]
+                };
+                let bytes = u64::try_from(request.payload.len())
+                    .map_err(|_| EngineError::InvalidConfig("append payload exceeds u64".into()))?;
+                match self._replication_progress.prepare(AppendIntent {
+                    topic_partition,
+                    request_id: request.request_id,
+                    producer: request.producer,
+                    atomic_group: request.atomic_group,
+                    record_count,
+                    payload_bytes: bytes,
+                    payload_digest: digest,
+                    durability: request.durability,
+                    admitted_leader_epoch: Some(LeaderEpoch::new(leader_epoch)),
+                })? {
+                    PrepareOutcome::Duplicate(outcome) => {
+                        return guarded_cached_response(&request, outcome);
+                    }
+                    PrepareOutcome::New(prepared) => prepared_guarded = Some(prepared),
+                }
+                guarded_input = Some((digest, bytes));
+            }
             let admission = write_fence
                 .prepare_write(topic_partition, leader_epoch)
                 .map_err(|error| EngineError::Fenced(error.to_string()))?;
@@ -583,13 +617,18 @@ impl StreamEngine {
         } else {
             (None, None)
         };
-        let payload_digest = if request.producer.is_some() || request.atomic_group.is_some() {
+        let payload_digest = if let Some((digest, _)) = guarded_input {
+            digest
+        } else if request.producer.is_some() || request.atomic_group.is_some() {
             xxhash_rust::xxh3::xxh3_128(&request.payload).to_le_bytes()
         } else {
             [0; 16]
         };
-        let payload_bytes = u64::try_from(request.payload.len())
-            .map_err(|_| EngineError::InvalidConfig("append payload exceeds u64".into()))?;
+        let payload_bytes = match guarded_input {
+            Some((_, bytes)) => bytes,
+            None => u64::try_from(request.payload.len())
+                .map_err(|_| EngineError::InvalidConfig("append payload exceeds u64".into()))?,
+        };
         if admission.is_some()
             && crate::worker::append_command_charge(request.payload.len(), true)
                 .is_none_or(|charge| charge > self.config.queue_bytes_per_shard)
@@ -599,17 +638,58 @@ impl StreamEngine {
             ));
         }
         validate_pending_admission(admission.as_ref())?;
-        let reserve_outcome = self.coordinators.reserve(
-            topic_partition,
-            request.request_id,
-            request.producer,
-            request.atomic_group,
-            record_count,
-            payload_bytes,
-            payload_digest,
-            request.durability,
-            admitted_leader_epoch,
-        )?;
+        let guarded = admission.is_some();
+        let mut guarded_result = None;
+        let reserve_outcome = if let Some(admission) = admission.take() {
+            match prepared_guarded {
+                Some(prepared) => {
+                    let ticket = self
+                        .shard_for_lane(prepared.proposal.placement().virtual_lane_id)?
+                        .begin_proposed_append(
+                            prepared,
+                            request.payload.clone(),
+                            request.durability == Durability::Object,
+                            admission,
+                            self._replication_progress.clone(),
+                        )?;
+                    match ticket.wait() {
+                        ProposedAppendOutcome::Unallocated(error)
+                        | ProposedAppendOutcome::Unknown(error) => return Err(error),
+                        ProposedAppendOutcome::Duplicate(outcome) => outcome,
+                        ProposedAppendOutcome::Committed {
+                            reservation,
+                            producer,
+                            replication_policy,
+                            result,
+                        } => {
+                            guarded_result = Some(result);
+                            ReserveOutcome::Reserved {
+                                reservation,
+                                producer,
+                                replication_policy,
+                            }
+                        }
+                    }
+                }
+                None => {
+                    return Err(EngineError::CorruptState(
+                        "physical ticket lacks its pure preparation".into(),
+                    ));
+                }
+            }
+        } else {
+            self.coordinators.reserve(
+                topic_partition,
+                request.request_id,
+                request.producer,
+                request.atomic_group,
+                record_count,
+                payload_bytes,
+                payload_digest,
+                request.durability,
+                admitted_leader_epoch,
+            )?
+        };
         let replication_policy = match reserve_outcome {
             ReserveOutcome::Duplicate {
                 replication_policy, ..
@@ -636,8 +716,13 @@ impl StreamEngine {
                 let async_followers_pending = self.replication.is_some()
                     && matches!(request.durability, Durability::Leader | Durability::Object)
                     && durable_replicas < replication_policy.replication_factor;
-                if durable_replicas >= required_replicas && !async_followers_pending {
+                if durable_replicas >= required_replicas && (guarded || !async_followers_pending) {
                     return Ok(response);
+                }
+                if guarded {
+                    return Err(EngineError::Fenced(
+                        "historical receipt replication requires separate authenticated replay authority".into(),
+                    ));
                 }
                 let Some(replication) = &self.replication else {
                     return Err(EngineError::DurabilityUnavailable {
@@ -698,7 +783,8 @@ impl StreamEngine {
         });
         let mut replication_ticket = None;
         let mut replication_start_error = None;
-        if required_followers > 0
+        if !guarded
+            && required_followers > 0
             && let (Some(replication), Some(batch)) = (&self.replication, replicated_batch.take())
         {
             match replication.begin_replicate(batch, required_followers) {
@@ -706,20 +792,23 @@ impl StreamEngine {
                 Err(error) => replication_start_error = Some(error),
             }
         }
-        let append_result = self
-            .shard_for_lane(reservation.placement.virtual_lane_id)?
-            .append(
-                reservation,
-                producer,
-                request.atomic_group.map(|group| AtomicGroupSequence {
-                    transaction_id: group.transaction_id,
-                    chunk_sequence: group.chunk_sequence,
-                    payload_digest,
-                }),
-                request.payload,
-                request.durability == Durability::Object,
-                admission,
-            );
+        let append_result = if let Some(result) = guarded_result {
+            result
+        } else {
+            self.shard_for_lane(reservation.placement.virtual_lane_id)?
+                .append(
+                    reservation,
+                    producer,
+                    request.atomic_group.map(|group| AtomicGroupSequence {
+                        transaction_id: group.transaction_id,
+                        chunk_sequence: group.chunk_sequence,
+                        payload_digest,
+                    }),
+                    request.payload,
+                    request.durability == Durability::Object,
+                    admission,
+                )
+        };
         let response = append_response(request.request_id, reservation);
         match append_result {
             Ok(mut durability) => {
@@ -748,7 +837,11 @@ impl StreamEngine {
                 } else if let (Some(replication), Some(batch)) =
                     (&self.replication, replicated_batch)
                 {
-                    match replication.replicate(batch, 0) {
+                    // Guarded local work has settled and released its physical
+                    // authority before remote admission/ACK waits. A follower
+                    // must independently prove its own physical permission.
+                    match replication.replicate(batch, if guarded { required_followers } else { 0 })
+                    {
                         Ok(remote) => {
                             durability.durable_replicas =
                                 durability.durable_replicas.saturating_add(remote);
@@ -1813,6 +1906,38 @@ fn select_fetch_plan(
     })
 }
 
+fn guarded_cached_response(
+    request: &AppendRequest,
+    outcome: ReserveOutcome,
+) -> EngineResult<AppendResponse> {
+    let ReserveOutcome::Duplicate {
+        response,
+        durable_replicas,
+        object_durable,
+        replication_policy,
+    } = outcome
+    else {
+        return Err(EngineError::CorruptState(
+            "cached response is not an existing receipt".into(),
+        ));
+    };
+    if request.durability == Durability::Object && !object_durable {
+        return Err(EngineError::ObjectDurabilityUnavailable);
+    }
+    let required = match request.durability {
+        Durability::Quorum => replication_policy.min_in_sync_replicas,
+        Durability::AllReplicas => replication_policy.replication_factor,
+        Durability::Leader | Durability::Object => 1,
+    };
+    if durable_replicas < required {
+        return Err(EngineError::Fenced(
+            "historical receipt replication requires separate authenticated replay authority"
+                .into(),
+        ));
+    }
+    Ok(response)
+}
+
 fn validate_pending_admission(
     admission: Option<&Arc<dyn PendingWriteAdmission>>,
 ) -> EngineResult<()> {
@@ -1999,6 +2124,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct RecordingSinkControl {
         state: Mutex<RecordingSinkState>,
+        validation_calls: AtomicUsize,
         failures_remaining: AtomicUsize,
         stale_conflicts_remaining: AtomicUsize,
         advancing_conflict_once: AtomicBool,
@@ -2106,6 +2232,9 @@ mod tests {
 
     impl DurableAppendSinkFactory for RecordingSinkFactory {
         fn validate_append(&self, payload: &[u8], _record_count: NonZeroU32) -> EngineResult<()> {
+            self.control
+                .validation_calls
+                .fetch_add(1, Ordering::Relaxed);
             if payload == b"reject" {
                 return Err(EngineError::InvalidConfig(
                     "recording sink rejected append".into(),
@@ -2229,6 +2358,8 @@ mod tests {
         refuse_physical: AtomicBool,
         active: Arc<AtomicUsize>,
         physical_admissions: AtomicUsize,
+        expected_ring: AtomicU64,
+        proposal_pause: Mutex<Option<Arc<ProposalPause>>>,
     }
 
     #[derive(Debug)]
@@ -2239,6 +2370,41 @@ mod tests {
     impl Drop for FixtureSettlementGuard {
         fn drop(&mut self) {
             assert_eq!(self.0.fetch_sub(1, Ordering::AcqRel), 1);
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ProposalPause {
+        entered: AtomicBool,
+        released: Mutex<bool>,
+        changed: std::sync::Condvar,
+    }
+
+    struct ReleaseProposal(Arc<ProposalPause>);
+
+    impl Drop for ReleaseProposal {
+        fn drop(&mut self) {
+            *self.0.released.lock().expect("proposal release") = true;
+            self.0.changed.notify_all();
+        }
+    }
+
+    impl FixturePendingAdmission {
+        fn acquire_guard(
+            &self,
+        ) -> Result<
+            Box<dyn shard_stream_core::PhysicalWriteGuard>,
+            shard_stream_core::WriteFenceError,
+        > {
+            self.active
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                    (active == 0).then_some(1)
+                })
+                .map_err(|_| {
+                    shard_stream_core::WriteFenceError::new("bounded fixture guard capacity")
+                })?;
+            self.physical_admissions.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(FixtureSettlementGuard(Arc::clone(&self.active))))
         }
     }
 
@@ -2253,6 +2419,38 @@ mod tests {
                 ));
             }
             Ok(())
+        }
+
+        fn try_admit_proposal(
+            &self,
+            proposal: &shard_stream_core::ReservationProposal,
+        ) -> Result<
+            Box<dyn shard_stream_core::PhysicalWriteGuard>,
+            shard_stream_core::WriteFenceError,
+        > {
+            if proposal.topic_partition()
+                != TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0))
+                || proposal.placement().leader_epoch != LeaderEpoch::new(7)
+                || proposal.placement().ring_epoch
+                    != RingEpoch::new(self.expected_ring.load(Ordering::Acquire).max(1))
+                || self.refuse_physical.load(Ordering::Acquire)
+            {
+                return Err(shard_stream_core::WriteFenceError::new(
+                    "bounded fixture proposal refusal",
+                ));
+            }
+            let guard = self.acquire_guard()?;
+            // A finite test barrier on the real worker; it is not a production
+            // authority, metadata transport or a bounded-callback qualification.
+            let pause = self.proposal_pause.lock().expect("proposal pause").clone();
+            if let Some(pause) = pause {
+                pause.entered.store(true, Ordering::Release);
+                let mut released = pause.released.lock().expect("proposal released");
+                while !*released {
+                    released = pause.changed.wait(released).expect("proposal barrier");
+                }
+            }
+            Ok(guard)
         }
 
         fn try_admit_physical(
@@ -2272,15 +2470,112 @@ mod tests {
                     "bounded fixture physical refusal",
                 ));
             }
-            self.active
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                    (active == 0).then_some(1)
-                })
+            self.acquire_guard()
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct TicketBudgetFence {
+        used: Arc<AtomicUsize>,
+        prepares: AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct TestTicketCharge(Arc<AtomicUsize>);
+
+    impl Drop for TestTicketCharge {
+        fn drop(&mut self) {
+            assert_eq!(self.0.fetch_sub(1, Ordering::AcqRel), 1);
+        }
+    }
+
+    #[derive(Debug)]
+    struct BudgetTicket {
+        charge: Arc<TestTicketCharge>,
+        admitted: AtomicBool,
+    }
+
+    #[derive(Debug)]
+    struct BudgetGuard {
+        _charge: Arc<TestTicketCharge>,
+    }
+    impl shard_stream_core::PhysicalWriteGuard for BudgetGuard {}
+
+    impl PendingWriteAdmission for BudgetTicket {
+        fn validate_before_reserve(&self) -> Result<(), shard_stream_core::WriteFenceError> {
+            if self.admitted.load(Ordering::Acquire) {
+                return Err(shard_stream_core::WriteFenceError::new(
+                    "fixture ticket is single-use",
+                ));
+            }
+            Ok(())
+        }
+        fn try_admit_proposal(
+            &self,
+            proposal: &shard_stream_core::ReservationProposal,
+        ) -> Result<
+            Box<dyn shard_stream_core::PhysicalWriteGuard>,
+            shard_stream_core::WriteFenceError,
+        > {
+            ExactEpochFence.check_write(
+                proposal.topic_partition(),
+                proposal.placement().leader_epoch.get(),
+            )?;
+            if proposal.placement().ring_epoch != RingEpoch::new(1) {
+                return Err(shard_stream_core::WriteFenceError::new(
+                    "fixture ring changed",
+                ));
+            }
+            self.admitted
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .map_err(|_| {
-                    shard_stream_core::WriteFenceError::new("bounded fixture guard capacity")
+                    shard_stream_core::WriteFenceError::new("fixture ticket is single-use")
                 })?;
-            self.physical_admissions.fetch_add(1, Ordering::Relaxed);
-            Ok(Box::new(FixtureSettlementGuard(Arc::clone(&self.active))))
+            Ok(Box::new(BudgetGuard {
+                _charge: self.charge.clone(),
+            }))
+        }
+        fn try_admit_physical(
+            &self,
+            _reservation: &Reservation,
+        ) -> Result<
+            Box<dyn shard_stream_core::PhysicalWriteGuard>,
+            shard_stream_core::WriteFenceError,
+        > {
+            Err(shard_stream_core::WriteFenceError::new(
+                "fixture incoming replica authority is unavailable",
+            ))
+        }
+    }
+
+    impl WriteFence for TicketBudgetFence {
+        fn check_write(
+            &self,
+            partition: TopicPartition,
+            epoch: u64,
+        ) -> Result<(), shard_stream_core::WriteFenceError> {
+            ExactEpochFence.check_write(partition, epoch)
+        }
+        fn requires_physical_admission(&self) -> bool {
+            true
+        }
+        fn prepare_write(
+            &self,
+            partition: TopicPartition,
+            epoch: u64,
+        ) -> Result<Option<Arc<dyn PendingWriteAdmission>>, shard_stream_core::WriteFenceError>
+        {
+            self.check_write(partition, epoch)?;
+            self.prepares.fetch_add(1, Ordering::Relaxed);
+            self.used
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| {
+                    shard_stream_core::WriteFenceError::new("fixture ticket capacity is occupied")
+                })?;
+            Ok(Some(Arc::new(BudgetTicket {
+                charge: Arc::new(TestTicketCharge(self.used.clone())),
+                admitted: AtomicBool::new(false),
+            })))
         }
     }
 
@@ -3823,7 +4118,7 @@ mod tests {
     }
 
     #[test]
-    fn guarded_early_refusal_has_no_allocation_and_late_refusal_preserves_real_abort_lineage() {
+    fn guarded_early_and_queued_physical_refusal_leave_no_allocation_or_abort_gap() {
         let directory = TempDir::new("guarded-refusal-lineage");
         let admission = Arc::new(FixturePendingAdmission::default());
         let fence = Arc::new(FixturePendingFence {
@@ -3879,12 +4174,12 @@ mod tests {
             engine.append(refused),
             Err(EngineError::Fenced(_))
         ));
-        let aborted = engine
-            .watermarks(partition)
-            .expect("actual terminal abort frontiers");
-        assert_eq!(aborted.allocated_end, LogicalOffset::new(1));
-        assert_eq!(aborted.contiguous_log_end, LogicalOffset::new(1));
-        assert_eq!(aborted.last_stable_offset, LogicalOffset::new(1));
+        assert_eq!(
+            engine
+                .watermarks(partition)
+                .expect("queued refused frontiers"),
+            before
+        );
         assert!(
             engine
                 .fetch(fetch_request(0))
@@ -3892,18 +4187,18 @@ mod tests {
                 .is_empty()
         );
         admission.refuse_physical.store(false, Ordering::Release);
-        let mut next = append_request(2, b"later real WAL after abort", None);
+        let mut next = append_request(2, b"later real WAL after refusal", None);
         next.leader_epoch = Some(7);
         let receipt = engine.append(next).expect("actual later physical progress");
-        assert_eq!(receipt.first_offset, LogicalOffset::new(1));
+        assert_eq!(receipt.first_offset, LogicalOffset::new(0));
         let wal = engine
             .fetch(fetch_request(0))
             .expect("actual data excludes refused slot");
         assert_eq!(wal.len(), 1);
-        assert_eq!(wal[0].first_offset, LogicalOffset::new(1));
+        assert_eq!(wal[0].first_offset, LogicalOffset::new(0));
         drop(engine);
         let reopened = StreamEngine::open_with_fence(config(&directory.0), fence)
-            .expect("recover interior abort gap");
+            .expect("recover only genuinely committed data");
         let recovered = reopened
             .fetch(fetch_request(0))
             .expect("recovered actual data");
@@ -3913,11 +4208,473 @@ mod tests {
                 .watermarks(partition)
                 .expect("recovered allocated frontier")
                 .allocated_end,
-            LogicalOffset::new(2)
+            LogicalOffset::new(1)
         );
         assert_eq!(admission.active.load(Ordering::Acquire), 0);
-        // No sink is installed: this test cannot qualify abort-gap checkpoint
-        // advancement, lease transitions or an external replica authority.
+        // No external authority is installed: this tests genuine engine/WAL
+        // sequencing rather than controller leases or a replica credential.
+    }
+
+    fn proposed_test_request(
+        engine: &StreamEngine,
+        request: &AppendRequest,
+    ) -> crate::coordinator::PreparedAppend {
+        let record_count = request
+            .validate(engine.maximum_batch_bytes())
+            .expect("actual request validation");
+        let payload_digest = if request.producer.is_some() || request.atomic_group.is_some() {
+            xxhash_rust::xxh3::xxh3_128(&request.payload).to_le_bytes()
+        } else {
+            [0; 16]
+        };
+        let intent = AppendIntent {
+            topic_partition: TopicPartition::new(request.topic_id, request.partition_id),
+            request_id: request.request_id,
+            producer: request.producer,
+            atomic_group: request.atomic_group,
+            record_count,
+            payload_bytes: request.payload.len() as u64,
+            payload_digest,
+            durability: request.durability,
+            admitted_leader_epoch: request.leader_epoch.map(LeaderEpoch::new),
+        };
+        match engine
+            ._replication_progress
+            .prepare(intent)
+            .expect("pure genuine preparation")
+        {
+            PrepareOutcome::New(prepared) => prepared,
+            PrepareOutcome::Duplicate(_) => panic!("new fixture input must not be a receipt"),
+        }
+    }
+
+    #[test]
+    fn proposal_refusal_preserves_producer_and_atomic_retry_and_later_sink_progress() {
+        for producer in [
+            None,
+            Some(ProducerIdentity {
+                producer_id: 17,
+                epoch: 1,
+                first_sequence: 0,
+                event_id: None,
+            }),
+        ] {
+            let directory = TempDir::new("proposal-refusal-index");
+            let admission = Arc::new(FixturePendingAdmission::default());
+            let fence = Arc::new(FixturePendingFence {
+                admission: admission.clone(),
+                declared: true,
+            });
+            let control = Arc::new(RecordingSinkControl::default());
+            let engine = StreamEngine::open_with_all_components_and_durable_sink(
+                config(&directory.0),
+                Some(fence),
+                None,
+                None,
+                Some(recording_sink_config(
+                    &control,
+                    DurableSinkOptions::default(),
+                )),
+            )
+            .expect("real engine and checkpointed sink");
+            engine
+                .create_topic(TopicConfig {
+                    topic_id: TopicId::new(1),
+                    partitions: 1,
+                    shards: None,
+                })
+                .expect("topic");
+            let partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+            let mut request = append_request(1, b"indexed after a refused proposal", producer);
+            request.leader_epoch = Some(7);
+            request.atomic_group = Some(AtomicGroupIdentity {
+                transaction_id: 91,
+                chunk_sequence: 0,
+            });
+            admission.refuse_physical.store(true, Ordering::Release);
+            assert!(matches!(
+                engine.append(request.clone()),
+                Err(EngineError::Fenced(_))
+            ));
+            assert_eq!(
+                engine
+                    .watermarks(partition)
+                    .expect("refused allocation")
+                    .allocated_end,
+                LogicalOffset::new(0)
+            );
+            assert!(
+                engine
+                    .fetch(fetch_request(0))
+                    .expect("refused data WAL")
+                    .is_empty()
+            );
+            assert!(matches!(
+                engine.inspect_atomic_group(partition, 91),
+                Err(EngineError::UnknownAtomicGroup(91))
+            ));
+            if let Some(producer) = producer {
+                assert!(
+                    engine
+                        .producer_progress(partition, producer.producer_id)
+                        .expect("unpoisoned producer")
+                        .is_none()
+                );
+            }
+            admission.refuse_physical.store(false, Ordering::Release);
+            let receipt = engine
+                .append(request.clone())
+                .expect("same input is still eligible");
+            assert_eq!(receipt.first_offset, LogicalOffset::new(0));
+            assert_eq!(admission.active.load(Ordering::Acquire), 0);
+            let admissions = admission.physical_admissions.load(Ordering::Acquire);
+            assert_eq!(
+                engine.append(request).expect("exact existing receipt"),
+                receipt
+            );
+            assert_eq!(
+                admission.physical_admissions.load(Ordering::Acquire),
+                admissions
+            );
+            engine
+                .commit_atomic_group(partition, 91)
+                .expect("actual atomic decision");
+            wait_for_test(|| {
+                engine
+                    .durable_sink_checkpoint(partition)
+                    .expect("real sink checkpoint")
+                    .is_some_and(|checkpoint| checkpoint.next_offset == LogicalOffset::new(1))
+            });
+            let state = control.state.lock().expect("actual sink state");
+            assert_eq!(state.appends.len(), 1);
+            assert_eq!(
+                state.appends[0].reservation.first_offset,
+                LogicalOffset::new(0)
+            );
+            assert_eq!(
+                state.appends[0].payload,
+                Bytes::from_static(b"indexed after a refused proposal")
+            );
+            drop(state);
+            let wal = engine
+                .fetch(fetch_request(0))
+                .expect("visible committed data");
+            assert_eq!(wal.len(), 1);
+            drop(engine);
+            let reopened = StreamEngine::open(config(&directory.0))
+                .expect("genuine recovery without aborted gap");
+            assert_eq!(
+                reopened
+                    .fetch(fetch_request(0))
+                    .expect("recovered exact data"),
+                wal
+            );
+        }
+    }
+
+    #[test]
+    fn engine_cached_receipt_needs_no_ticket_or_sink_charge_under_escaped_guard_capacity() {
+        // A bounded neutral fence qualifies engine ownership, not a real lease/HA authority.
+        let directory = TempDir::new("cached-engine-receipt-capacity");
+        let fence = Arc::new(TicketBudgetFence::default());
+        let control = Arc::new(RecordingSinkControl::default());
+        let engine = StreamEngine::open_with_all_components_and_durable_sink(
+            config(&directory.0),
+            Some(fence.clone()),
+            None,
+            None,
+            Some(recording_sink_config(
+                &control,
+                DurableSinkOptions::default(),
+            )),
+        )
+        .expect("real guarded engine and sink");
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("topic");
+        let partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        let mut request = append_request(
+            1,
+            b"immutable durable receipt",
+            Some(ProducerIdentity {
+                producer_id: 31,
+                epoch: 1,
+                first_sequence: 0,
+                event_id: None,
+            }),
+        );
+        request.leader_epoch = Some(7);
+        let receipt = engine.append(request.clone()).expect("actual initial WAL");
+        wait_for_test(|| engine.durable_sink_stats().pending_items == 0);
+        let before = engine
+            .watermarks(partition)
+            .expect("actual committed frontier");
+        let before_wal = engine
+            .fetch(fetch_request(0))
+            .expect("actual committed WAL");
+        let mut next = append_request(
+            2,
+            b"new write after capacity recovery",
+            Some(ProducerIdentity {
+                producer_id: 31,
+                epoch: 1,
+                first_sequence: 1,
+                event_id: None,
+            }),
+        );
+        next.leader_epoch = Some(7);
+        let prepared = proposed_test_request(&engine, &next);
+        let ticket = fence
+            .prepare_write(partition, 7)
+            .expect("actual bounded ticket")
+            .expect("ticket");
+        let guard = ticket
+            .try_admit_proposal(&prepared.proposal)
+            .expect("owned physical permission");
+        drop(ticket);
+        assert_eq!(fence.used.load(Ordering::Acquire), 1);
+        let prepares = fence.prepares.load(Ordering::Acquire);
+        let validations = control.validation_calls.load(Ordering::Acquire);
+        assert_eq!(
+            engine
+                .append(request.clone())
+                .expect("cached ACK under occupied ticket capacity"),
+            receipt
+        );
+        assert_eq!(fence.prepares.load(Ordering::Acquire), prepares);
+        assert_eq!(
+            control.validation_calls.load(Ordering::Acquire),
+            validations
+        );
+        assert_eq!(fence.used.load(Ordering::Acquire), 1);
+        assert_eq!(
+            engine
+                .watermarks(partition)
+                .expect("cached path does not allocate"),
+            before
+        );
+        assert_eq!(
+            engine
+                .fetch(fetch_request(0))
+                .expect("cached path has no new WAL"),
+            before_wal
+        );
+        let mut wrong_payload = request.clone();
+        wrong_payload.payload = Bytes::from_static(b"different bytes at the old producer sequence");
+        assert!(matches!(
+            engine.append(wrong_payload),
+            Err(EngineError::DuplicateSequenceMismatch(31))
+        ));
+        let mut wrong_count = request.clone();
+        wrong_count.record_count = 2;
+        assert!(matches!(
+            engine.append(wrong_count),
+            Err(EngineError::DuplicateSequenceMismatch(31))
+        ));
+        request.leader_epoch = Some(6);
+        assert!(matches!(
+            engine.append(request),
+            Err(EngineError::Fenced(_))
+        ));
+        assert_eq!(fence.prepares.load(Ordering::Acquire), prepares);
+        assert!(matches!(
+            engine.append(next.clone()),
+            Err(EngineError::Fenced(_))
+        ));
+        assert_eq!(
+            engine
+                .watermarks(partition)
+                .expect("new input refusal has no allocation"),
+            before
+        );
+        drop(guard);
+        assert_eq!(fence.used.load(Ordering::Acquire), 0);
+        assert_eq!(
+            engine
+                .append(next)
+                .expect("actual same-producer progress after final owner Drop")
+                .first_offset,
+            LogicalOffset::new(1)
+        );
+    }
+
+    #[test]
+    fn stale_queued_proposal_conflict_has_no_new_allocation_or_producer_poison() {
+        let directory = TempDir::new("proposal-compare-commit");
+        let admission = Arc::new(FixturePendingAdmission::default());
+        let engine = StreamEngine::open_with_fence(
+            config(&directory.0),
+            Arc::new(FixturePendingFence {
+                admission: admission.clone(),
+                declared: true,
+            }),
+        )
+        .expect("guarded engine");
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("topic");
+        let partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        let mut stale = append_request(
+            2,
+            b"second producer",
+            Some(ProducerIdentity {
+                producer_id: 22,
+                epoch: 1,
+                first_sequence: 0,
+                event_id: None,
+            }),
+        );
+        stale.leader_epoch = Some(7);
+        let prepared = proposed_test_request(&engine, &stale);
+        let mut first = append_request(1, b"first actual record", None);
+        first.leader_epoch = Some(7);
+        engine
+            .append(first)
+            .expect("a genuine competing commit wins");
+        let before = engine
+            .watermarks(partition)
+            .expect("before stale queued proposal");
+        let ticket = engine
+            .shard_for_lane(prepared.proposal.placement().virtual_lane_id)
+            .expect("real lane")
+            .begin_proposed_append(
+                prepared,
+                stale.payload.clone(),
+                false,
+                admission,
+                engine._replication_progress.clone(),
+            )
+            .expect("charged actual queue");
+        assert!(matches!(
+            ticket.wait(),
+            ProposedAppendOutcome::Unallocated(EngineError::Sequencer(
+                shard_stream_core::SequencerError::ReservationProposalChanged
+            ))
+        ));
+        assert_eq!(
+            engine
+                .watermarks(partition)
+                .expect("conflict changes no allocation"),
+            before
+        );
+        assert!(
+            engine
+                .producer_progress(partition, 22)
+                .expect("producer was not advanced or failed")
+                .is_none()
+        );
+        assert_eq!(
+            engine
+                .fetch(fetch_request(0))
+                .expect("actual WAL retains winner only")
+                .len(),
+            1
+        );
+        assert_eq!(
+            engine
+                .append(stale)
+                .expect("fresh same-producer progress")
+                .first_offset,
+            LogicalOffset::new(1)
+        );
+    }
+
+    #[test]
+    fn queued_proposal_cancellation_prevents_late_allocation_and_preserves_same_input() {
+        let directory = TempDir::new("proposal-cancellation");
+        let pause = Arc::new(ProposalPause::default());
+        let admission = Arc::new(FixturePendingAdmission::default());
+        *admission
+            .proposal_pause
+            .lock()
+            .expect("install finite test barrier") = Some(pause.clone());
+        let engine = StreamEngine::open_with_fence(
+            config(&directory.0),
+            Arc::new(FixturePendingFence {
+                admission: admission.clone(),
+                declared: true,
+            }),
+        )
+        .expect("guarded engine");
+        // Declared after the engine so unwind releases the worker before engine Drop.
+        let release = ReleaseProposal(pause.clone());
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("topic");
+        let partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        let mut request = append_request(
+            1,
+            b"cancelled producer can still progress",
+            Some(ProducerIdentity {
+                producer_id: 29,
+                epoch: 1,
+                first_sequence: 0,
+                event_id: None,
+            }),
+        );
+        request.leader_epoch = Some(7);
+        let prepared = proposed_test_request(&engine, &request);
+        let ticket = engine
+            .shard_for_lane(prepared.proposal.placement().virtual_lane_id)
+            .expect("real lane")
+            .begin_proposed_append(
+                prepared,
+                request.payload.clone(),
+                false,
+                admission.clone(),
+                engine._replication_progress.clone(),
+            )
+            .expect("actual charged proposal");
+        wait_for_test(|| pause.entered.load(Ordering::Acquire));
+        assert_eq!(admission.active.load(Ordering::Acquire), 1);
+        drop(ticket); // Actual caller-drop cancellation while the worker owns its guard.
+        assert_eq!(
+            engine
+                .watermarks(partition)
+                .expect("not yet allocated")
+                .allocated_end,
+            LogicalOffset::new(0)
+        );
+        drop(release);
+        assert!(
+            engine
+                .fetch(fetch_request(0))
+                .expect("physical barrier and queue settle")
+                .is_empty()
+        );
+        assert_eq!(
+            engine
+                .watermarks(partition)
+                .expect("cancelled commit cannot run later")
+                .allocated_end,
+            LogicalOffset::new(0)
+        );
+        assert!(
+            engine
+                .producer_progress(partition, 29)
+                .expect("cancel does not poison producer")
+                .is_none()
+        );
+        assert_eq!(admission.active.load(Ordering::Acquire), 0);
+        assert_eq!(
+            engine
+                .append(request)
+                .expect("same-ID actual later progress")
+                .first_offset,
+            LogicalOffset::new(0)
+        );
     }
 
     #[test]

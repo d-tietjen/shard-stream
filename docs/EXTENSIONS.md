@@ -35,9 +35,16 @@ leader epoch. Its typed coordinates are not a WAL or replication reservation.
 and prior leader epoch before changing state; a conflict consumes nothing.
 The caller must serialize commit with other sequencer mutations and separately
 retain genuine physical authority. Proposals establish no authority themselves.
-The engine's existing append path still reserves before its physical queue;
-this sequencer primitive alone does not remove late-refusal abort gaps or
-establish durable-index progress after a refused queued append.
+For a local-leader append with a physical ticket, the coordinator first
+prepares the proposal and the relevant producer/atomic-group counters without
+mutating them. The engine charges and queues input on the proposed lane. The
+worker obtains genuine permission through `try_admit_proposal`, then commits
+only if the proposal, prior epoch, ring, dense index, replication policy and
+relevant producer/atomic-group state still agree. A refusal, callback panic,
+queue refusal, cancellation or compare conflict before commit allocates no
+coordinates, creates no abort and does not fail the producer. Only a committed
+reservation can enter WAL, replication or durable-sink publication. The
+unfenced/check-only path preserves its existing parallel append flow.
 
 The accepted epoch is reservation identity. The default `WriteFence`
 preparation calls `check_write` and returns no pending ticket, preserving
@@ -49,8 +56,12 @@ A host requiring that boundary declares the immutable
 `requires_physical_admission` contract and implements `prepare_write` with a
 `PendingWriteAdmission`. A pending ticket owns no physical permission.
 `validate_before_reserve` rejects authority already revoked during preflight
-or capacity waits. The shard calls `try_admit_physical` with the actual
-reservation before any append preparation or data WAL mutation. The host must
+or capacity waits. For local leaders, the shard calls `try_admit_proposal`
+with typed prospective coordinates, without constructing a reservation. An
+existing strict ticket's default proposal method refuses until its host
+implements this contract. Allocated incoming replicas continue to use
+`try_admit_physical`; positive authenticated follower installation is a
+separate required stage. The host must
 join current partition, epoch, ring, role and genuine lease validity to its
 shared transition state and return an owned `PhysicalWriteGuard`. Pending
 revocation must stop new admissions, and conflicting effective ownership must
@@ -63,9 +74,10 @@ proof.
 The engine moves the guard and byte charge with the physical append command,
 including batching and the sync queue, until physical settlement. Dropping a
 producer response cannot release them early. Guard ownership ends before a
-subsequent durable-index acknowledgement wait. Physical admission refusal or
-panic occurs before data WAL mutation and uses the existing definitely-not-
-written failure path; a storage or sync-dispatch failure remains ambiguous.
+subsequent remote or durable-index acknowledgement wait. Local-leader
+physical refusal or panic precedes allocation and is returned separately from
+failure of an allocated reservation. Storage or sync-dispatch failure after
+commit retains the existing failure/recovery semantics and remains ambiguous.
 Before storage opens, a guarded constructor verifies that both configured
 request ceilings plus command and fixed admission metadata fit the shard byte
 budget. A guarded operation checks its actual charge before reservation, and
@@ -73,6 +85,35 @@ a ticket inconsistent with the installation contract is refused. The reported
 maximum payload remains the configured maximum when that guarded
 configuration is valid. These are command/input budgets, not process RAM
 limits; a host must bound its own ticket and guard allocations.
+
+Proposal RPCs use the existing bounded coordinator queue with nonblocking
+queue admission and one preparation plus one commit attempt. Both have a
+one-second response interval. Preparation has no mutations. A commit still in
+`Pending` may atomically become `Cancelled`, preventing later allocation;
+once `Committing` wins, its physical worker retains capacity and permission
+until the actual reply or destruction of its reply sender after settlement or
+coordinator failure. Only a successful `Pending` cancellation or an actual
+returned precommit refusal proves no allocation. A missing reply after commit
+wins is `Unknown`: it cannot create an abort or index delivery, nor prove that
+sequencing, producer or group state stayed unchanged. There is no detached
+replacement job or automatic proposal reroute. The new handlers perform no journal or host
+metadata I/O, but the shared coordinator still executes existing journal
+control operations. Therefore this interval is not a strict wall-clock bound
+on an already committing operation, storage I/O or engine destruction.
+
+For guarded new local writes, replication dispatch follows successful local
+WAL/sync settlement; the local physical guard ends before peer acknowledgement
+waiting. Each follower must independently verify its current credential,
+incarnation, remote lease, role and physical permission. This ordering does
+not provide that missing positive follower/HA contract. A sufficiently durable
+cached receipt keeps its exact identity. The strict path first uses a
+read-only current-authority check plus full producer/chunk duplicate validation;
+it returns an eligible immutable ACK before ticket acquisition, sink validation
+or physical charge. That read-only check grants no new write permission. Only
+new prepared work acquires owned capacity and its physical guard. A guarded
+historical retry that
+would dispatch new peer WAL is refused until a separate authenticated replay
+lineage contract exists; its old placement must not be restamped.
 
 `DurableApplyQueue::append_from_peer` carries `ReplicaSourceIdentity` obtained
 from a verified transport to `prepare_replica_write`. Identity fields alone
@@ -90,9 +131,10 @@ restamped as a new current-term append. An exact duplicate acquires no new
 physical guard and retains its original persisted coordinates.
 
 These contracts alone do not supply a host authority implementation, HA quorum
-or indexed replay. A late physical refusal retains the existing abort
-algorithm: an allocated slot becomes an in-memory abort without rewinding the
-normal sequencer. A later durable extent permits recovery of an interior gap;
+or indexed replay. Local-leader proposal refusal does not create an
+allocated gap. Already allocated replica or storage failures retain the
+existing abort algorithm: an allocated slot can become an in-memory abort
+without rewinding the normal sequencer. A later durable extent permits recovery of an interior gap;
 an unpersisted tail can disappear during restart. In-memory aborts are not
 durable sink checkpoint evidence. The current sink does not advance across
 such a gap, and a safe checkpoint-only advancement requires durable abort

@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::{BrokerId, Reservation, TopicPartition};
+use crate::{BrokerId, Reservation, ReservationProposal, TopicPartition};
 
 /// Trusted transport context associated with an authenticated replica sender.
 ///
@@ -23,7 +23,7 @@ pub struct ReplicaSourceIdentity {
 /// Pending authority for one admitted write, without physical write permission.
 ///
 /// Implementations join the original admission to the same transition state at
-/// physical mutation. Both methods must be bounded and nonblocking, using
+/// physical mutation. Its methods must be bounded and nonblocking, using
 /// already verified local state rather than metadata or network I/O.
 pub trait PendingWriteAdmission: Send + Sync + fmt::Debug {
     /// Refuses authority already revoked during preflight or capacity waits.
@@ -31,6 +31,24 @@ pub trait PendingWriteAdmission: Send + Sync + fmt::Debug {
     /// This check precedes a new reservation. It is not a settlement guard and
     /// cannot by itself synchronize later revocation with physical mutation.
     fn validate_before_reserve(&self) -> Result<(), WriteFenceError>;
+
+    /// Obtains physical authority for exact prospective coordinates before any
+    /// offset, producer cursor or atomic-group state is allocated.
+    ///
+    /// The worker has already charged and queued its input. Commit must compare
+    /// this same proposal and retain the returned guard through local WAL/sync
+    /// settlement. The proposal is not an allocated reservation. Implementations
+    /// must validate its genuine topic, ring and epoch with the same transition
+    /// state as their reservation admission; no metadata I/O is permitted.
+    /// Existing tickets fail closed until their host implements this boundary.
+    fn try_admit_proposal(
+        &self,
+        _proposal: &ReservationProposal,
+    ) -> Result<Box<dyn PhysicalWriteGuard>, WriteFenceError> {
+        Err(WriteFenceError::new(
+            "physical reservation-proposal admission is not implemented",
+        ))
+    }
 
     /// Joins the exact reservation to current authority at physical admission.
     ///

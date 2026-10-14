@@ -131,7 +131,7 @@ impl Fixture {
                 admission: Some(admission.clone()),
                 _physical_guard: None,
                 _byte_charge: None,
-                response,
+                response: AppendReply::Legacy(response),
             }),
             receiver,
         )

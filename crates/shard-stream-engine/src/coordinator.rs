@@ -22,6 +22,11 @@ use crate::{
     TopicConfig,
 };
 
+mod proposal;
+pub(crate) use proposal::{
+    AppendIntent, CommitControl, CommitOutcome, PrepareOutcome, PreparedAppend,
+};
+
 const COORDINATOR_QUEUE_SLOTS: usize = 16_384;
 const CONTROL_QUEUE_SLOTS: usize = 1_024;
 const MAX_RECOVERED_GAP_BATCHES: u128 = 1_000_000;
@@ -56,7 +61,7 @@ struct AtomicGroupRuntime {
     record_count: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProducerCursor {
     epoch: u32,
     next_sequence: u64,
@@ -502,6 +507,15 @@ enum CoordinatorCommand {
         admitted_leader_epoch: Option<LeaderEpoch>,
         response: SyncSender<EngineResult<ReserveOutcome>>,
     },
+    Prepare {
+        intent: AppendIntent,
+        response: SyncSender<EngineResult<PrepareOutcome>>,
+    },
+    CommitPrepared {
+        prepared: PreparedAppend,
+        control: std::sync::Arc<CommitControl>,
+        response: SyncSender<EngineResult<ReserveOutcome>>,
+    },
     ReserveReplica {
         topic_partition: TopicPartition,
         reservation: Reservation,
@@ -643,6 +657,53 @@ pub(crate) struct CoordinatorRouter {
 }
 
 impl CoordinatorRouter {
+    pub(crate) fn prepare(&self, intent: AppendIntent) -> EngineResult<PrepareOutcome> {
+        let (response, receiver) = sync_channel(1);
+        self.try_send(
+            intent.topic_partition,
+            CoordinatorCommand::Prepare { intent, response },
+        )?;
+        receiver.recv_timeout(proposal::RPC_TIMEOUT).map_err(|_| {
+            EngineError::Fenced(
+                "reservation preparation did not complete before its deadline".into(),
+            )
+        })?
+    }
+
+    pub(crate) fn commit_prepared(
+        &self,
+        prepared: PreparedAppend,
+        control: std::sync::Arc<CommitControl>,
+    ) -> CommitOutcome {
+        let (response, receiver) = sync_channel(1);
+        if let Err(error) = self.try_send(
+            prepared.intent.topic_partition,
+            CoordinatorCommand::CommitPrepared {
+                prepared,
+                control: control.clone(),
+                response,
+            },
+        ) {
+            // A rejected queue admission cannot have reached the coordinator.
+            control.cancel();
+            return CommitOutcome::Unallocated(error);
+        }
+        proposal::await_commit(receiver, &control)
+    }
+
+    fn try_send(
+        &self,
+        topic_partition: TopicPartition,
+        command: CoordinatorCommand,
+    ) -> EngineResult<()> {
+        let index = coordinator_index(topic_partition, self.senders.len());
+        self.senders[index].try_send(command).map_err(|_| {
+            EngineError::Fenced(
+                "reservation coordinator is unavailable or its bounded queue is full".into(),
+            )
+        })
+    }
+
     pub(crate) fn replica_count_durable(&self, reservation: Reservation, durable_replicas: u32) {
         let topic_partition = TopicPartition::new(reservation.topic_id, reservation.partition_id);
         let index = coordinator_index(topic_partition, self.senders.len());
@@ -1200,6 +1261,20 @@ fn run_coordinator(
                 );
                 let _ = response.send(result);
             }
+            CoordinatorCommand::Prepare { intent, response } => {
+                let result = state(&states, intent.topic_partition)
+                    .and_then(|state| proposal::prepare(state, intent));
+                let _ = response.send(result);
+            }
+            CoordinatorCommand::CommitPrepared {
+                prepared,
+                control,
+                response,
+            } => {
+                let result = state_mut(&mut states, prepared.intent.topic_partition)
+                    .and_then(|state| proposal::commit(state, prepared, Some(&control)));
+                let _ = response.send(result);
+            }
             CoordinatorCommand::ReplicaCountDurable {
                 topic_partition,
                 reservation,
@@ -1528,77 +1603,21 @@ fn reserve(
     durability: Durability,
     admitted_leader_epoch: Option<LeaderEpoch>,
 ) -> EngineResult<ReserveOutcome> {
-    if let Some((response, durable_replicas, object_durable)) = check_producer(
-        state,
+    let intent = AppendIntent {
+        topic_partition: state.sequencer.topic_partition(),
         request_id,
         producer,
+        atomic_group,
         record_count,
+        payload_bytes,
         payload_digest,
         durability,
-    )? {
-        return Ok(ReserveOutcome::Duplicate {
-            response,
-            durable_replicas,
-            object_durable,
-            replication_policy: state.replication_policy,
-        });
+        admitted_leader_epoch,
+    };
+    match proposal::prepare(state, intent)? {
+        PrepareOutcome::Duplicate(outcome) => Ok(outcome),
+        PrepareOutcome::New(prepared) => proposal::commit(state, prepared, None),
     }
-    if let Some(group) = atomic_group
-        && let Some(duplicate) = check_atomic_group(
-            state,
-            request_id,
-            group,
-            record_count,
-            payload_bytes,
-            payload_digest,
-        )?
-    {
-        return Ok(duplicate);
-    }
-    // Existing receipts retain their exact placement. Only a new physical
-    // append observes the epoch accepted by the engine's installed fence.
-    if let Some(leader_epoch) = admitted_leader_epoch {
-        state.sequencer.observe_leader_epoch(leader_epoch)?;
-    }
-    let previous = state.sequencer.state();
-    let reservation = state.sequencer.reserve(record_count)?;
-    if let Some(identity) = producer
-        && let Err(error) = advance_producer(state, identity, record_count)
-    {
-        state.sequencer =
-            TopicSequencer::restore(previous).expect("previous sequencer state was valid");
-        return Err(error);
-    }
-    let producer_sequence = producer.map(|identity| ProducerSequence {
-        producer_id: identity.producer_id,
-        epoch: identity.epoch,
-        first_sequence: identity.first_sequence,
-        event_id: identity.event_id,
-        digest_algorithm: DIGEST_XXH3_128,
-        payload_digest,
-    });
-    append_batch_runtime(
-        state,
-        BatchRuntime {
-            reservation,
-            status: BatchStatus::Pending,
-            durable_replicas: 0,
-            replica_acks: 0,
-            producer,
-            atomic_group,
-            payload_digest: Some(payload_digest),
-            payload_bytes,
-            object_durable: false,
-        },
-    )?;
-    if let Some(group) = atomic_group {
-        register_atomic_chunk(state, group, reservation, payload_bytes)?;
-    }
-    Ok(ReserveOutcome::Reserved {
-        reservation,
-        producer: producer_sequence,
-        replication_policy: state.replication_policy,
-    })
 }
 
 fn complete(
