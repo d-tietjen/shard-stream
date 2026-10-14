@@ -16,7 +16,8 @@ use super::{
 };
 use crate::PartitionReplicationPolicy;
 use crate::coordinator::{
-    CommitControl, CommitOutcome, CoordinatorRouter, PreparedAppend, ReserveOutcome,
+    CommitControl, CommitOutcome, CoordinatorRouter, PreparedAppend, PreparedReplica,
+    ReserveOutcome,
 };
 use crate::{EngineError, EngineResult};
 
@@ -60,8 +61,33 @@ impl Drop for ProposedAppendTicket {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum PreparedInput {
+    Leader(PreparedAppend),
+    Replica(PreparedReplica),
+}
+
+impl PreparedInput {
+    fn atomic_group(self) -> Option<AtomicGroupSequence> {
+        let (identity, payload_digest) = match self {
+            Self::Leader(prepared) => {
+                (prepared.intent.atomic_group, prepared.intent.payload_digest)
+            }
+            Self::Replica(prepared) => {
+                let intent = prepared.intent();
+                (intent.atomic_group, intent.payload_digest)
+            }
+        };
+        identity.map(|identity| AtomicGroupSequence {
+            transaction_id: identity.transaction_id,
+            chunk_sequence: identity.chunk_sequence,
+            payload_digest,
+        })
+    }
+}
+
 pub(super) struct ProposedAppendCommand {
-    prepared: PreparedAppend,
+    prepared: PreparedInput,
     payload: Bytes,
     object_durable: bool,
     admission: Arc<dyn PendingWriteAdmission>,
@@ -75,6 +101,39 @@ impl ShardHandle {
     pub(crate) fn begin_proposed_append(
         &self,
         prepared: PreparedAppend,
+        payload: Bytes,
+        object_durable: bool,
+        admission: Arc<dyn PendingWriteAdmission>,
+        coordinator: Arc<CoordinatorRouter>,
+    ) -> EngineResult<ProposedAppendTicket> {
+        self.begin_prepared_append(
+            PreparedInput::Leader(prepared),
+            payload,
+            object_durable,
+            admission,
+            coordinator,
+        )
+    }
+
+    pub(crate) fn begin_prepared_replica(
+        &self,
+        prepared: PreparedReplica,
+        payload: Bytes,
+        admission: Arc<dyn PendingWriteAdmission>,
+        coordinator: Arc<CoordinatorRouter>,
+    ) -> EngineResult<ProposedAppendTicket> {
+        self.begin_prepared_append(
+            PreparedInput::Replica(prepared),
+            payload,
+            false,
+            admission,
+            coordinator,
+        )
+    }
+
+    fn begin_prepared_append(
+        &self,
+        prepared: PreparedInput,
         payload: Bytes,
         object_durable: bool,
         admission: Arc<dyn PendingWriteAdmission>,
@@ -151,10 +210,11 @@ pub(super) fn resolve(command: ShardCommand) -> Option<ShardCommand> {
         );
         return None;
     }
-    let guard = match catch_unwind(AssertUnwindSafe(|| {
-        command
+    let guard = match catch_unwind(AssertUnwindSafe(|| match &command.prepared {
+        PreparedInput::Leader(prepared) => command.admission.try_admit_proposal(&prepared.proposal),
+        PreparedInput::Replica(prepared) => command
             .admission
-            .try_admit_proposal(&command.prepared.proposal)
+            .try_admit_physical(&prepared.reservation()),
     })) {
         Ok(Ok(guard)) => guard,
         Ok(Err(error)) => {
@@ -170,10 +230,15 @@ pub(super) fn resolve(command: ShardCommand) -> Option<ShardCommand> {
             return None;
         }
     };
-    match command
-        .coordinator
-        .commit_prepared(command.prepared, command.control.clone())
-    {
+    let committed = match command.prepared {
+        PreparedInput::Leader(prepared) => command
+            .coordinator
+            .commit_prepared(prepared, command.control.clone()),
+        PreparedInput::Replica(prepared) => command
+            .coordinator
+            .commit_prepared_replica(prepared, command.control.clone()),
+    };
+    match committed {
         CommitOutcome::Unallocated(error) => {
             reply_unallocated(command, error, Some(guard));
             None
@@ -216,14 +281,7 @@ pub(super) fn resolve(command: ShardCommand) -> Option<ShardCommand> {
             Some(ShardCommand::Append(AppendCommand {
                 reservation,
                 producer,
-                atomic_group: prepared
-                    .intent
-                    .atomic_group
-                    .map(|identity| AtomicGroupSequence {
-                        transaction_id: identity.transaction_id,
-                        chunk_sequence: identity.chunk_sequence,
-                        payload_digest: prepared.intent.payload_digest,
-                    }),
+                atomic_group: prepared.atomic_group(),
                 payload,
                 object_durable,
                 admission: Some(admission),

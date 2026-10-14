@@ -22,8 +22,8 @@ use shardlog::{
 
 use crate::coordinator::{
     AppendIntent, CommittedBatchSet, CompleteAppend, ControlJournal, CoordinatorPool,
-    CoordinatorRouter, PrepareOutcome, ReserveOutcome, VisibilityMode, recover_partition_states,
-    retention_hints,
+    CoordinatorRouter, PrepareOutcome, PrepareReplicaOutcome, PreparedReplica, ReplicaIntent,
+    ReserveOutcome, VisibilityMode, recover_partition_states, retention_hints,
 };
 use crate::durable_sink::DurableSinkDispatcher;
 use crate::worker::{FetchCompletion, ProposedAppendOutcome, ShardHandle};
@@ -172,6 +172,10 @@ impl ReplicationProgress {
 
 pub(crate) enum ReplicaAppendPlan {
     Duplicate(AppendResponse),
+    Prepared {
+        prepared: PreparedReplica,
+        admission: Arc<dyn PendingWriteAdmission>,
+    },
     Reserved {
         response: AppendResponse,
         producer: Option<ProducerSequence>,
@@ -900,7 +904,7 @@ impl StreamEngine {
         self.plan_replica_append_from_peer(batch, None)
     }
 
-    /// Plans a reserved replica batch with optional trusted transport context.
+    /// Plans exact replica input with optional trusted transport context.
     ///
     /// The installed fence owns role/lineage validation; the context's presence
     /// alone is not authentication. Pending permission survives the physical
@@ -946,6 +950,28 @@ impl StreamEngine {
             ));
         }
         validate_pending_admission(admission.as_ref())?;
+        if let Some(admission) = admission {
+            // The actual immutable remote coordinates remain unallocated until
+            // the charged receiver shard owns a physical guard and commits.
+            return match self._replication_progress.prepare_replica(ReplicaIntent {
+                reservation: batch.reservation,
+                producer: batch.producer,
+                atomic_group: batch.atomic_group,
+                payload_bytes,
+                payload_digest: batch.payload_digest,
+            })? {
+                PrepareReplicaOutcome::New(prepared) => Ok(ReplicaAppendPlan::Prepared {
+                    prepared,
+                    admission,
+                }),
+                PrepareReplicaOutcome::Duplicate(ReserveOutcome::Duplicate {
+                    response, ..
+                }) => Ok(ReplicaAppendPlan::Duplicate(response)),
+                PrepareReplicaOutcome::Duplicate(ReserveOutcome::Reserved { .. }) => Err(
+                    EngineError::CorruptState("replica duplicate returned new allocation".into()),
+                ),
+            };
+        }
         self.coordinators
             .observe_leader_epoch(topic_partition, batch.reservation.placement.leader_epoch)?;
         let response = match self.coordinators.reserve_replica(
@@ -965,7 +991,7 @@ impl StreamEngine {
             response,
             producer,
             atomic_group,
-            admission,
+            admission: None,
         })
     }
 
@@ -996,6 +1022,18 @@ impl StreamEngine {
         &self,
         appends: Vec<(ReplicaAppend, ReplicaAppendPlan)>,
     ) -> Vec<EngineResult<AppendResponse>> {
+        enum Pending {
+            Legacy {
+                batch: ReplicaAppend,
+                response: AppendResponse,
+                receiver:
+                    Receiver<Result<crate::worker::AppendDurability, crate::worker::AppendFailure>>,
+            },
+            Prepared {
+                batch: ReplicaAppend,
+                ticket: crate::worker::ProposedAppendTicket,
+            },
+        }
         let mut results = (0..appends.len())
             .map(|_| None)
             .collect::<Vec<Option<EngineResult<AppendResponse>>>>();
@@ -1003,6 +1041,25 @@ impl StreamEngine {
         for (index, (batch, plan)) in appends.into_iter().enumerate() {
             match plan {
                 ReplicaAppendPlan::Duplicate(response) => results[index] = Some(Ok(response)),
+                ReplicaAppendPlan::Prepared {
+                    prepared,
+                    admission,
+                } => {
+                    let result = self
+                        .shard_for_lane(batch.reservation.placement.virtual_lane_id)
+                        .and_then(|shard| {
+                            shard.begin_prepared_replica(
+                                prepared,
+                                batch.payload.clone(),
+                                admission,
+                                Arc::clone(&self._replication_progress),
+                            )
+                        });
+                    match result {
+                        Ok(ticket) => pending.push((index, Pending::Prepared { batch, ticket })),
+                        Err(error) => results[index] = Some(Err(error)),
+                    }
+                }
                 ReplicaAppendPlan::Reserved {
                     response,
                     producer,
@@ -1027,7 +1084,14 @@ impl StreamEngine {
                         admission,
                         completion,
                     ) {
-                        Ok(()) => pending.push((index, batch, response, receiver)),
+                        Ok(()) => pending.push((
+                            index,
+                            Pending::Legacy {
+                                batch,
+                                response,
+                                receiver,
+                            },
+                        )),
                         Err(error) => {
                             results[index] =
                                 Some(self.finish_replica_append(&batch, response, Err(error)));
@@ -1036,14 +1100,52 @@ impl StreamEngine {
                 }
             }
         }
-        for (index, batch, response, receiver) in pending {
-            let append_result = match receiver.recv() {
-                Ok(result) => result,
-                Err(_) => Err(crate::worker::AppendFailure::ambiguous(
-                    EngineError::WorkerStopped(batch.reservation.placement.virtual_lane_id),
-                )),
-            };
-            results[index] = Some(self.finish_replica_append(&batch, response, append_result));
+        for (index, pending) in pending {
+            results[index] = Some(match pending {
+                Pending::Legacy {
+                    batch,
+                    response,
+                    receiver,
+                } => {
+                    let append_result = match receiver.recv() {
+                        Ok(result) => result,
+                        Err(_) => Err(crate::worker::AppendFailure::ambiguous(
+                            EngineError::WorkerStopped(batch.reservation.placement.virtual_lane_id),
+                        )),
+                    };
+                    self.finish_replica_append(&batch, response, append_result)
+                }
+                Pending::Prepared { batch, ticket } => match ticket.wait() {
+                    ProposedAppendOutcome::Unallocated(error)
+                    | ProposedAppendOutcome::Unknown(error) => Err(error),
+                    ProposedAppendOutcome::Duplicate(ReserveOutcome::Duplicate {
+                        response,
+                        ..
+                    }) => Ok(response),
+                    ProposedAppendOutcome::Duplicate(ReserveOutcome::Reserved { .. }) => {
+                        Err(EngineError::CorruptState(
+                            "replica duplicate returned new allocation".into(),
+                        ))
+                    }
+                    ProposedAppendOutcome::Committed {
+                        reservation,
+                        result,
+                        ..
+                    } => {
+                        if reservation != batch.reservation {
+                            Err(EngineError::CorruptState(
+                                "guarded replica committed different coordinates".into(),
+                            ))
+                        } else {
+                            self.finish_replica_append(
+                                &batch,
+                                append_response(0, reservation),
+                                result,
+                            )
+                        }
+                    }
+                },
+            });
         }
         results
             .into_iter()
@@ -2002,6 +2104,9 @@ mod tests {
     use crate::{
         DurableAppendSink, DurableAppendSinkFactory, DurableSinkApply, DurableSinkOptions,
     };
+
+    #[path = "replica_proposal_tests.rs"]
+    mod replica_proposal_tests;
 
     struct DirectReplication {
         follower: Arc<StreamEngine>,

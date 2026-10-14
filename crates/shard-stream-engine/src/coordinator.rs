@@ -23,9 +23,11 @@ use crate::{
 };
 
 mod proposal;
+mod replica;
 pub(crate) use proposal::{
     AppendIntent, CommitControl, CommitOutcome, PrepareOutcome, PreparedAppend,
 };
+pub(crate) use replica::{PrepareReplicaOutcome, PreparedReplica, ReplicaIntent};
 
 const COORDINATOR_QUEUE_SLOTS: usize = 16_384;
 const CONTROL_QUEUE_SLOTS: usize = 1_024;
@@ -516,6 +518,15 @@ enum CoordinatorCommand {
         control: std::sync::Arc<CommitControl>,
         response: SyncSender<EngineResult<ReserveOutcome>>,
     },
+    PrepareReplica {
+        intent: ReplicaIntent,
+        response: SyncSender<EngineResult<PrepareReplicaOutcome>>,
+    },
+    CommitPreparedReplica {
+        prepared: PreparedReplica,
+        control: std::sync::Arc<CommitControl>,
+        response: SyncSender<EngineResult<ReserveOutcome>>,
+    },
     ReserveReplica {
         topic_partition: TopicPartition,
         reservation: Reservation,
@@ -685,6 +696,40 @@ impl CoordinatorRouter {
             },
         ) {
             // A rejected queue admission cannot have reached the coordinator.
+            control.cancel();
+            return CommitOutcome::Unallocated(error);
+        }
+        proposal::await_commit(receiver, &control)
+    }
+
+    pub(crate) fn prepare_replica(
+        &self,
+        intent: ReplicaIntent,
+    ) -> EngineResult<PrepareReplicaOutcome> {
+        let (response, receiver) = sync_channel(1);
+        self.try_send(
+            intent.topic_partition(),
+            CoordinatorCommand::PrepareReplica { intent, response },
+        )?;
+        receiver.recv_timeout(proposal::RPC_TIMEOUT).map_err(|_| {
+            EngineError::Fenced("replica preparation did not complete before its deadline".into())
+        })?
+    }
+
+    pub(crate) fn commit_prepared_replica(
+        &self,
+        prepared: PreparedReplica,
+        control: std::sync::Arc<CommitControl>,
+    ) -> CommitOutcome {
+        let (response, receiver) = sync_channel(1);
+        if let Err(error) = self.try_send(
+            prepared.intent().topic_partition(),
+            CoordinatorCommand::CommitPreparedReplica {
+                prepared,
+                control: control.clone(),
+                response,
+            },
+        ) {
             control.cancel();
             return CommitOutcome::Unallocated(error);
         }
@@ -1273,6 +1318,20 @@ fn run_coordinator(
             } => {
                 let result = state_mut(&mut states, prepared.intent.topic_partition)
                     .and_then(|state| proposal::commit(state, prepared, Some(&control)));
+                let _ = response.send(result);
+            }
+            CoordinatorCommand::PrepareReplica { intent, response } => {
+                let result = state(&states, intent.topic_partition())
+                    .and_then(|state| replica::prepare(state, intent));
+                let _ = response.send(result);
+            }
+            CoordinatorCommand::CommitPreparedReplica {
+                prepared,
+                control,
+                response,
+            } => {
+                let result = state_mut(&mut states, prepared.intent().topic_partition())
+                    .and_then(|state| replica::commit(state, prepared, &control));
                 let _ = response.send(result);
             }
             CoordinatorCommand::ReplicaCountDurable {

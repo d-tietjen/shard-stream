@@ -59,9 +59,13 @@ A host requiring that boundary declares the immutable
 or capacity waits. For local leaders, the shard calls `try_admit_proposal`
 with typed prospective coordinates, without constructing a reservation. An
 existing strict ticket's default proposal method refuses until its host
-implements this contract. Allocated incoming replicas continue to use
-`try_admit_physical`; positive authenticated follower installation is a
-separate required stage. The host must
+implements this contract. Guarded incoming replicas first verify the exact
+received reservation against pure receiver sequencing and producer/atomic
+snapshots. They charge and queue input on the actual receiver shard, obtain
+`try_admit_physical` permission for those immutable remote coordinates, and
+only then compare/commit receiver allocation and epoch. This uses the existing
+reservation callback without forging or restamping coordinates. Positive
+production sender/issuer/lease installation is a separate required stage. The host must
 join current partition, epoch, ring, role and genuine lease validity to its
 shared transition state and return an owned `PhysicalWriteGuard`. Pending
 revocation must stop new admissions, and conflicting effective ownership must
@@ -74,8 +78,8 @@ proof.
 The engine moves the guard and byte charge with the physical append command,
 including batching and the sync queue, until physical settlement. Dropping a
 producer response cannot release them early. Guard ownership ends before a
-subsequent remote or durable-index acknowledgement wait. Local-leader
-physical refusal or panic precedes allocation and is returned separately from
+subsequent remote or durable-index acknowledgement wait. Guarded leader and
+replica physical refusal or panic precedes allocation and is returned separately from
 failure of an allocated reservation. Storage or sync-dispatch failure after
 commit retains the existing failure/recovery semantics and remains ambiguous.
 Before storage opens, a guarded constructor verifies that both configured
@@ -128,11 +132,30 @@ the supplied fields. Existing check-only implementations remain compatible.
 A retransmitted old placement must
 be explicitly authorized as historical lineage or refused; it must never be
 restamped as a new current-term append. An exact duplicate acquires no new
-physical guard and retains its original persisted coordinates.
+physical guard and retains its original persisted coordinates. Current replica
+source authorization still runs before an immutable ACK; the existing replica
+preparation hook may own a ticket because there is no separate read-only
+replica-authority hook. This unit does not borrow local-leader `check_write`
+as follower authority or promise cached replica delivery under exhausted host
+ticket capacity.
+
+For a guarded receiver, `DurableApplyQueue` advances its ordering cursor only
+after the actual committed append result, before draining the next buffered
+batch. It does not advertise an unallocated predecessor as reserved. Queue
+refusal, Pending cancellation, callback refusal/panic or compare conflict
+changes no receiver epoch, offset, producer/group state, data WAL or index.
+Missing replies after commit wins remain `Unknown` under the same owned
+arbitration as leader proposals; they cannot create a speculative abort or
+claim unchanged receiver allocation. Legacy/check-only receiver planning and
+parallel dispatch preserve their existing behavior. Exact guarded retries of
+an existing aborted batch remain refused without authenticated replay lineage;
+legacy aborted revival is unchanged. Successful follower WAL installation is
+still index-silent; retained WAL replay through `resume_durable_sink` is the
+existing separate leader-activation contract.
 
 These contracts alone do not supply a host authority implementation, HA quorum
-or indexed replay. Local-leader proposal refusal does not create an
-allocated gap. Already allocated replica or storage failures retain the
+or indexed replay. Guarded leader or replica precommit refusal does not create
+an allocated gap. Already allocated legacy replica or storage failures retain the
 existing abort algorithm: an allocated slot can become an in-memory abort
 without rewinding the normal sequencer. A later durable extent permits recovery of an interior gap;
 an unpersisted tail can disappear during restart. In-memory aborts are not

@@ -33,7 +33,7 @@ pub(crate) const ADMISSION_METADATA_BYTES: usize =
         Option<Arc<dyn PendingWriteAdmission>>,
         Option<Box<dyn PhysicalWriteGuard>>,
         Option<Budgeted<()>>,
-    )>() + std::mem::size_of::<crate::coordinator::PreparedAppend>()
+    )>() + std::mem::size_of::<proposal::PreparedInput>()
         + std::mem::size_of::<crate::coordinator::CommitControl>()
         + std::mem::size_of::<Arc<crate::coordinator::CoordinatorRouter>>();
 
@@ -49,7 +49,7 @@ pub(crate) fn append_command_charge(payload_bytes: usize, guarded: bool) -> Opti
 mod physical_admission_tests;
 
 mod proposal;
-pub(crate) use proposal::ProposedAppendOutcome;
+pub(crate) use proposal::{ProposedAppendOutcome, ProposedAppendTicket};
 
 enum AppendReply {
     Legacy(SyncSender<Result<AppendDurability, AppendFailure>>),

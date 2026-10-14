@@ -390,6 +390,15 @@ fn reserve_and_dispatch(
             respond_all(waiters, Ok(response));
             return true;
         }
+        Ok(plan @ ReplicaAppendPlan::Prepared { .. }) => {
+            // Guarded preparation allocates nothing. Advance this admission
+            // cursor only after the actual receiver guard/commit/WAL result;
+            // a later batch must not observe a speculative reserved predecessor.
+            let result = engine.execute_replica_append(batch, plan);
+            let accepted = result.is_ok();
+            respond_all(waiters, result);
+            return accepted;
+        }
         Ok(plan @ ReplicaAppendPlan::Reserved { .. }) => plan,
         Err(error) => {
             respond_all(waiters, Err(error));
