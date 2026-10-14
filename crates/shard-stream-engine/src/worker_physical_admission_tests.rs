@@ -186,7 +186,6 @@ impl Fixture {
         .expect("reopen actual WAL");
         let planned = store
             .plan_fetch(
-                0,
                 TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0)),
                 LogicalOffset::new(0),
                 1024,
