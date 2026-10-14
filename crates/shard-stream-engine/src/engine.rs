@@ -234,6 +234,21 @@ impl StreamEngine {
         self.config.max_batch_bytes
     }
 
+    /// Check that this exact fence is installed for guarded replica admission.
+    ///
+    /// This uses the physical-admission mode captured when the engine opened
+    /// and the installed fence's allocation identity, without calling the fence.
+    /// It proves installation mechanics only, not current TLS identity, issuer
+    /// authorization, lease validity, or permission to write.
+    #[must_use]
+    pub fn has_guarded_replica_fence(&self, fence: &Arc<dyn WriteFence>) -> bool {
+        self.requires_physical_admission
+            && self
+                .write_fence
+                .as_ref()
+                .is_some_and(|installed| Arc::ptr_eq(installed, fence))
+    }
+
     pub fn open(config: EngineConfig) -> EngineResult<Self> {
         Self::open_inner(config, None, None, None, None, false)
     }
@@ -4132,6 +4147,14 @@ mod tests {
     fn unfenced_supplied_epoch_keeps_existing_placement_behavior() {
         let directory = TempDir::new("unfenced-epoch-compatibility");
         let engine = StreamEngine::open(config(&directory.0)).expect("ordinary unfenced engine");
+        let uninstalled: Arc<dyn WriteFence> = Arc::new(FixturePendingFence {
+            admission: Arc::new(FixturePendingAdmission::default()),
+            declared: true,
+        });
+        assert!(
+            !engine.has_guarded_replica_fence(&uninstalled),
+            "an unfenced engine cannot establish another instance's guarded installation"
+        );
         engine
             .create_topic(TopicConfig {
                 topic_id: TopicId::new(1),

@@ -88,8 +88,13 @@ fn partition() -> TopicPartition {
 /// Obtain every replica field from actual checksummed leader WAL, including
 /// unresolved atomic chunks, without constructing synthetic reservations.
 fn source_batch(path: &std::path::Path, atomic: bool) -> ReplicaAppend {
-    let leader = StreamEngine::open_with_fence(config(path), Arc::new(ExactEpochFence))
-        .expect("actual source engine");
+    let fence: Arc<dyn WriteFence> = Arc::new(ExactEpochFence);
+    let leader =
+        StreamEngine::open_with_fence(config(path), fence.clone()).expect("actual source engine");
+    assert!(
+        !leader.has_guarded_replica_fence(&fence),
+        "the actual installed check-only fence supplies no guarded receiver mechanics"
+    );
     leader.create_topic(topic()).expect("actual source topic");
     let mut request = append_request(
         1,
@@ -170,9 +175,15 @@ fn assert_receipt_coordinates(
 }
 
 fn new_receiver(path: &std::path::Path, admission: &Arc<ReplicaAdmission>) -> StreamEngine {
-    let receiver =
-        StreamEngine::open_with_fence(config(path), Arc::new(ReplicaFence(admission.clone())))
-            .expect("actual guarded receiver");
+    let fence: Arc<dyn WriteFence> = Arc::new(ReplicaFence(admission.clone()));
+    let receiver = StreamEngine::open_with_fence(config(path), fence.clone())
+        .expect("actual guarded receiver");
+    assert!(receiver.has_guarded_replica_fence(&fence));
+    let other: Arc<dyn WriteFence> = Arc::new(ReplicaFence(admission.clone()));
+    assert!(
+        !receiver.has_guarded_replica_fence(&other),
+        "the same ticket provider in a different fence allocation is not installed"
+    );
     receiver
         .create_topic(topic())
         .expect("actual receiver topic");
@@ -239,12 +250,13 @@ fn guarded_replica_refusal_preserves_source_coordinates_and_later_real_sink_repl
         let directory = TempDir::new("guarded-replica-refusal-replay");
         let batch = source_batch(&directory.0.join("leader"), atomic);
         let admission = Arc::new(ReplicaAdmission::default());
+        let fence: Arc<dyn WriteFence> = Arc::new(ReplicaFence(admission.clone()));
         let control = Arc::new(RecordingSinkControl::default());
         let limits = config(&directory.0.join("receiver"));
         let receiver = Arc::new(
             StreamEngine::open_with_all_components_and_durable_sink(
                 limits.clone(),
-                Some(Arc::new(ReplicaFence(admission.clone()))),
+                Some(fence.clone()),
                 None,
                 None,
                 Some(recording_sink_config(
@@ -254,6 +266,7 @@ fn guarded_replica_refusal_preserves_source_coordinates_and_later_real_sink_repl
             )
             .expect("actual guarded receiver with real checkpointed derivative"),
         );
+        assert!(receiver.has_guarded_replica_fence(&fence));
         receiver.create_topic(topic()).expect("receiver topic");
         let queue = DurableApplyQueue::spawn(
             receiver.clone(),

@@ -75,6 +75,15 @@ transition waits. This is a local linearization boundary, not a wall-clock
 guarantee that fsync finishes before lease expiry or a distributed finality
 proof.
 
+`StreamEngine::has_guarded_replica_fence` checks the actual guarded mode captured
+at construction and exact allocation identity of the installed fence. A clone
+of that installed `Arc<dyn WriteFence>` qualifies; a different allocation,
+check-only fence or unfenced engine does not. An alias wrapper must be checked
+as the actual installed allocation, rather than substituting its inner fence.
+This check calls no authority callback and supplies no TLS, issuer, lease or
+current write permission proof. Hosts still need the reviewed receiver source
+and dependency pins plus genuine authority and delivery qualification.
+
 The engine moves the guard and byte charge with the physical append command,
 including batching and the sync queue, until physical settlement. Dropping a
 producer response cannot release them early. Guard ownership ends before a
