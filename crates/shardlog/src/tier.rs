@@ -17,6 +17,14 @@ const COPY_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[path = "tier_recovery_paths.rs"]
+mod recovery_paths;
+pub use recovery_paths::{
+    RecoveryTierPathCost, RecoveryTierPathError, RecoveryTierPathLimits,
+    recovery_tier_manifest_path_matches, recovery_tier_object_path_matches,
+    recovery_tier_path_inspection_cost,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TierObject {
     pub pack_sequence: u64,

@@ -53,6 +53,12 @@ pub use tier::{
     parse_recovery_tier_current,
 };
 
+pub use tier::{
+    RecoveryTierPathCost, RecoveryTierPathError, RecoveryTierPathLimits,
+    recovery_tier_manifest_path_matches, recovery_tier_object_path_matches,
+    recovery_tier_path_inspection_cost,
+};
+
 pub use recovery_codec::{
     RECOVERY_EXTENT_HEADER_BYTES, RECOVERY_EXTENT_PREFIX_BYTES, RECOVERY_JOURNAL_PREFIX_BYTES,
     RecoveryExtentHeader, RecoveryExtentTail, RecoveryExtentTailUnknown, inspect_recovery_extent,

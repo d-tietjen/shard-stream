@@ -52,6 +52,13 @@ pub use shardlog::{
     recovery_extent_frame_bytes, recovery_extent_inspection_cost,
 };
 
+// Shared native path construction for ordinary archived tier source joins.
+pub use shardlog::{
+    RecoveryTierPathCost, RecoveryTierPathError, RecoveryTierPathLimits,
+    recovery_tier_manifest_path_matches, recovery_tier_object_path_matches,
+    recovery_tier_path_inspection_cost,
+};
+
 #[cfg(unix)]
 pub use recovery_archived::{
     ArchivedNativeExtent, ArchivedNativeJournalEvent, ArchivedNativeTail, NativeArchivedSourceCost,

@@ -464,3 +464,25 @@ capture context never makes an otherwise possible local term foreign. Native
 frame validity alone cannot establish an active-active commit or activation.
 The archive source fixtures are source regressions until the normal dependency,
 typecheck and test workflow has actually run.
+
+### Exact native tier path joins
+
+Archived CURRENT, manifest and object sources must agree on the same native
+tier root. A matching object-key suffix under another root cannot complete
+that join. `recovery_tier_manifest_path_matches` and
+`recovery_tier_object_path_matches` reuse the ordinary native CURRENT,
+manifest and object path producers. Root inference uses the actual relative
+CURRENT path's component count, followed by exact encoded-byte comparison;
+there is no separate directory-depth or shard-name parser. The shard and
+generation come from the native decoded manifest; CURRENT must independently
+select that generation.
+
+Before either helper, predebit `recovery_tier_path_inspection_cost` into the
+same cumulative recovery owner. Explicit `RecoveryTierPathLimits` bound every
+input path/key and the native temporary, diagnostic, entry and work costs.
+Both helpers preserve the supplied absolute Instant before and after native
+phases. They read no files and return only an ordinary lexical match. Matching
+paths still require same-set source membership, original source retention,
+full object length/hash and native extent coverage; they authenticate no
+physical root, placement, currentness or serving permission. Existing ordinary
+tier loaders and native path/key policies keep their behavior.
