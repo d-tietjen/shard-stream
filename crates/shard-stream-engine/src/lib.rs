@@ -6,7 +6,16 @@ mod durable_apply;
 mod durable_sink;
 mod engine;
 mod error;
+#[cfg(unix)]
+mod recovery_census;
 mod worker;
+
+#[cfg(unix)]
+pub use recovery_census::{
+    NativeRecoveryCensus, NativeRecoveryError, NativeRecoveryLimits, NativeRecoveryUsage,
+    OwnedRecoveryStorage, RecoveryExtentObservation, RecoverySourceFact, RecoverySourceKind,
+    RecoveryTierManifestObservation,
+};
 
 pub use config::{EngineConfig, PartitionReplicationPolicy, TopicConfig};
 pub use durable_apply::{DurableApplyConfig, DurableApplyQueue};

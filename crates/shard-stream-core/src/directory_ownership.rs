@@ -110,6 +110,27 @@ impl FileIdentity {
 }
 
 impl DirectoryOwnership {
+    #[cfg(unix)]
+    pub(crate) fn validate_retained_root(&self) -> Result<(), DirectoryOwnershipError> {
+        self.validate_directory(&self.canonical_directory)
+    }
+
+    /// Borrows the actual opened root into a retained descriptor-relative handle.
+    ///
+    /// Child operations retain this SAME allocation, not a path-labelled owner.
+    /// This grants storage custody only, never process or write permission.
+    #[cfg(unix)]
+    pub fn root_handle(
+        self: &Arc<Self>,
+    ) -> Result<crate::OwnedDirectoryHandle, DirectoryOwnershipError> {
+        self.validate_directory(&self.canonical_directory)?;
+        crate::owned_directory_handle::from_root(
+            self._directory.try_clone()?,
+            self.canonical_directory.clone(),
+            Arc::clone(self),
+        )
+    }
+
     /// Creates the directory if absent and acquires its nonblocking exclusive lock.
     ///
     /// Acquire this before advancing any process identity or opening mutable

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{IoSlice, Read, Seek, SeekFrom, Write};
+use std::mem::size_of;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,6 +35,16 @@ const FETCH_PLAN_INITIAL_CAPACITY: usize = 64;
 const MAX_EXTENTS_PER_WRITE: usize = 128;
 const READ_BUFFER_POOL_SLOTS: usize = 8;
 const MAX_CACHED_READ_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+pub(crate) const fn recovery_frame_minimum() -> usize {
+    HEADER_LEN + CHECKSUM_LEN
+}
+
+pub(crate) fn recovery_frame_ceiling(max_batch_bytes: usize) -> StorageResult<usize> {
+    recovery_frame_minimum()
+        .checked_add(max_batch_bytes)
+        .ok_or_else(|| StorageError::LimitExceeded("extent frame ceiling overflow".into()))
+}
 static NEXT_STORE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -137,10 +148,10 @@ pub struct GarbageCollectionStats {
 }
 
 #[derive(Debug, Clone)]
-struct ExtentLocation {
-    reservation: Reservation,
-    producer: Option<ProducerSequence>,
-    atomic_group: Option<AtomicGroupSequence>,
+pub(crate) struct ExtentLocation {
+    pub(crate) reservation: Reservation,
+    pub(crate) producer: Option<ProducerSequence>,
+    pub(crate) atomic_group: Option<AtomicGroupSequence>,
     pack_sequence: u64,
     payload_offset: u64,
     payload_len: usize,
@@ -262,6 +273,43 @@ fn claim_read_buffer_slot(cached_buffers: &AtomicUsize) -> bool {
         .is_ok()
 }
 
+/// Concrete native shard lease retaining the exact pre-open lock inode.
+#[cfg(unix)]
+pub struct ShardRecoveryGuard {
+    file: File,
+    directory: PathBuf,
+}
+
+#[cfg(unix)]
+impl ShardRecoveryGuard {
+    /// Nonblocking acquisition; no new timeout or skipped native lock.
+    pub fn try_acquire(file: File, directory: PathBuf) -> StorageResult<Self> {
+        let result = Self { file, directory };
+        result.validate(&result.directory)?;
+        fs2::FileExt::try_lock_exclusive(&result.file)?;
+        result.validate(&result.directory)?;
+        Ok(result)
+    }
+
+    /// Checks the same concrete lease against the native directory/lock path.
+    pub fn validate(&self, directory: &Path) -> StorageResult<()> {
+        use std::os::unix::fs::MetadataExt;
+        let named = fs::symlink_metadata(directory.join(".shard-store.lock"))?;
+        let actual = self.file.metadata()?;
+        if directory != self.directory
+            || !named.is_file()
+            || named.file_type().is_symlink()
+            || actual.dev() != named.dev()
+            || actual.ino() != named.ino()
+        {
+            return Err(StorageError::InvalidInput(
+                "shard recovery lease identity changed".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct ShardStore {
     config: ShardStoreConfig,
@@ -276,7 +324,30 @@ pub struct ShardStore {
 }
 
 impl ShardStore {
+    /// Fixed logical recovery-open slots, including both native directory scans
+    /// and the actual empty read-buffer queue. This is not allocator/RSS usage.
+    pub const fn recovery_open_fixed_bytes() -> usize {
+        size_of::<Self>()
+            + size_of::<ReadBufferPool>()
+            + READ_BUFFER_POOL_SLOTS * size_of::<Vec<u8>>()
+            + 2 * 65_536
+    }
+
     pub fn open(config: ShardStoreConfig) -> StorageResult<Self> {
+        Self::open_inner(config, None)
+    }
+
+    /// Continues with the SAME native lock held during a pre-open census.
+    #[cfg(unix)]
+    pub fn open_after_census(
+        config: ShardStoreConfig,
+        guard: ShardRecoveryGuard,
+    ) -> StorageResult<Self> {
+        guard.validate(&config.directory)?;
+        Self::open_inner(config, Some(guard.file))
+    }
+
+    fn open_inner(config: ShardStoreConfig, held_lock: Option<File>) -> StorageResult<Self> {
         config.validate()?;
         let directory_existed = config.directory.exists();
         fs::create_dir_all(&config.directory)?;
@@ -285,15 +356,23 @@ impl ShardStore {
         }
         let lock_path = config.directory.join(".shard-store.lock");
         let lock_existed = lock_path.exists();
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(lock_path)?;
-        fs2::FileExt::try_lock_exclusive(&lock_file).map_err(|error| {
-            StorageError::InvalidInput(format!("shard store directory is already open: {error}"))
-        })?;
+        let lock_file = match held_lock {
+            Some(file) => file,
+            None => {
+                let file = OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(lock_path)?;
+                fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
+                    StorageError::InvalidInput(format!(
+                        "shard store directory is already open: {error}"
+                    ))
+                })?;
+                file
+            }
+        };
         if !lock_existed {
             lock_file.sync_all()?;
             sync_directory(&config.directory)?;
@@ -1120,7 +1199,7 @@ fn write_all_vectored(writer: &mut impl Write, buffers: &mut [IoSlice<'_>]) -> s
     Ok(())
 }
 
-fn decode_extent(
+pub(crate) fn decode_extent(
     path: &Path,
     frame_offset: u64,
     frame: &[u8],
@@ -1379,7 +1458,11 @@ fn scan_pack(
     Ok(())
 }
 
-fn validate_prefix(path: &Path, offset: u64, prefix: &[u8; PREFIX_LEN]) -> StorageResult<()> {
+pub(crate) fn validate_prefix(
+    path: &Path,
+    offset: u64,
+    prefix: &[u8; PREFIX_LEN],
+) -> StorageResult<()> {
     if &prefix[..4] != EXTENT_MAGIC {
         return Err(StorageError::corrupt(path, offset, "invalid extent magic"));
     }

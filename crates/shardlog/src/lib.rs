@@ -13,6 +13,7 @@ mod extent;
 mod journal;
 #[allow(missing_docs)]
 mod model;
+mod recovery_codec;
 #[allow(missing_docs)]
 mod tier;
 
@@ -25,6 +26,8 @@ pub use error::StorageError as ShardLogError;
 
 #[doc(hidden)]
 pub use error::{StorageError, StorageResult};
+#[cfg(unix)]
+pub use extent::ShardRecoveryGuard;
 #[doc(hidden)]
 pub use extent::{
     ExtentCatalogEntry, GarbageCollectionStats, PreparedExtent, SealedPack, ShardStore,
@@ -41,5 +44,12 @@ pub use model::{
     RecordId, Reservation, RingEpoch, ShardId, StreamOffset, TopicId, TopicPartition,
     VirtualLaneId,
 };
+#[cfg(unix)]
+pub use tier::TierRecoveryGuard;
 #[doc(hidden)]
 pub use tier::{LocalObjectTier, TierExtent, TierManifest, TierObject};
+
+pub use recovery_codec::{
+    RECOVERY_EXTENT_PREFIX_BYTES, RECOVERY_JOURNAL_PREFIX_BYTES, inspect_recovery_extent,
+    inspect_recovery_journal, recovery_extent_frame_bytes, recovery_journal_frame_bytes,
+};

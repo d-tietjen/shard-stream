@@ -46,6 +46,10 @@ impl<'a> Decoder<'a> {
         self.cursor == self.bytes.len()
     }
 
+    pub(crate) fn remaining(&self) -> usize {
+        self.bytes.len() - self.cursor
+    }
+
     fn array<const N: usize>(&mut self) -> StorageResult<[u8; N]> {
         self.take(N)?
             .try_into()

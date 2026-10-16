@@ -4,6 +4,8 @@ mod channel;
 mod directory_ownership;
 mod fencing;
 mod ids;
+#[cfg(unix)]
+mod owned_directory_handle;
 mod sequencer;
 mod topology;
 
@@ -19,6 +21,10 @@ pub use ids::{
     AssignmentEpoch, BatchId, BrokerId, LeaderEpoch, LogicalOffset, LogicalPartitionId, OriginId,
     PhysicalShardId, PlacementSequence, RecordId, RingEpoch, ShardId, StreamOffset, TopicId,
     TopicPartition, VirtualLaneId,
+};
+#[cfg(unix)]
+pub use owned_directory_handle::{
+    OwnedDirectoryEntries, OwnedDirectoryHandle, OwnedFileAccess, OwnedFileHandle,
 };
 pub use sequencer::{
     Placement, Reservation, ReservationProposal, SequencerError, SequencerState, TopicSequencer,

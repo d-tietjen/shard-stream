@@ -1,5 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::mem::size_of;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -71,7 +72,8 @@ impl TierManifest {
         }
     }
 
-    fn validate(&self, shard_id: ShardId) -> StorageResult<()> {
+    /// Validates the native version, shard, object order and extent encoding.
+    pub fn validate(&self, shard_id: ShardId) -> StorageResult<()> {
         if self.format_version != MANIFEST_VERSION {
             return Err(tier_corrupt(format!(
                 "unsupported tier manifest version {}",
@@ -121,9 +123,23 @@ pub struct LocalObjectTier {
     root: PathBuf,
     shard_id: ShardId,
     manifest: TierManifest,
+    // A concrete pre-open lease may move here; never reacquire its own flock.
+    #[cfg(unix)]
+    recovery_guard: Option<TierRecoveryGuard>,
 }
 
 impl LocalObjectTier {
+    /// Fixed native value slots before recovery open; paths/JSON/object values
+    /// and actual verification reads must be admitted separately by the owner.
+    pub const fn recovery_open_fixed_bytes() -> usize {
+        size_of::<Self>() + size_of::<TierManifest>()
+    }
+
+    /// Actual native verification scratch allocated by `hash_file` per object.
+    pub const fn recovery_hash_buffer_bytes() -> usize {
+        COPY_BUFFER_BYTES
+    }
+
     pub fn open(root: impl AsRef<Path>, shard_id: ShardId) -> StorageResult<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("objects").join(shard_directory(shard_id)))?;
@@ -137,6 +153,8 @@ impl LocalObjectTier {
             root,
             shard_id,
             manifest,
+            #[cfg(unix)]
+            recovery_guard: None,
         })
     }
 
@@ -156,6 +174,23 @@ impl LocalObjectTier {
                 "object manifest coverage cannot be empty".into(),
             ));
         }
+        // The real native writer lease spans object copy AND publication.
+        // Older writers that lock publication only are not made quiescent by
+        // this change; a recovery snapshot must still retain that distinction.
+        #[cfg(unix)]
+        let temporary;
+        #[cfg(unix)]
+        let publication = match &self.recovery_guard {
+            Some(guard) => &guard.publication,
+            None => {
+                temporary = ManifestUpdateLock::acquire(&self.root, self.shard_id)?;
+                &temporary
+            }
+        };
+        #[cfg(not(unix))]
+        let temporary = ManifestUpdateLock::acquire(&self.root, self.shard_id)?;
+        #[cfg(not(unix))]
+        let publication = &temporary;
         if let Some(existing) = self
             .manifest
             .objects
@@ -216,7 +251,13 @@ impl LocalObjectTier {
             StorageError::LimitExceeded("tier manifest generation exhausted".into())
         })?;
         next.objects.push(object.clone());
-        publish_manifest(&self.root, self.shard_id, self.manifest.generation, &next)?;
+        publish_manifest(
+            &self.root,
+            self.shard_id,
+            self.manifest.generation,
+            &next,
+            publication,
+        )?;
         self.manifest = next;
         Ok(object)
     }
@@ -284,9 +325,9 @@ fn publish_manifest(
     shard_id: ShardId,
     expected_generation: u64,
     manifest: &TierManifest,
+    _publication: &ManifestUpdateLock,
 ) -> StorageResult<()> {
     manifest.validate(shard_id)?;
-    let _lock = ManifestUpdateLock::acquire(root, shard_id)?;
     let observed = load_current_manifest(root, shard_id)?;
     if observed.generation != expected_generation
         || manifest.generation != expected_generation.saturating_add(1)
@@ -336,8 +377,86 @@ fn publish_manifest(
     Ok(())
 }
 
+#[derive(Debug)]
 struct ManifestUpdateLock {
     file: File,
+}
+
+/// Actual retained native tier writer lease acquired before a recovery census.
+///
+/// This excludes cooperating copy+publication writers in this protocol only.
+/// Older publication-only writers may still create objects before this lease.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct TierRecoveryGuard {
+    publication: ManifestUpdateLock,
+    root: PathBuf,
+    shard_id: ShardId,
+}
+
+#[cfg(unix)]
+impl TierRecoveryGuard {
+    /// Acquires the actual native lease without blocking or starting a new clock.
+    ///
+    /// `file` must be the pinned regular native UPDATE.lock; its inode is checked
+    /// against the exact native path. This is a lock, not directory authority.
+    pub fn try_acquire(file: File, root: PathBuf, shard_id: ShardId) -> StorageResult<Self> {
+        validate_recovery_lock(&file, &root, shard_id)?;
+        file.try_lock_exclusive()?;
+        // Construct the unlocking RAII value only after actual acquisition.
+        let result = Self {
+            publication: ManifestUpdateLock { file },
+            root,
+            shard_id,
+        };
+        result.validate()?;
+        Ok(result)
+    }
+
+    /// Checks that the real lease still names the original native lock inode.
+    pub fn validate(&self) -> StorageResult<()> {
+        validate_recovery_lock(&self.publication.file, &self.root, self.shard_id)
+    }
+}
+
+#[cfg(unix)]
+fn validate_recovery_lock(file: &File, root: &Path, shard_id: ShardId) -> StorageResult<()> {
+    use std::os::unix::fs::MetadataExt;
+    let path = root
+        .join("manifests")
+        .join(shard_directory(shard_id))
+        .join("UPDATE.lock");
+    let named = fs::symlink_metadata(path)?;
+    let actual = file.metadata()?;
+    if !named.is_file()
+        || named.file_type().is_symlink()
+        || named.dev() != actual.dev()
+        || named.ino() != actual.ino()
+    {
+        return Err(tier_corrupt("tier recovery lease identity changed"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+impl LocalObjectTier {
+    /// Opens using the SAME concrete lease held by the native recovery census.
+    ///
+    /// This still verifies native CURRENT and every referenced object. It does
+    /// not restore object-only batches into the engine's primary catalog.
+    pub fn open_after_census(
+        root: PathBuf,
+        shard_id: ShardId,
+        guard: TierRecoveryGuard,
+    ) -> StorageResult<Self> {
+        if root != guard.root || shard_id != guard.shard_id {
+            return Err(tier_corrupt("tier recovery lease has another root/shard"));
+        }
+        guard.validate()?;
+        let mut result = Self::open(root, shard_id)?;
+        result.recovery_guard = Some(guard);
+        Ok(result)
+    }
 }
 
 impl ManifestUpdateLock {

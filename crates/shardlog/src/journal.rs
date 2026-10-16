@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 
 use crate::{
@@ -16,6 +17,20 @@ const JOURNAL_VERSION: u8 = 3;
 const PREFIX_LEN: usize = 4 + 1 + 1 + 2 + 4;
 const CRC_LEN: usize = 4;
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
+
+pub(crate) fn recovery_frame_length(path: &Path, offset: u64, body: usize) -> StorageResult<usize> {
+    if body > MAX_EVENT_BYTES {
+        return Err(StorageError::corrupt(
+            path,
+            offset,
+            "journal event exceeds maximum size",
+        ));
+    }
+    PREFIX_LEN
+        .checked_add(body)
+        .and_then(|n| n.checked_add(CRC_LEN))
+        .ok_or_else(|| StorageError::corrupt(path, offset, "journal frame length overflow"))
+}
 
 const CONFIGURE_KIND: u8 = 1;
 const TRUNCATE_KIND: u8 = 6;
@@ -352,7 +367,12 @@ fn encode_event(event: &JournalEvent) -> StorageResult<Vec<u8>> {
     Ok(frame)
 }
 
-fn decode_event(path: &Path, offset: u64, kind: u8, body: &[u8]) -> StorageResult<JournalEvent> {
+pub(crate) fn decode_event(
+    path: &Path,
+    offset: u64,
+    kind: u8,
+    body: &[u8],
+) -> StorageResult<JournalEvent> {
     let mut decoder = Decoder::new(body);
     let event = match kind {
         CONFIGURE_KIND => {
@@ -502,6 +522,13 @@ fn decode_shards(
             "empty configured shard ring",
         ));
     }
+    if shard_count > decoder.remaining() / size_of::<u32>() {
+        return Err(StorageError::corrupt(
+            path,
+            offset,
+            "configured shard count exceeds encoded body",
+        ));
+    }
     let mut shards = Vec::with_capacity(shard_count);
     let mut unique = HashSet::with_capacity(shard_count);
     for _ in 0..shard_count {
@@ -551,7 +578,11 @@ fn validate_decoded_replication_policy(
         .map_err(|_| StorageError::corrupt(path, offset, "invalid replication policy"))
 }
 
-fn validate_prefix(path: &Path, offset: u64, prefix: &[u8; PREFIX_LEN]) -> StorageResult<()> {
+pub(crate) fn validate_prefix(
+    path: &Path,
+    offset: u64,
+    prefix: &[u8; PREFIX_LEN],
+) -> StorageResult<()> {
     if &prefix[..4] != JOURNAL_MAGIC {
         return Err(StorageError::corrupt(path, offset, "invalid journal magic"));
     }
