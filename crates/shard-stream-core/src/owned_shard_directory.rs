@@ -23,6 +23,11 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 mod store;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use store::{
+    OwnedPinnedShardGcComplete, OwnedPinnedShardGcCost, OwnedPinnedShardGcFailure,
+    RetainedOwnedPinnedShardGcError, owned_pinned_shard_gc_cost,
+};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use store::{
     OwnedPinnedShardStore, OwnedPinnedShardStoreCost, OwnedPinnedShardStoreFailure,
     OwnedShardStoreDirectory, RetainedOwnedPinnedShardStoreError, owned_pinned_shard_store_cost,
 };

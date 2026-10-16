@@ -22,6 +22,13 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+#[path = "owned_pinned_shard_gc.rs"]
+mod gc;
+pub use gc::{
+    OwnedPinnedShardGcComplete, OwnedPinnedShardGcCost, OwnedPinnedShardGcFailure,
+    RetainedOwnedPinnedShardGcError, owned_pinned_shard_gc_cost,
+};
+
 /// Plain logical bridge and native open ceilings; no admission or RSS claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnedPinnedShardStoreCost {

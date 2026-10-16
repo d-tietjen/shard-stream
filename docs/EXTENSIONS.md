@@ -876,3 +876,32 @@ that outlives the primary store. There is no pin, guard, descriptor or store
 extraction, fresh startup budget or serving permission. Borrowed ordinary store
 methods keep their existing behavior; bounded GC, append/rotation and actual
 engine worker distribution require their own composed producers and validation.
+
+### Core custody through native garbage collection
+
+`OwnedPinnedShardStore::garbage_collect_until` consumes the whole actual Core
+store and calls the native pinned collector using its same private directory.
+The original/minimum `NativeDirectoryBudget` and mandatory composing checks
+cover recursive Core validation and the real native operation. The actual typed
+pin-borrow result remains outside catch boundaries until composing work/health
+denial and physical native settlement finish. The private pin is never extracted
+or paired with a caller-claimed owner.
+
+Success returns `OwnedPinnedShardGcComplete`: its report precedes the whole Core
+owner in destruction order. `into_store` drops that actual report and returns the
+whole `OwnedPinnedShardStore`, preserving native pin/lock/Core-parent custody.
+Every refusal retains the actual store, including its partial mutable indexes,
+native report, typed errors and independent unwind payloads. A successful native
+collection followed by a final Core identity/deadline refusal remains an error
+with both actual outcomes retained. No store/pin reconstruction or retry witness
+is provided. A physical worker must still retain its opaque directory custody
+outside all file/request/result frames through physical joining.
+
+`owned_pinned_shard_gc_cost` includes native configured ceilings, fixed Core
+carriers, the actual pin-borrow result slot and independent bridge panic slots.
+Core validation charges its own actual phases to the same counters. Existing
+store/pin/floor allocations are already owned inputs; logical costs do not
+establish allocator/kernel/RSS or performance bounds. Seven genuine Core/native
+filesystem regression groups are saved and remain uncompiled and unexecuted.
+Actual consuming engine/census/worker adoption, bounded later producers and full
+host/resource/authority qualification remain required.
