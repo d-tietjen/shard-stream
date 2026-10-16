@@ -358,3 +358,39 @@ saved expiry; it supplies no clock or source replacement to the reader. Exact
 and one-less copy/read caps and real inode replacement are also covered. These
 new cases remain uncompiled and unexecuted until the original native dependency
 graph and required full checks run.
+
+## Borrowed complete native extent inspection
+
+`inspect_recovery_extent_payload` borrows a complete retained extent and returns
+the actual native reservation, producer and atomic-group fields together with
+the original frame and payload slices. It calls the unchanged native complete
+decoder: native prefix/length, checksum, nonzero record count, range, reserved
+fields and payload-length acceptance stay with shardlog. Payload boundaries are
+selected inside that codec, with no host-side SSE8 offset or replacement parser.
+An incomplete tail is refused here; the separate incomplete-header inspector
+retains its conservative observation/Unknown contract.
+
+Before invocation, the composing owner must charge the ordinary
+`recovery_extent_inspection_cost` facts against its existing cumulative budget.
+Explicit finite per-call limits are checked again before native work. The facts
+include already-held frame/path bytes, named fixed native/result/decoder slots,
+native diagnostic buffers, checksum and bounded decode/copy work. They are
+logical bounds, not allocator or process RSS limits. No payload is cloned or
+canonicalized. A borrowed view remains valid only while its original frame is
+owned by the caller; storage leases and authenticated source/body joins remain
+the caller's responsibility.
+
+The original absolute Instant is checked before limits/native phases and after
+native settlement. Sizing does not create a clock or carry consumed usage.
+These APIs perform no filesystem I/O, repair, mutation, worker creation or
+authority admission. The engine re-exports the same native types and functions
+for compositions without a direct shardlog dependency. Native validity alone
+does not prove child lineage, signatures, source completeness, currentness,
+availability, commit or serving permission.
+
+The new source fixtures use real native append/sync output, original borrowed
+pointer identity, complete producer/atomic metadata, consecutive/empty payloads,
+the ordinary decoder's checksum/range refusals, exact/one-less cost limits and
+the original saved expiry. They have not been compiled or executed in this
+source unit; formatting, type checks and full composition qualification remain
+separate required work.

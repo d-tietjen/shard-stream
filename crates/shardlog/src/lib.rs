@@ -14,6 +14,7 @@ mod journal;
 #[allow(missing_docs)]
 mod model;
 mod recovery_codec;
+mod recovery_payload;
 #[allow(missing_docs)]
 mod tier;
 
@@ -54,4 +55,10 @@ pub use recovery_codec::{
     RecoveryExtentHeader, RecoveryExtentTail, RecoveryExtentTailUnknown, inspect_recovery_extent,
     inspect_recovery_extent_tail, inspect_recovery_journal, recovery_extent_frame_bytes,
     recovery_journal_frame_bytes,
+};
+
+pub use recovery_payload::{
+    BorrowedRecoveryExtent, RecoveryExtentInspectionCost, RecoveryExtentInspectionError,
+    RecoveryExtentInspectionLimits, inspect_recovery_extent_payload,
+    recovery_extent_inspection_cost,
 };
