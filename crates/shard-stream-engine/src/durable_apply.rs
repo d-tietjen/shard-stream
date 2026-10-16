@@ -130,16 +130,58 @@ impl fmt::Debug for DurableApplyQueue {
 
 impl DurableApplyQueue {
     pub fn spawn(engine: Arc<StreamEngine>, config: DurableApplyConfig) -> EngineResult<Self> {
+        Self::spawn_with_engine_handle(engine.into(), config)
+    }
+
+    /// Starts the unchanged replica queues retaining the actual engine owner.
+    ///
+    /// A recovered handle remains alive through every admission/append worker
+    /// and physical join. This grants no replica identity or write permission.
+    pub fn spawn_with_engine_handle(
+        engine: crate::EngineHandle,
+        config: DurableApplyConfig,
+    ) -> EngineResult<Self> {
+        Self::spawn_with_engine_handle_inner(engine, config, None)
+    }
+
+    /// Starts replica queues within the caller's original absolute startup expiry.
+    ///
+    /// Each channel and worker starts only after checking that same `Instant`.
+    /// A started spawn may settle late; refusal then physically joins all started
+    /// workers while retaining the complete engine owner. This does not limit
+    /// the lifetime of a successfully constructed queue or grant write authority.
+    pub fn spawn_with_engine_handle_until(
+        engine: crate::EngineHandle,
+        config: DurableApplyConfig,
+        original_expiry: Instant,
+    ) -> EngineResult<Self> {
+        Self::spawn_with_engine_handle_inner(engine, config, Some(original_expiry))
+    }
+
+    fn spawn_with_engine_handle_inner(
+        engine: crate::EngineHandle,
+        config: DurableApplyConfig,
+        original_expiry: Option<Instant>,
+    ) -> EngineResult<Self> {
+        queue_start_clock(original_expiry)?;
         let config = config.validate()?;
+        queue_start_clock(original_expiry)?;
         let append_worker_count = engine.replica_append_worker_count();
+        queue_start_clock(original_expiry)?;
         let mut append_workers = Vec::with_capacity(append_worker_count);
+        queue_start_clock(original_expiry)?;
         let mut append_senders = Vec::with_capacity(append_worker_count);
         for index in 0..append_worker_count {
+            queue_start_clock(original_expiry)?;
             let (sender, receiver) =
                 sync_channel::<DurableApplyWork>(config.queue_slots_per_worker);
-            let engine = Arc::clone(&engine);
-            let thread = thread::Builder::new()
-                .name(format!("shard-stream-replica-append-{index}"))
+            queue_start_clock(original_expiry)?;
+            let engine = engine.clone();
+            queue_start_clock(original_expiry)?;
+            let builder =
+                thread::Builder::new().name(format!("shard-stream-replica-append-{index}"));
+            queue_start_clock(original_expiry)?;
+            let thread = builder
                 .spawn(move || {
                     while let Ok(work) = receiver.recv() {
                         let mut works = vec![work];
@@ -176,15 +218,28 @@ impl DurableApplyQueue {
                 sender: Some(sender),
                 thread: Some(thread),
             });
+            // Store the actual join handle before any late refusal or observer
+            // unwind. On failure, extra append senders drop before these workers;
+            // the engine parameter remains alive until every physical join ends.
+            #[cfg(test)]
+            queue_spawn_phase(QueueSpawnPhase::AppendStarted, index);
+            queue_start_clock(original_expiry)?;
         }
 
+        queue_start_clock(original_expiry)?;
         let mut admission_workers = Vec::with_capacity(config.worker_count);
         for index in 0..config.worker_count {
+            queue_start_clock(original_expiry)?;
             let (sender, receiver) = sync_channel(config.queue_slots_per_worker);
-            let engine = Arc::clone(&engine);
+            queue_start_clock(original_expiry)?;
+            let engine = engine.clone();
+            queue_start_clock(original_expiry)?;
             let append_senders = append_senders.clone();
-            let thread = thread::Builder::new()
-                .name(format!("shard-stream-replica-admission-{index}"))
+            queue_start_clock(original_expiry)?;
+            let builder =
+                thread::Builder::new().name(format!("shard-stream-replica-admission-{index}"));
+            queue_start_clock(original_expiry)?;
+            let thread = builder
                 .spawn(move || {
                     let mut partitions = HashMap::new();
                     while let Ok(command) = receiver.recv() {
@@ -200,7 +255,11 @@ impl DurableApplyQueue {
                 sender: Some(sender),
                 thread: Some(thread),
             });
+            #[cfg(test)]
+            queue_spawn_phase(QueueSpawnPhase::AdmissionStarted, index);
+            queue_start_clock(original_expiry)?;
         }
+        queue_start_clock(original_expiry)?;
         Ok(Self {
             admission_workers,
             append_workers,
@@ -248,6 +307,64 @@ impl DurableApplyQueue {
             .recv()
             .map_err(|_| EngineError::CorruptState("durable apply response lost".into()))?
     }
+}
+
+fn queue_start_clock(original_expiry: Option<Instant>) -> EngineResult<()> {
+    if original_expiry.is_some_and(|expiry| Instant::now() >= expiry) {
+        return Err(EngineError::InvalidConfig(
+            "durable apply original startup expiry elapsed".into(),
+        ));
+    }
+    Ok(())
+}
+
+// These observers schedule tests at actual completed spawns. They cannot
+// replace the original clock, native worker, owner, channel, or join handle.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QueueSpawnPhase {
+    AppendStarted,
+    AdmissionStarted,
+}
+
+#[cfg(test)]
+type QueueSpawnCallback = Box<dyn FnMut(QueueSpawnPhase, usize)>;
+
+#[cfg(test)]
+std::thread_local! {
+    static QUEUE_SPAWN_OBSERVER: std::cell::RefCell<Option<QueueSpawnCallback>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) struct QueueSpawnObserver;
+
+#[cfg(test)]
+impl QueueSpawnObserver {
+    pub(crate) fn install(observer: impl FnMut(QueueSpawnPhase, usize) + 'static) -> Self {
+        QUEUE_SPAWN_OBSERVER.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(observer));
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for QueueSpawnObserver {
+    fn drop(&mut self) {
+        QUEUE_SPAWN_OBSERVER.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn queue_spawn_phase(phase: QueueSpawnPhase, index: usize) {
+    QUEUE_SPAWN_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.borrow_mut().as_mut() {
+            observer(phase, index);
+        }
+    });
 }
 
 fn admit(

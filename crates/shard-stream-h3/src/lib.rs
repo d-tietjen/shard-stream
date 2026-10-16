@@ -15,7 +15,7 @@ use http::{Method, Request, Response, StatusCode};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::Serialize;
 use shard_stream_core::{LogicalOffset, LogicalPartitionId, TopicId};
-use shard_stream_engine::{EngineError, StreamEngine};
+use shard_stream_engine::{EngineError, EngineHandle, StreamEngine};
 use shard_stream_protocol::{
     AppendRequest, Durability, FetchMode, FetchRequest, NativeFetchBatch, ProducerIdentity,
     encode_fetch_batches,
@@ -55,6 +55,18 @@ impl std::error::Error for H3Error {}
 pub async fn serve(
     config: H3Config,
     engine: Arc<StreamEngine>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<(), H3Error> {
+    serve_with_engine_handle(config, engine.into(), shutdown).await
+}
+
+/// Serves the unchanged HTTP/3 protocol retaining the actual engine owner.
+///
+/// Connection/request/blocking tasks keep the complete recovered wrapper when
+/// supplied. This changes custody only, without startup or authentication proof.
+pub async fn serve_with_engine_handle(
+    config: H3Config,
+    engine: EngineHandle,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), H3Error> {
     install_crypto_provider();
@@ -87,7 +99,7 @@ pub async fn serve(
                 let Some(incoming) = incoming else {
                     break;
                 };
-                let engine = Arc::clone(&engine);
+                let engine = engine.clone();
                 let config = config.clone();
                 tokio::spawn(async move {
                     match incoming.await {
@@ -124,7 +136,7 @@ pub async fn serve(
 
 async fn handle_connection(
     connection: quinn::Connection,
-    engine: Arc<StreamEngine>,
+    engine: EngineHandle,
     config: H3Config,
 ) -> Result<(), H3Error> {
     let mut connection = h3::server::Connection::new(h3_quinn::Connection::new(connection))
@@ -133,7 +145,7 @@ async fn handle_connection(
     loop {
         match connection.accept().await {
             Ok(Some(resolver)) => {
-                let engine = Arc::clone(&engine);
+                let engine = engine.clone();
                 let config = config.clone();
                 tokio::spawn(async move {
                     if let Err(error) = handle_request(resolver, engine, config).await {
@@ -154,7 +166,7 @@ async fn handle_connection(
 
 async fn handle_request<C>(
     resolver: RequestResolver<C, Bytes>,
-    engine: Arc<StreamEngine>,
+    engine: EngineHandle,
     config: H3Config,
 ) -> Result<(), H3Error>
 where
@@ -196,7 +208,7 @@ where
 async fn route<C>(
     request: Request<()>,
     stream: &mut h3::server::RequestStream<C, Bytes>,
-    engine: Arc<StreamEngine>,
+    engine: EngineHandle,
     config: &H3Config,
 ) -> Result<H3Response, RouteError>
 where
@@ -797,5 +809,66 @@ mod tests {
             }
         }
         body
+    }
+
+    #[tokio::test]
+    async fn handle_entry_keeps_native_owner_until_real_config_refusal_without_network() {
+        struct Clean(std::path::PathBuf);
+        impl Drop for Clean {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("actual clock")
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("h3-engine-handle-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&directory).expect("real native root");
+        let _clean = Clean(directory.clone());
+        let cfg = EngineConfig {
+            data_dir: directory.clone(),
+            object_store_dir: None,
+            shard_count: 1,
+            virtual_lane_count: 1,
+            replication_factor: 1,
+            min_in_sync_replicas: 1,
+            queue_slots_per_shard: 16,
+            queue_bytes_per_shard: 1 << 20,
+            target_pack_bytes: 4096,
+            max_pack_age: std::time::Duration::from_secs(30),
+            max_batch_bytes: 4096,
+            max_fetch_bytes: 1 << 20,
+            append_linger: std::time::Duration::ZERO,
+        };
+        let engine = Arc::new(StreamEngine::open(cfg.clone()).expect("actual native RF1 engine"));
+        let weak = Arc::downgrade(&engine);
+        let (_, shutdown) = watch::channel(false);
+        let future = serve_with_engine_handle(
+            H3Config {
+                listen: "127.0.0.1:0".parse().expect("ordinary address"),
+                certificate_path: directory.join("not-opened-certificate"),
+                private_key_path: directory.join("not-opened-key"),
+                max_batch_bytes: 0,
+                max_fetch_bytes: 4096,
+            },
+            engine.into(),
+            shutdown,
+        );
+        assert!(
+            weak.upgrade().is_some(),
+            "actual async entry owns the handle before polling"
+        );
+        let error = future
+            .await
+            .expect_err("original finite config refusal before TLS or bind");
+        assert_eq!(
+            error.to_string(),
+            "HTTP/3 batch and fetch byte limits must be nonzero"
+        );
+        assert!(weak.upgrade().is_none());
+        assert!(!directory.join("not-opened-certificate").exists());
+        StreamEngine::open(cfg).expect("actual native restart after refused handle entry");
     }
 }

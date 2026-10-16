@@ -5,6 +5,7 @@ mod coordinator;
 mod durable_apply;
 mod durable_sink;
 mod engine;
+mod engine_handle;
 mod error;
 #[cfg(unix)]
 mod recovery_archived;
@@ -38,6 +39,7 @@ pub use engine::{
     ProducerProgress, ReplicationProgress, ReplicationStats, ReplicationTicket,
     ReplicationTransport, RetentionGuard, StreamEngine,
 };
+pub use engine_handle::{EngineHandle, WeakEngineHandle};
 pub use error::{EngineError, EngineResult};
 pub use shard_stream_protocol::ReplicaAppend;
 // The original native enum, also borrowed by the pre-open census.
