@@ -12,9 +12,10 @@ mod worker;
 
 #[cfg(unix)]
 pub use recovery_census::{
-    NativeRecoveryCensus, NativeRecoveryError, NativeRecoveryLimits, NativeRecoveryUsage,
-    OwnedRecoveryStorage, RecoveryExtentObservation, RecoveryExtentTailObservation,
-    RecoverySourceFact, RecoverySourceKind, RecoveryTierManifestObservation,
+    NativeRecoveryCatalog, NativeRecoveryCensus, NativeRecoveryError, NativeRecoveryLimits,
+    NativeRecoveryPartition, NativeRecoveryUsage, OwnedRecoveryStorage, RecoveryExtentObservation,
+    RecoveryExtentTailObservation, RecoverySourceFact, RecoverySourceKind,
+    RecoveryTierManifestObservation,
 };
 
 pub use config::{EngineConfig, PartitionReplicationPolicy, TopicConfig};

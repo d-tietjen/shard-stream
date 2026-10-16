@@ -300,3 +300,43 @@ itself at policy/data generation `1`.
 Extensions may add routes, readiness observations, and shutdown-aware
 background tasks. The public binary installs none. Cargo features and runtime
 dynamic loading are not privacy or isolation boundaries.
+
+## Bounded catalog before owned recovery
+
+On Unix, `NativeRecoveryCensus::catalog(&mut self)` derives an immutable
+`NativeRecoveryCatalog` from the actual retained coordinator journal and the
+census's original `EngineConfig`. It shares the ordinary full recovery
+Configure/CreatePartition/UpdateReplicationPolicy reducer. Legacy Configure
+keeps the native configured default policy, exact policy repeats keep native
+idempotence, and native validation/error ordering is preserved. The existing
+SSJ3 writer/parser still enforce their own wire validity, including advancing
+policy updates. A pure typed-reducer differential is not a disk acceptance
+claim.
+
+`partition(tp)` borrows the effective policy, complete ordered native placement
+ring history over virtual lanes and configured virtual lane count. Ring tokens
+retain their native `ShardId` representation; resolve physical storage shards
+through the original `EngineConfig::physical_shard_for_lane`. These tokens are
+distinct from physical storage shards and broker replica IDs. An absent TP has
+no synthesized policy or empty ring. The
+privately constructed catalog exposes its actual original owner allocation,
+Instant and cumulative native usage. It accepts no caller event, map, usage or
+authority flag. The census and its source leases must remain owned while the
+host joins these observations with signed history and physical evidence.
+
+Catalog fixed values, all borrowed event sizing, native map/ring values,
+validation scratch, clones, probes and finite error buffers are admitted through
+the SAME native reader caps before materialization. Repeated calls accumulate
+cost and never renew the saved Instant. Catalog construction reads no files,
+repairs no tail, opens no storage and starts no worker. It validates the native
+configuration event subset; full payload, truncation, atomic state and engine
+recovery remain required before operational use. No assignment, lease,
+currentness, serving or write-fence permission is conferred.
+
+The new source fixtures use actual RF1 engine creation/reconfiguration/policy
+updates, real SSJ3 journal production and ordinary full restart, native invalid
+configuration differentials, exact/one-less original caps, cumulative refusal
+and actual expiry/custody release. A separate explicitly pure typed reducer
+fixture preserves its broader in-memory semantics without fabricating native
+wire acceptance. They remain uncompiled and unexecuted in this source unit;
+canonical formatting alone does not qualify the full recovery graph.

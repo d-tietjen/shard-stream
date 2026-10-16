@@ -22,6 +22,9 @@ use crate::{
     TopicConfig,
 };
 
+mod catalog;
+pub(crate) use catalog::apply_recovered_catalog_event;
+
 mod proposal;
 mod replica;
 pub(crate) use proposal::{
@@ -2802,89 +2805,15 @@ fn recover_partition_states_inner(
     for event in events {
         recovery_reduce_clock(expiry)?;
         match event {
-            JournalEvent::Configure {
-                topic_partition,
-                ring_epoch,
-                shards,
-            } => {
-                validate_ring(config, shards)?;
-                let history = rings.entry(*topic_partition).or_default();
-                if history
-                    .last_key_value()
-                    .is_some_and(|(current, _)| ring_epoch <= current)
-                {
-                    return Err(EngineError::CorruptState(format!(
-                        "non-increasing ring epoch for {}/{}",
-                        topic_partition.topic_id, topic_partition.partition_id
-                    )));
-                }
-                history.insert(*ring_epoch, shards.clone());
-                replication_policies
-                    .entry(*topic_partition)
-                    .or_insert_with(|| config.default_replication_policy());
-            }
-            JournalEvent::CreatePartition {
-                topic_partition,
-                ring_epoch,
-                shards,
-                policy_generation,
-                replication_factor,
-                min_in_sync_replicas,
-            } => {
-                validate_ring(config, shards)?;
-                if rings.contains_key(topic_partition) {
-                    return Err(EngineError::CorruptState(format!(
-                        "duplicate partition creation for {}/{}",
-                        topic_partition.topic_id, topic_partition.partition_id
-                    )));
-                }
-                let policy = PartitionReplicationPolicy {
-                    policy_generation: *policy_generation,
-                    replication_factor: *replication_factor,
-                    min_in_sync_replicas: *min_in_sync_replicas,
-                };
-                policy.validate(config.replication_factor)?;
-                rings
-                    .entry(*topic_partition)
-                    .or_default()
-                    .insert(*ring_epoch, shards.clone());
-                replication_policies.insert(*topic_partition, policy);
-            }
-            JournalEvent::UpdateReplicationPolicy {
-                topic_partition,
-                expected_policy_generation,
-                policy_generation,
-                replication_factor,
-                min_in_sync_replicas,
-            } => {
-                if !rings.contains_key(topic_partition) {
-                    return Err(EngineError::CorruptState(format!(
-                        "replication policy update for unconfigured partition {}/{}",
-                        topic_partition.topic_id, topic_partition.partition_id
-                    )));
-                }
-                let policy = PartitionReplicationPolicy {
-                    policy_generation: *policy_generation,
-                    replication_factor: *replication_factor,
-                    min_in_sync_replicas: *min_in_sync_replicas,
-                };
-                policy.validate(config.replication_factor)?;
-                let current = replication_policies
-                    .get(topic_partition)
-                    .copied()
-                    .unwrap_or_else(|| config.default_replication_policy());
-                if current != policy {
-                    if current.policy_generation != *expected_policy_generation {
-                        return Err(EngineError::CorruptState(format!(
-                            "replication policy generation mismatch for {}/{}: expected {}, found {}",
-                            topic_partition.topic_id,
-                            topic_partition.partition_id,
-                            expected_policy_generation,
-                            current.policy_generation
-                        )));
-                    }
-                    replication_policies.insert(*topic_partition, policy);
-                }
+            JournalEvent::Configure { .. }
+            | JournalEvent::CreatePartition { .. }
+            | JournalEvent::UpdateReplicationPolicy { .. } => {
+                apply_recovered_catalog_event(
+                    config,
+                    event,
+                    &mut rings,
+                    &mut replication_policies,
+                )?;
             }
             JournalEvent::Truncate {
                 topic_partition,

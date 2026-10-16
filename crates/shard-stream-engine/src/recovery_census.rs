@@ -31,6 +31,10 @@ use crate::{EngineConfig, EngineError};
 mod restore;
 pub(crate) use restore::OwnedEngineCustody;
 
+#[path = "recovery_catalog.rs"]
+mod catalog;
+pub use catalog::{NativeRecoveryCatalog, NativeRecoveryPartition};
+
 /// Explicit finite logical allowances; the original Instant is separate.
 #[derive(Clone, Copy, Debug)]
 pub struct NativeRecoveryLimits {
