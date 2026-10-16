@@ -293,9 +293,7 @@ impl LocalObjectTier {
 fn load_current_manifest(root: &Path, shard_id: ShardId) -> StorageResult<TierManifest> {
     let current = current_path(root, shard_id);
     let generation = match fs::read_to_string(&current) {
-        Ok(value) => value
-            .trim()
-            .parse::<u64>()
+        Ok(value) => parse_recovery_tier_current(&value)
             .map_err(|_| tier_corrupt("invalid tier CURRENT generation"))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(TierManifest::empty(shard_id));
@@ -310,7 +308,7 @@ fn load_current_manifest(root: &Path, shard_id: ShardId) -> StorageResult<TierMa
         ));
     }
     let bytes = fs::read(path)?;
-    let manifest: TierManifest = serde_json::from_slice(&bytes)
+    let manifest = decode_recovery_tier_manifest(&bytes)
         .map_err(|error| tier_corrupt(format!("invalid tier manifest: {error}")))?;
     if manifest.generation != generation {
         return Err(tier_corrupt(
@@ -318,6 +316,24 @@ fn load_current_manifest(root: &Path, shard_id: ShardId) -> StorageResult<TierMa
         ));
     }
     Ok(manifest)
+}
+
+/// Parses native CURRENT text without reading a path or inferring selection.
+///
+/// This is the ordinary loader's exact trim/u64 grammar. A byte caller must
+/// separately validate UTF-8, bound input/error work and retain its original
+/// expiry. No missing-file or empty-manifest fallback is provided here.
+pub fn parse_recovery_tier_current(value: &str) -> Result<u64, std::num::ParseIntError> {
+    value.trim().parse::<u64>()
+}
+
+/// Decodes the original native manifest type, without I/O or validation policy.
+///
+/// Admit bounded JSON shape/native values before calling, then call the actual
+/// `TierManifest::validate` and join CURRENT/generation/source/object coverage.
+/// The ordinary loader's error policy is unchanged by this shared decoder.
+pub fn decode_recovery_tier_manifest(bytes: &[u8]) -> Result<TierManifest, serde_json::Error> {
+    serde_json::from_slice(bytes)
 }
 
 fn publish_manifest(

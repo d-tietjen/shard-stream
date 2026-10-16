@@ -7,7 +7,11 @@ mod durable_sink;
 mod engine;
 mod error;
 #[cfg(unix)]
+mod recovery_archived;
+#[cfg(unix)]
 mod recovery_census;
+#[cfg(unix)]
+mod recovery_json;
 mod worker;
 
 #[cfg(unix)]
@@ -46,4 +50,11 @@ pub use shardlog::{
     BorrowedRecoveryExtent, RECOVERY_EXTENT_PREFIX_BYTES, RecoveryExtentInspectionCost,
     RecoveryExtentInspectionError, RecoveryExtentInspectionLimits, inspect_recovery_extent_payload,
     recovery_extent_frame_bytes, recovery_extent_inspection_cost,
+};
+
+#[cfg(unix)]
+pub use recovery_archived::{
+    ArchivedNativeExtent, ArchivedNativeJournalEvent, ArchivedNativeTail, NativeArchivedSourceCost,
+    NativeArchivedSourceError, NativeArchivedSourceLimits, UnverifiedNativeArchivedSource,
+    inspect_archived_native_source, native_archived_source_inspection_cost,
 };

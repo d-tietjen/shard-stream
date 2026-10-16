@@ -412,3 +412,55 @@ the original native constant and function, with unchanged acceptance; they do
 not acquire storage custody, establish body lineage or completeness, renew a
 budget or expiry, or confer permission to publish a leader term. Full native and
 composition qualification remains required.
+
+
+### Ordinary archived native source inspection
+
+On Unix, `shard-stream-engine::inspect_archived_native_source` interprets one
+complete, already-retained native source through the same native parsers used by
+recovery. It performs no filesystem I/O, repair, engine open, worker start or
+storage-owner construction. The caller retains the original chunks and their
+source context; assembling chunks is separate work that must be admitted before
+copying. The returned `UnverifiedNativeArchivedSource` borrows those original
+bytes. It does not authenticate their physical origin or supply completeness,
+currentness, a floor decision, child lineage or permission to serve or append.
+
+Admit `native_archived_source_inspection_cost` through the caller's existing
+cumulative resource owner before inspection. Its plain facts cover held input,
+result/native slots, dynamic SSJ3 shard values, JSON/native strings, bounded
+native diagnostics, and scan/hash/decode/validation work. These are logical
+value and byte bounds, separate from allocator capacity, RSS or a CPU-time
+promise. The inspector independently checks the explicit finite limits before
+native work and retains the caller's original absolute `Instant`; it never
+creates a replacement duration or cumulative budget. Limits apply to whole
+source/frame/manifest/path/payload lengths, complete frame count, JSON depth and
+nodes, declared bytes, work and entries. JSON depth can only tighten the native
+32-level walk. The shared shape visitor admits every key/value visit before
+native manifest Vec/String materialization, including ignored JSON fields.
+
+For a coordinator source, every complete SSJ3 event and its original raw frame
+is returned in physical order. An incomplete terminal suffix remains explicit;
+SSJ3 has no encoded leader term. Pack and object roles expose every complete
+SSE8 frame through the actual checksum/header decoder, including native
+reservation, producer, atomic-group fields and the borrowed payload. An
+incomplete SSE8 suffix retains its exact bytes plus the native conservative
+header or explicit Unknown. Complete corrupt frames refuse; they are never
+silently converted to an empty source or a valid payload.
+
+CURRENT uses the native trim/u64 text grammar. Selected and unselected
+manifests use the native typed JSON decoder and native manifest validation,
+retaining every object and extent. The optional expected shard is an ordinary
+context check: `Some(actual_shard)` checks a manifest against that value;
+`None` validates only its own decoded shard and remains physically unbound.
+Neither path guesses a shard from an archive path. Native ordinary loaders
+retain their existing `read_to_string`, missing-CURRENT and invalid-UTF8 I/O
+behavior. A raw inspector reports its separate ordinary byte refusal instead.
+
+Cross-source CURRENT/generation/hash/coverage joins, effective journal/catalog
+reduction, native placement-to-physical-shard mapping, duplicate/source identity,
+full current and historical floors, authenticated child/body linkage and the
+actual retained-owner handoff remain the consuming recovery path's work. Raw
+capture context never makes an otherwise possible local term foreign. Native
+frame validity alone cannot establish an active-active commit or activation.
+The archive source fixtures are source regressions until the normal dependency,
+typecheck and test workflow has actually run.

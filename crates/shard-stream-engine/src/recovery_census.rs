@@ -1148,7 +1148,7 @@ impl Attempt {
                 Some(
                     std::str::from_utf8(&raw)
                         .ok()
-                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .and_then(|s| shardlog::parse_recovery_tier_current(s).ok())
                         .ok_or_else(|| identity("invalid native tier CURRENT"))?,
                 )
             } else {
@@ -1245,7 +1245,7 @@ impl Attempt {
             0,
             (raw.len() as u64).checked_mul(16).ok_or_else(limited)?,
         )?;
-        let manifest: TierManifest = serde_json::from_slice(raw)
+        let manifest = shardlog::decode_recovery_tier_manifest(raw)
             .map_err(|_| identity("invalid native tier manifest JSON"))?;
         manifest.validate(shard)?;
         if manifest.generation != generation {
@@ -1732,94 +1732,24 @@ impl Attempt {
 }
 
 mod json_shape {
-    use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
-    use std::fmt;
-
     use super::{Attempt, Result, identity};
+    use crate::recovery_json::{self, Budget, ShapeError};
 
-    struct Shape<'a> {
-        attempt: &'a mut Attempt,
-        depth: usize,
-    }
-
-    impl<'de> DeserializeSeed<'de> for Shape<'_> {
-        type Value = ();
-        fn deserialize<D: serde::Deserializer<'de>>(
-            self,
-            deserializer: D,
-        ) -> std::result::Result<(), D::Error> {
-            self.attempt
-                .charge(0, 1, 0, 0, 0)
-                .map_err(|_| serde::de::Error::custom("JSON cumulative node limit or expiry"))?;
-            if self.depth > 32 {
-                return Err(serde::de::Error::custom("JSON depth limit"));
-            }
-            deserializer.deserialize_any(self)
+    struct NativeBudget<'a>(&'a mut Attempt);
+    impl Budget for NativeBudget<'_> {
+        fn node(&mut self) -> bool {
+            self.0.charge(0, 1, 0, 0, 0).is_ok()
+        }
+        fn maximum_depth(&self) -> usize {
+            32
         }
     }
-
-    impl<'de> Visitor<'de> for Shape<'_> {
-        type Value = ();
-        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("bounded native JSON")
-        }
-        fn visit_bool<E: serde::de::Error>(self, _: bool) -> std::result::Result<(), E> {
-            Ok(())
-        }
-        fn visit_i64<E: serde::de::Error>(self, _: i64) -> std::result::Result<(), E> {
-            Ok(())
-        }
-        fn visit_u64<E: serde::de::Error>(self, _: u64) -> std::result::Result<(), E> {
-            Ok(())
-        }
-        fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<(), E> {
-            Ok(())
-        }
-        fn visit_str<E: serde::de::Error>(self, _: &str) -> std::result::Result<(), E> {
-            Ok(())
-        }
-        fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<(), E> {
-            Ok(())
-        }
-        fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> std::result::Result<(), S::Error> {
-            while seq
-                .next_element_seed(Shape {
-                    attempt: &mut *self.attempt,
-                    depth: self.depth + 1,
-                })?
-                .is_some()
-            {}
-            Ok(())
-        }
-        fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> std::result::Result<(), M::Error> {
-            while map
-                .next_key_seed(Shape {
-                    attempt: &mut *self.attempt,
-                    depth: self.depth + 1,
-                })?
-                .is_some()
-            {
-                map.next_value_seed(Shape {
-                    attempt: &mut *self.attempt,
-                    depth: self.depth + 1,
-                })?;
-            }
-            Ok(())
-        }
-    }
-
     pub(super) fn inspect(bytes: &[u8], attempt: &mut Attempt) -> Result<usize> {
         let before = attempt.usage.entries;
-        let mut decoder = serde_json::Deserializer::from_slice(bytes);
-        Shape {
-            attempt: &mut *attempt,
-            depth: 0,
-        }
-        .deserialize(&mut decoder)
-        .map_err(|_| identity("native manifest JSON shape refused"))?;
-        decoder
-            .end()
-            .map_err(|_| identity("native manifest JSON has trailing bytes"))?;
+        recovery_json::inspect(bytes, &mut NativeBudget(attempt)).map_err(|error| match error {
+            ShapeError::Decode => identity("native manifest JSON shape refused"),
+            ShapeError::Trailing => identity("native manifest JSON has trailing bytes"),
+        })?;
         Ok(attempt.usage.entries - before)
     }
 }

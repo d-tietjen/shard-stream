@@ -166,6 +166,31 @@ pub fn recovery_journal_frame_bytes(
     crate::journal::recovery_frame_length(path, offset, body)
 }
 
+/// Named fixed native SSJ3 inspection slots, before any decoder work.
+///
+/// These ordinary logical facts exclude held frame/path bytes and dynamic
+/// shard values. Admit those separately: each encoded shard occupies at most
+/// one Vec value and one uniqueness-set value (at most frame bytes / u32).
+/// This creates no budget, storage owner or authenticated source observation.
+pub fn recovery_journal_fixed_inspection_cost() -> (usize, usize) {
+    use std::collections::HashSet;
+    use std::mem::size_of;
+    let slots = [
+        size_of::<crate::codec::Decoder<'_>>(),
+        size_of::<JournalEvent>(),
+        size_of::<Vec<ShardId>>(),
+        size_of::<HashSet<ShardId>>(),
+        size_of::<&[u8; RECOVERY_JOURNAL_PREFIX_BYTES]>(),
+        size_of::<&[u8]>(),
+        size_of::<&Path>(),
+        size_of::<StorageError>(),
+        size_of::<u64>(),
+        size_of::<usize>(),
+        size_of::<u32>(),
+    ];
+    (slots.into_iter().sum(), slots.len())
+}
+
 /// Validates native SSJ3 framing/CRC/body without a journal open or tail repair.
 ///
 /// Admit decoded shard-vector/hash-set upper bounds from the frame length
