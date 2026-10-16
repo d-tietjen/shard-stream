@@ -13,6 +13,25 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[path = "pinned_gc.rs"]
+mod gc;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use gc::{
+    PinnedShardGcChecks, PinnedShardGcCost, PinnedShardGcError, PinnedShardGcFailure,
+    PinnedShardGcLimits, PinnedShardGcPack, PinnedShardGcPhase, PinnedShardGcReport,
+    PinnedShardGcUsage, pinned_shard_gc_cost,
+};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[path = "pinned_store_open.rs"]
+mod store_open;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use store_open::{
+    OpenedPinnedShardStore, PinnedStoreDirectoryEntry, PinnedStoreOpenChecks, PinnedStoreOpenCost,
+    PinnedStoreOpenError, PinnedStoreOpenFailure, PinnedStoreOpenLimits, PinnedStoreOpenOutcome,
+    PinnedStoreOpenPhase, PinnedStoreOpenUsage, pinned_store_open_cost,
+};
+
 /// Finite source allowances for one real directory/lease identity observation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PinnedShardDirectoryLimits {

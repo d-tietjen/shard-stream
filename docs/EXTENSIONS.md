@@ -791,3 +791,64 @@ their bounded producers. Ten genuine filesystem regression groups are saved
 for identity substitution, exact and one-less fees, real native errors, tighter
 checkpoints, phase unwinds and final-owner cleanup; they remain uncompiled and
 unexecuted.
+
+### Bounded native garbage collection through the pinned descriptor
+
+On Linux and Android, `ShardStore::garbage_collect_pinned_until` uses the actual
+retained `PinnedShardDirectory` for native stat, no-replace rename, parent sync
+and unlink. It first joins the actual directory and named path, acquired lock,
+descriptor-relative named lock and store lock identities. The selected pack
+must be an actual no-follow single-link regular file. Existing pending names
+are preserved by native `NOREPLACE`; there is no pathname reopen or fallback
+that replaces an unrecognized tombstone.
+
+The collector shares the ordinary native retention predicate. A finite plan
+caps existing map/vector capacities, literal path/name bytes, selected packs,
+native calls and cumulative loop/copy/index-movement work. Raw pathname bytes
+are capped and component/role scans are prepaid before parsing. The shared
+parser preserves ordinary accepted leading-zero digit spellings. Planned batch
+and topic keys are retained before mutation. It removes actual native index
+values in finite steps and keeps those values, removed paths and original topic
+vector allocations in the result before each post-operation checkpoint. Partial
+epoch/index/namespace effects remain visible on refusal; no rollback is claimed.
+
+Every actual stat/rename/sync/unlink result and reservation refusal precedes its
+post-call deadline check. Actual normal sync-helper results are separately held
+before the next checkpoint. Bounded native C names and conversion errors are
+retained before final entry checks; native calls receive those prepared C names.
+Rename and unlink each prepay their parent sync. On
+late/error/unwind, the required scoped composing denial runs before cleanup,
+then an already-admitted pending parent sync physically settles once through a
+direct native syscall. An entered sync is never retried. Producer, denial and
+settlement panics retain distinct actual payloads; an entered call with no
+result keeps its unfinished phase. A denial panic does not assert that external
+health was successfully denied. The composing owner supplies its SAME actual
+counters and captured health, retaining the SAME store, pin and original Core
+parent outside the operation through physical cleanup. The native report is
+ordinary data and contains no Session, permanent startup budget or serving grant.
+
+`pinned_shard_gc_cost` describes fixed source values, configured requested vector
+and name slots, native conversion ceilings, native outcomes and three independent
+panic slots before entry. Existing store/pin/floor allocations are already owned
+inputs. Allocator/library/kernel/RSS and performance measurements remain separate
+required gates. Twelve genuine native filesystem regression groups are saved for
+actual retention, identity changes, partial index effects, tighter deadlines,
+phase/denial unwinds, unknown pending names, real native errors and exact/one-less
+limits. These tests remain uncompiled and unexecuted. Native open/repair and GC
+still require normal compilation and validation. Later pack reads,
+append/rotation, Core/worker distribution and strict consuming resume require
+their actual producers and integration.
+
+`ShardStore::open_pinned_until` separately discovers, scans and repairs through
+the same actual pinned directory. Its Linux/Android `RawDir` uses a finite
+caller buffer and exposes individual refill attempts; native reads, truncation
+and synchronization use bounded direct attempts. Native framing, duplicate
+batch rejection and index insertion use the existing native codec/reducer.
+Actual opened files, raw reads, decoded values, index state and repair outcomes
+remain held before post-call checks. The active store uses the actual scanned
+descriptor. `OpenedPinnedShardStore` offers borrowed store access and retains
+observations; it supplies no raw descriptor extraction or ownership/serving
+witness. The caller must retain the SAME pin/Core parent through this owner and
+all later jobs. Fifteen genuine opener groups and the actual bounded-open/GC
+composition group remain uncompiled and unexecuted. Later ordinary store methods
+do not become bounded by being called on a successfully opened store.

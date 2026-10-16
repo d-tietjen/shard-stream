@@ -30,11 +30,23 @@ mod fetch;
 #[cfg(unix)]
 #[path = "pinned_directory.rs"]
 mod pinned_directory;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use pinned_directory::{
+    OpenedPinnedShardStore, PinnedStoreDirectoryEntry, PinnedStoreOpenChecks, PinnedStoreOpenCost,
+    PinnedStoreOpenError, PinnedStoreOpenFailure, PinnedStoreOpenLimits, PinnedStoreOpenOutcome,
+    PinnedStoreOpenPhase, PinnedStoreOpenUsage, pinned_store_open_cost,
+};
 #[cfg(unix)]
 pub use pinned_directory::{
     PinnedShardDirectory, PinnedShardDirectoryCost, PinnedShardDirectoryError,
     PinnedShardDirectoryFailure, PinnedShardDirectoryLimits, PinnedShardDirectoryObservation,
     ShardDirectoryCheckFailure, ShardDirectoryChecks, pinned_shard_directory_cost,
+};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use pinned_directory::{
+    PinnedShardGcChecks, PinnedShardGcCost, PinnedShardGcError, PinnedShardGcFailure,
+    PinnedShardGcLimits, PinnedShardGcPack, PinnedShardGcPhase, PinnedShardGcReport,
+    PinnedShardGcUsage, pinned_shard_gc_cost,
 };
 #[cfg(unix)]
 #[path = "guard_acquire.rs"]
@@ -1077,14 +1089,9 @@ impl ShardStore {
                     .filter(|location| location.pack_sequence == sequence)
                     .collect::<Vec<_>>();
                 (!locations.is_empty()
-                    && locations.iter().all(|location| {
-                        log_starts
-                            .get(&TopicPartition::new(
-                                location.reservation.topic_id,
-                                location.reservation.partition_id,
-                            ))
-                            .is_some_and(|log_start| location.reservation.last_offset < *log_start)
-                    }))
+                    && locations
+                        .iter()
+                        .all(|location| gc_location_before_start(location, log_starts)))
                 .then(|| (sequence, path.clone(), locations.len() as u64))
             })
             .collect::<Vec<_>>();
@@ -1138,14 +1145,9 @@ impl ShardStore {
                 .collect::<Vec<_>>();
             recovery_gc_clock(expiry)?;
             if !locations.is_empty()
-                && locations.iter().all(|location| {
-                    log_starts
-                        .get(&TopicPartition::new(
-                            location.reservation.topic_id,
-                            location.reservation.partition_id,
-                        ))
-                        .is_some_and(|start| location.reservation.last_offset < *start)
-                })
+                && locations
+                    .iter()
+                    .all(|location| gc_location_before_start(location, log_starts))
             {
                 recovery_gc_clock(expiry)?;
                 removable.push((sequence, path.clone(), locations.len() as u64));
@@ -1671,19 +1673,47 @@ fn scan_pack(
         let mut frame = vec![0u8; frame_len_usize];
         frame[..PREFIX_LEN].copy_from_slice(&prefix);
         file.read_exact(&mut frame[PREFIX_LEN..])?;
-        let mut location = decode_extent(path, offset, &frame, expected_shard)?;
-        location.pack_sequence = pack_sequence;
-        let topic_partition = TopicPartition::new(
-            location.reservation.topic_id,
-            location.reservation.partition_id,
-        );
-        let key = (topic_partition, location.reservation.batch_id);
-        if by_batch.insert(key, location.clone()).is_some() {
-            return Err(StorageError::corrupt(path, offset, "duplicate batch ID"));
-        }
-        index.entry(topic_partition).or_default().push(location);
+        let location = decode_extent(path, offset, &frame, expected_shard)?;
+        index_recovered_extent(
+            path,
+            offset,
+            pack_sequence,
+            location,
+            index,
+            by_batch,
+            &mut None,
+        )?;
         offset += frame_len;
     }
+    Ok(())
+}
+
+// Bounded callers reserve the native maps and existing topic Vec first, and
+// retain an optional pre-reserved new topic Vec outside their unwind boundary.
+// Ordinary callers pass None and retain the original allocation behavior.
+// Preserve the native duplicate overwrite/refusal BEFORE any index insertion.
+fn index_recovered_extent(
+    path: &Path,
+    offset: u64,
+    pack_sequence: u64,
+    mut location: ExtentLocation,
+    index: &mut HashMap<TopicPartition, Vec<ExtentLocation>>,
+    by_batch: &mut HashMap<(TopicPartition, BatchId), ExtentLocation>,
+    spare_locations: &mut Option<Vec<ExtentLocation>>,
+) -> StorageResult<()> {
+    location.pack_sequence = pack_sequence;
+    let topic_partition = TopicPartition::new(
+        location.reservation.topic_id,
+        location.reservation.partition_id,
+    );
+    let key = (topic_partition, location.reservation.batch_id);
+    if by_batch.insert(key, location.clone()).is_some() {
+        return Err(StorageError::corrupt(path, offset, "duplicate batch ID"));
+    }
+    index
+        .entry(topic_partition)
+        .or_insert_with(|| spare_locations.take().unwrap_or_default())
+        .push(location);
     Ok(())
 }
 
@@ -1716,6 +1746,17 @@ pub(crate) fn validate_prefix(
     Ok(())
 }
 
+// Keep the existing native accepted digit spellings and pending-name role.
+fn pack_sequence_from_name(name: &str) -> Option<u64> {
+    name.strip_prefix("pack-")
+        .and_then(|name| name.strip_suffix(".sse"))
+        .and_then(|digits| digits.parse::<u64>().ok())
+}
+
+fn is_pending_pack_deletion_name(name: &str) -> bool {
+    name.starts_with("pack-") && name.ends_with(".sse.gc-pending")
+}
+
 fn discover_packs(directory: &Path) -> StorageResult<BTreeMap<u64, PathBuf>> {
     let mut packs = BTreeMap::new();
     for entry in fs::read_dir(directory)? {
@@ -1723,11 +1764,7 @@ fn discover_packs(directory: &Path) -> StorageResult<BTreeMap<u64, PathBuf>> {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        let Some(sequence) = name
-            .strip_prefix("pack-")
-            .and_then(|name| name.strip_suffix(".sse"))
-            .and_then(|digits| digits.parse::<u64>().ok())
-        else {
+        let Some(sequence) = pack_sequence_from_name(name) else {
             continue;
         };
         if packs.insert(sequence, path).is_some() {
@@ -1821,18 +1858,17 @@ fn scan_pack_until(
         frame[..PREFIX_LEN].copy_from_slice(&prefix);
         file.read_exact(&mut frame[PREFIX_LEN..])?;
         recovery_gc_clock(expiry)?;
-        let mut location = decode_extent(path, offset, &frame, expected_shard)?;
+        let location = decode_extent(path, offset, &frame, expected_shard)?;
         recovery_gc_clock(expiry)?;
-        location.pack_sequence = pack_sequence;
-        let topic_partition = TopicPartition::new(
-            location.reservation.topic_id,
-            location.reservation.partition_id,
-        );
-        let key = (topic_partition, location.reservation.batch_id);
-        if by_batch.insert(key, location.clone()).is_some() {
-            return Err(StorageError::corrupt(path, offset, "duplicate batch ID"));
-        }
-        index.entry(topic_partition).or_default().push(location);
+        index_recovered_extent(
+            path,
+            offset,
+            pack_sequence,
+            location,
+            index,
+            by_batch,
+            &mut None,
+        )?;
         offset += frame_len;
     }
     recovery_gc_clock(expiry)?;
@@ -1864,11 +1900,7 @@ fn discover_packs_until(
             recovery_directory_test_step("discover-entry-complete");
             continue;
         };
-        let Some(sequence) = name
-            .strip_prefix("pack-")
-            .and_then(|name| name.strip_suffix(".sse"))
-            .and_then(|digits| digits.parse::<u64>().ok())
-        else {
+        let Some(sequence) = pack_sequence_from_name(name) else {
             #[cfg(test)]
             recovery_directory_test_step("discover-entry-complete");
             continue;
@@ -1906,7 +1938,7 @@ fn cleanup_pending_pack_deletions_until(directory: &Path, expiry: Instant) -> St
             if path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("pack-") && name.ends_with(".sse.gc-pending"))
+                .is_some_and(is_pending_pack_deletion_name)
             {
                 pending.push(path);
             }
@@ -1965,6 +1997,18 @@ fn recovery_gc_test_step(step: &str) {
     });
 }
 
+fn gc_location_before_start(
+    location: &ExtentLocation,
+    log_starts: &HashMap<TopicPartition, LogicalOffset>,
+) -> bool {
+    log_starts
+        .get(&TopicPartition::new(
+            location.reservation.topic_id,
+            location.reservation.partition_id,
+        ))
+        .is_some_and(|start| location.reservation.last_offset < *start)
+}
+
 fn pending_pack_deletion_path(path: &Path) -> PathBuf {
     path.with_extension("sse.gc-pending")
 }
@@ -1975,7 +2019,7 @@ fn cleanup_pending_pack_deletions(directory: &Path) -> StorageResult<()> {
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("pack-") && name.ends_with(".sse.gc-pending"))
+                .is_some_and(is_pending_pack_deletion_name)
         })
         .collect::<Vec<_>>();
     for path in &pending {

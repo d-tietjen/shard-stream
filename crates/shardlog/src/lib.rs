@@ -47,11 +47,23 @@ pub use extent::{
     ExtentCatalogEntry, GarbageCollectionStats, PreparedExtent, SealedPack, ShardStore,
     ShardStoreConfig, StoredBatch, StoredBatchMetadata,
 };
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use extent::{
+    OpenedPinnedShardStore, PinnedStoreDirectoryEntry, PinnedStoreOpenChecks, PinnedStoreOpenCost,
+    PinnedStoreOpenError, PinnedStoreOpenFailure, PinnedStoreOpenLimits, PinnedStoreOpenOutcome,
+    PinnedStoreOpenPhase, PinnedStoreOpenUsage, pinned_store_open_cost,
+};
 #[cfg(unix)]
 pub use extent::{
     PinnedShardDirectory, PinnedShardDirectoryCost, PinnedShardDirectoryError,
     PinnedShardDirectoryFailure, PinnedShardDirectoryLimits, PinnedShardDirectoryObservation,
     ShardDirectoryCheckFailure, ShardDirectoryChecks, pinned_shard_directory_cost,
+};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use extent::{
+    PinnedShardGcChecks, PinnedShardGcCost, PinnedShardGcError, PinnedShardGcFailure,
+    PinnedShardGcLimits, PinnedShardGcPack, PinnedShardGcPhase, PinnedShardGcReport,
+    PinnedShardGcUsage, pinned_shard_gc_cost,
 };
 #[cfg(unix)]
 pub use extent::{
