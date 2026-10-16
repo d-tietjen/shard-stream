@@ -50,6 +50,8 @@ pub use tier::TierRecoveryGuard;
 pub use tier::{LocalObjectTier, TierExtent, TierManifest, TierObject};
 
 pub use recovery_codec::{
-    RECOVERY_EXTENT_PREFIX_BYTES, RECOVERY_JOURNAL_PREFIX_BYTES, inspect_recovery_extent,
-    inspect_recovery_journal, recovery_extent_frame_bytes, recovery_journal_frame_bytes,
+    RECOVERY_EXTENT_HEADER_BYTES, RECOVERY_EXTENT_PREFIX_BYTES, RECOVERY_JOURNAL_PREFIX_BYTES,
+    RecoveryExtentHeader, RecoveryExtentTail, RecoveryExtentTailUnknown, inspect_recovery_extent,
+    inspect_recovery_extent_tail, inspect_recovery_journal, recovery_extent_frame_bytes,
+    recovery_journal_frame_bytes,
 };

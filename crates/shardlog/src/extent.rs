@@ -36,6 +36,10 @@ const MAX_EXTENTS_PER_WRITE: usize = 128;
 const READ_BUFFER_POOL_SLOTS: usize = 8;
 const MAX_CACHED_READ_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
+pub(crate) const fn recovery_header_bytes() -> usize {
+    HEADER_LEN
+}
+
 pub(crate) const fn recovery_frame_minimum() -> usize {
     HEADER_LEN + CHECKSUM_LEN
 }
@@ -1511,6 +1515,39 @@ pub(crate) fn decode_extent(
     }
 
     let mut decoder = Decoder::new(&frame[PREFIX_LEN..frame.len() - CHECKSUM_LEN]);
+    let header = decode_extent_header(path, frame_offset, &mut decoder)?;
+    if decoder.take(header.payload_len).is_err() || !decoder.is_empty() {
+        return Err(StorageError::corrupt(
+            path,
+            frame_offset,
+            "payload length does not match frame",
+        ));
+    }
+
+    Ok(ExtentLocation {
+        reservation: header.reservation,
+        producer: header.producer,
+        atomic_group: header.atomic_group,
+        pack_sequence: 0,
+        payload_offset: frame_offset + HEADER_LEN as u64,
+        payload_len: header.payload_len,
+    })
+}
+
+pub(crate) struct DecodedExtentHeader {
+    pub(crate) reservation: Reservation,
+    pub(crate) producer: Option<ProducerSequence>,
+    pub(crate) atomic_group: Option<AtomicGroupSequence>,
+    pub(crate) payload_len: usize,
+}
+
+// One native fixed-header decoder, shared with incomplete-tail observation.
+// Complete decode calls this only AFTER its original checksum validation.
+pub(crate) fn decode_extent_header(
+    path: &Path,
+    frame_offset: u64,
+    decoder: &mut Decoder<'_>,
+) -> StorageResult<DecodedExtentHeader> {
     let topic_id = TopicId::new(decoder.u128()?);
     let partition_id = LogicalPartitionId::new(decoder.u32()?);
     let batch_id = BatchId::new(decoder.u128()?);
@@ -1634,15 +1671,7 @@ pub(crate) fn decode_extent(
             "record range does not match record count",
         ));
     }
-    if decoder.take(payload_len).is_err() || !decoder.is_empty() {
-        return Err(StorageError::corrupt(
-            path,
-            frame_offset,
-            "payload length does not match frame",
-        ));
-    }
-
-    Ok(ExtentLocation {
+    Ok(DecodedExtentHeader {
         reservation: Reservation {
             topic_id,
             partition_id,
@@ -1659,8 +1688,6 @@ pub(crate) fn decode_extent(
         },
         producer,
         atomic_group,
-        pack_sequence: 0,
-        payload_offset: frame_offset + HEADER_LEN as u64,
         payload_len,
     })
 }
@@ -2726,3 +2753,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "extent_header_tests.rs"]
+mod header_tests;

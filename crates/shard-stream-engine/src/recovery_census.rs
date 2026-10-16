@@ -18,10 +18,11 @@ use shard_stream_core::{
     OwnedFileHandle, ShardId, TopicPartition,
 };
 use shardlog::{
-    ExtentCatalogEntry, JournalEvent, LocalObjectTier, RECOVERY_EXTENT_PREFIX_BYTES,
-    RECOVERY_JOURNAL_PREFIX_BYTES, ShardRecoveryGuard, ShardStore, ShardStoreConfig, StorageError,
-    TierExtent, TierManifest, TierRecoveryGuard, inspect_recovery_extent, inspect_recovery_journal,
-    recovery_extent_frame_bytes, recovery_journal_frame_bytes,
+    ExtentCatalogEntry, JournalEvent, LocalObjectTier, RECOVERY_EXTENT_HEADER_BYTES,
+    RECOVERY_EXTENT_PREFIX_BYTES, RECOVERY_JOURNAL_PREFIX_BYTES, RecoveryExtentHeader,
+    RecoveryExtentTail, ShardRecoveryGuard, ShardStore, ShardStoreConfig, StorageError, TierExtent,
+    TierManifest, TierRecoveryGuard, inspect_recovery_extent, inspect_recovery_extent_tail,
+    inspect_recovery_journal, recovery_extent_frame_bytes, recovery_journal_frame_bytes,
 };
 
 use crate::{EngineConfig, EngineError};
@@ -87,6 +88,22 @@ pub struct RecoverySourceFact {
     pub blake3: [u8; 32],
     /// Exact incomplete native tail preserved before any subsequent repair.
     pub partial_tail: Vec<u8>,
+    /// Actual incomplete SSE8 header observation, never checksum validity.
+    /// Coordinator SSJ3 tails have no encoded leader term and leave this None.
+    pub extent_tail: Option<RecoveryExtentTailObservation>,
+}
+
+/// Original source coordinates plus native incomplete-header/unknown evidence.
+#[derive(Debug)]
+pub struct RecoveryExtentTailObservation {
+    /// Index of the source retaining the exact bytes and real descriptor.
+    pub source_index: usize,
+    /// Offset of the original incomplete frame within that source.
+    pub file_offset: u64,
+    /// Actual physical source shard, independent of the claimed placement.
+    pub physical_shard: ShardId,
+    /// Native header fields or explicit unknown; no payload/CRC validity claim.
+    pub native: RecoveryExtentTail,
 }
 
 /// One complete native frame, including nonlatest and duplicate-source facts.
@@ -345,6 +362,14 @@ impl NativeRecoveryCensus {
     pub fn extents(&self) -> &[RecoveryExtentObservation] {
         &self.attempt.extents
     }
+    /// Every retained incomplete SSE8 header, including explicit unknowns.
+    /// These borrow the source facts that retain the original raw tail bytes.
+    pub fn extent_tails(&self) -> impl Iterator<Item = &RecoveryExtentTailObservation> {
+        self.attempt
+            .sources
+            .iter()
+            .filter_map(|source| source.fact.extent_tail.as_ref())
+    }
     /// All retained native manifests, including generations beyond CURRENT.
     ///
     /// Their recorded terms conservatively raise an observed floor; this does
@@ -414,10 +439,11 @@ impl NativeRecoveryCensus {
             .map_err(identity)?;
         Ok(bytes)
     }
-    /// Maximum of complete native frames and retained native manifest claims.
+    /// Maximum of complete frames, complete tail headers and manifest claims.
     ///
     /// This is a conservative local observation, never all-time authority or
-    /// proof of payload availability. Callers can inspect each source's role.
+    /// proof of payload availability. Unknown tails remain in `extent_tails`;
+    /// this numeric maximum cannot prove their absence or safe term reuse.
     pub fn observed_leader_epoch(&self, tp: TopicPartition) -> Option<u64> {
         self.attempt
             .extents
@@ -427,6 +453,15 @@ impl NativeRecoveryCensus {
                     && entry.native.reservation.partition_id == tp.partition_id
             })
             .map(|entry| entry.native.reservation.placement.leader_epoch.get())
+            .chain(self.extent_tails().filter_map(|entry| match &entry.native {
+                RecoveryExtentTail::Header(header)
+                    if header.reservation.topic_id == tp.topic_id
+                        && header.reservation.partition_id == tp.partition_id =>
+                {
+                    Some(header.reservation.placement.leader_epoch.get())
+                }
+                _ => None,
+            }))
             .chain(
                 self.attempt
                     .tier_manifests
@@ -1024,6 +1059,7 @@ impl Attempt {
                 bytes: metadata.len(),
                 blake3: digest,
                 partial_tail: Vec::new(),
+                extent_tail: None,
             },
         });
         Ok(raw)
@@ -1343,6 +1379,7 @@ impl Attempt {
                 bytes: metadata.len(),
                 blake3: digest,
                 partial_tail: Vec::new(),
+                extent_tail: None,
             },
             handle,
         });
@@ -1365,7 +1402,7 @@ impl Attempt {
                 RECOVERY_EXTENT_PREFIX_BYTES
             };
             if metadata.len() - offset < prefix_bytes as u64 {
-                self.tail(source_index, &file, offset, metadata.len())?;
+                self.tail(source_index, &file, offset, metadata.len(), kind, shard)?;
                 break;
             }
             let mut prefix = [0u8; RECOVERY_EXTENT_PREFIX_BYTES];
@@ -1383,7 +1420,7 @@ impl Attempt {
                 return Err(limited());
             }
             if length as u64 > metadata.len() - offset {
-                self.tail(source_index, &file, offset, metadata.len())?;
+                self.tail(source_index, &file, offset, metadata.len(), kind, shard)?;
                 break;
             }
             let mut frame = self.buffer(length)?;
@@ -1467,15 +1504,67 @@ impl Attempt {
         Ok(source_index)
     }
 
-    fn tail(&mut self, index: usize, file: &File, offset: u64, length: u64) -> Result<()> {
+    fn tail(
+        &mut self,
+        index: usize,
+        file: &File,
+        offset: u64,
+        length: u64,
+        kind: RecoverySourceKind,
+        shard: ShardId,
+    ) -> Result<()> {
         let remaining = usize::try_from(length - offset).map_err(|_| limited())?;
         if remaining > self.limits.max_partial_tail_bytes {
             return Err(limited());
         }
         let mut raw = self.buffer(remaining)?;
         self.read_at(file, &mut raw, offset)?;
+        // Retain original raw evidence before deriving any interpretation.
         self.sources[index].fact.partial_tail = raw;
+        if kind != RecoverySourceKind::Coordinator {
+            self.admit_tail_header()?;
+            let fact = &self.sources[index].fact;
+            #[cfg(test)]
+            TAIL_HEADER_INSPECTIONS.with(|count| count.set(count.get() + 1));
+            let native = inspect_recovery_extent_tail(
+                &fact.path,
+                offset,
+                &fact.partial_tail,
+                self.config.max_batch_bytes,
+            );
+            self.sources[index].fact.extent_tail = Some(RecoveryExtentTailObservation {
+                source_index: index,
+                file_offset: offset,
+                physical_shard: shard,
+                native,
+            });
+            self.clock()?;
+        }
         Ok(())
+    }
+
+    // Admission precedes every fixed-header probe/parser/result construction.
+    // Native error paths allocate at most one copied path plus static text;
+    // reserve four path/message copies conservatively, without cloning raw data.
+    fn admit_tail_header(&mut self) -> Result<()> {
+        let paths = self
+            .limits
+            .max_path_bytes
+            .checked_mul(4)
+            .ok_or_else(limited)?;
+        let fixed = size_of::<RecoveryExtentHeader>()
+            .checked_mul(3)
+            .and_then(|n| n.checked_add(2 * size_of::<RecoveryExtentTailObservation>()))
+            .and_then(|n| n.checked_add(size_of::<RecoveryExtentTail>()))
+            .and_then(|n| n.checked_add(RECOVERY_EXTENT_HEADER_BYTES))
+            .and_then(|n| n.checked_add(paths))
+            .and_then(|n| n.checked_add(512))
+            .ok_or_else(limited)?;
+        let work = RECOVERY_EXTENT_HEADER_BYTES
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(fixed))
+            .ok_or_else(limited)?;
+        self.charge(0, 3, fixed, 0, u64::try_from(work).map_err(|_| limited())?)
     }
 
     fn validate_sources(&mut self) -> Result<()> {
@@ -1706,3 +1795,8 @@ mod json_shape {
 #[cfg(test)]
 #[path = "recovery_census_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+std::thread_local! {
+    static TAIL_HEADER_INSPECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}

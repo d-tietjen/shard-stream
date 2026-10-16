@@ -13,8 +13,8 @@ mod worker;
 #[cfg(unix)]
 pub use recovery_census::{
     NativeRecoveryCensus, NativeRecoveryError, NativeRecoveryLimits, NativeRecoveryUsage,
-    OwnedRecoveryStorage, RecoveryExtentObservation, RecoverySourceFact, RecoverySourceKind,
-    RecoveryTierManifestObservation,
+    OwnedRecoveryStorage, RecoveryExtentObservation, RecoveryExtentTailObservation,
+    RecoverySourceFact, RecoverySourceKind, RecoveryTierManifestObservation,
 };
 
 pub use config::{EngineConfig, PartitionReplicationPolicy, TopicConfig};
@@ -36,4 +36,6 @@ pub use engine::{
 pub use error::{EngineError, EngineResult};
 pub use shard_stream_protocol::ReplicaAppend;
 // The original native enum, also borrowed by the pre-open census.
-pub use shardlog::JournalEvent;
+pub use shardlog::{
+    JournalEvent, RecoveryExtentHeader, RecoveryExtentTail, RecoveryExtentTailUnknown,
+};

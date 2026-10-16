@@ -278,3 +278,37 @@ to prune unknown staging objects; ordinary native helpers remain unchanged.
 The additional source regressions use actual native packs, late directory
 visits/EOF, genuine stale-name collisions, source-open loss and a real
 post-rename replacement. They remain uncompiled and unexecuted.
+
+### Incomplete SSE8 headers before repair
+
+The native recovery reader retains each incomplete source tail verbatim. A
+complete fixed SSE8 header can still contain a higher placement leader epoch,
+even when the final payload/checksum write did not finish. The shared native
+header decoder now exposes `RecoveryExtentTail::Header` with its original
+reservation, producer/atomic metadata and declared lengths. The complete native
+decoder still checks the checksum first and preserves its existing validation
+and error order. No missing bytes or checksum are synthesized.
+
+`NativeRecoveryCensus::extent_tails()` borrows each actual source index, file
+offset, physical shard and native classification. `observed_leader_epoch` also
+includes usable complete tail headers. A short or uninterpretable header remains
+explicitly `Unknown` with its raw bytes; a numeric maximum cannot certify that
+unknown bytes are safe or absent. Complete malformed frames and invalid native
+prefixes keep their existing refusal policy. SSJ3 tails have no leader-epoch
+field and are not assigned one. Tail facts move with the same original source
+facts through storage and engine custody after repair.
+
+Tail interpretation uses the retained byte slice and original expiry. The
+reader admits its fixed native/result slots, fixed scan work and bounded native
+error path/message copies before parsing; it performs no additional raw read or
+copy for that interpretation. This is conservative local evidence only, never
+checksum validity, payload availability, signed history, current assignment or
+permission to write. The closed host still has to join every source, explicit
+unknown, native/signed maximum and actual current authority before activation.
+
+Six new source fixture groups cover a genuine MAX-term native append truncated
+before its final checksum, pending-file provenance, explicit short/invalid
+unknowns, exact/one-less pre-parser admission, original expiry and custody, plus
+a complete-decoder differential against the unchanged pre-factoring native
+body. These fixture sources remain uncompiled and unexecuted; no engine, private
+startup or full graph qualification follows from this source unit.

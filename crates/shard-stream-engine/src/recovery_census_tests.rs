@@ -767,3 +767,6 @@ fn owned_native_long_root_ignored_discovery_paths_are_admitted_before_any_repair
 
 #[path = "owned_engine_tests.rs"]
 mod owned_engine;
+
+#[path = "recovery_extent_tail_tests.rs"]
+mod extent_tails;
