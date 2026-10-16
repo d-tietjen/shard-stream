@@ -564,3 +564,44 @@ or admission worker crosses the same original expiry without starting a later
 worker. Both directory owners remain contended until construction and worker
 cleanup settle. These authored groups remain source regressions
 until their normal dependency/typecheck and execution gates actually run.
+
+
+### Original-deadline directory validation
+
+`DirectoryOwnership::validate_directory_until` checks one supplied absolute
+`Instant` before and after every explicit native path metadata, ancestor
+metadata, descriptor open and native stat phase. This bounded API accepts only
+the byte-exact retained canonical absolute directory name. Relative names,
+alternate spellings and renamed paths fail before filesystem I/O. It walks
+borrowed components from `/` using `DIRECTORY | NOFOLLOW | CLOEXEC`, keeping each
+parent open until its child open settles. Ancestors must permit read access.
+The terminal directory and its nofollow relative lock entry are compared with
+the actual retained directory and lock descriptors using native stat types.
+It allocates no OS-derived canonical pathname. This is a deliberately narrower
+contract than the ordinary validator, which still accepts its existing path
+spellings and performs its existing canonicalization. Neither API establishes
+an atomic or permanent namespace against concurrent path replacement. An
+already entered filesystem call may settle late while the actual owner remains
+held. The validator then returns `DirectoryOwnershipUntilError::Expired` without
+starting another phase. The existing ordinary validator and its exhaustive
+error enum keep their signatures and policy. The additive error wraps
+canonical-name, identity and filesystem refusals as `Ownership`; `Capacity`
+reports checked cost overflow.
+
+Before this method, charge `directory_validation_cost` into the same composing
+resource owner. Its checked scalar facts use the borrowed input path and this
+actual owner's retained canonical path, bounded component/NUL conversion
+scratch, two temporary descriptor slots, native results and cleanup work.
+`declared_bytes` includes its separate
+`string_bytes` subset; `work_bytes` includes native entry work. These are ordinary
+logical native costs, without a new budget, clock, directory owner, currentness
+observation or serving authority. The host still owns the full startup and
+durable installation sequence.
+
+The authored fixtures use genuine native directories and OS locks, completed
+physical-phase gates, a real elapsed deadline, fitting identity/lock policy and
+last owner contention through blocked cleanup. Additional cases perform a real
+same-inode rename and install a real symlink after ancestor observations;
+alternate names start no native phase and the descriptor walk refuses the late
+symlink. Ordinary alias validation remains supported. They remain uncompiled and unexecuted
+until the normal native dependency, type and test gates run.

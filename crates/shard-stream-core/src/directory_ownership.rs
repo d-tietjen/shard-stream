@@ -1,5 +1,9 @@
 //! Exclusive, cooperating-process custody of an engine's local directory.
 
+#[path = "directory_validation_until.rs"]
+mod validation_until;
+pub use validation_until::{DirectoryOwnershipUntilError, DirectoryValidationCost};
+
 use std::error::Error;
 use std::fmt;
 use std::io;
