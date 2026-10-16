@@ -340,3 +340,21 @@ and actual expiry/custody release. A separate explicitly pure typed reducer
 fixture preserves its broader in-memory semantics without fabricating native
 wire acceptance. They remain uncompiled and unexecuted in this source unit;
 canonical formatting alone does not qualify the full recovery graph.
+
+## Original expiry during retained source reads
+
+`NativeRecoveryCensus::read_source_chunk` keeps the original census resource
+allowance, source descriptors and absolute expiry. It checks that expiry before
+source identity validation, before and after descriptor cloning, before the
+final identity validation, and after that validation before returning bytes.
+Elapsed work cannot start another physical source phase or return a successful
+late copy. Allocation and read admission continue to use the existing cumulative
+native counters. Refusal retains the census and its actual directory and shard
+leases; these bytes grant no authority or serving permission.
+
+The source regressions use real native writers, retained file identities and
+leases. Test-only scheduling pauses completed operations against the same real
+saved expiry; it supplies no clock or source replacement to the reader. Exact
+and one-less copy/read caps and real inode replacement are also covered. These
+new cases remain uncompiled and unexecuted until the original native dependency
+graph and required full checks run.

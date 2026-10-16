@@ -410,6 +410,8 @@ impl NativeRecoveryCensus {
     ///
     /// This debits actual read/copy work under the SAME saved expiry and keeps
     /// the real source lease; no caller can extract or replace its raw handle.
+    /// Identity validation and descriptor cloning recheck that original expiry
+    /// before another physical phase starts, including after final validation.
     pub fn read_source_chunk(
         &mut self,
         index: usize,
@@ -421,26 +423,52 @@ impl NativeRecoveryCensus {
         }
         self.attempt.charge(1, 1, 256, 0, 256)?;
         let source = self.attempt.sources.get(index).ok_or_else(limited)?;
+        self.attempt.clock()?;
         source.handle.validate().map_err(identity)?;
+        #[cfg(test)]
+        tests::source_read_phase(
+            tests::SourceReadPhase::AfterInitialIdentity,
+            self.attempt.expiry,
+        );
         let length = source
             .fact
             .bytes
             .checked_sub(offset)
             .ok_or_else(limited)?
             .min(maximum as u64);
+        self.attempt.clock()?;
+        #[cfg(test)]
+        tests::source_read_phase(tests::SourceReadPhase::BeforeClone, self.attempt.expiry);
         let file = source
             .handle
             .file()
             .try_clone()
             .map_err(StorageError::from)?;
+        #[cfg(test)]
+        tests::source_read_phase(tests::SourceReadPhase::AfterClone, self.attempt.expiry);
+        self.attempt.clock()?;
         let mut bytes = self
             .attempt
             .buffer(usize::try_from(length).map_err(|_| limited())?)?;
         self.attempt.read_at(&file, &mut bytes, offset)?;
+        #[cfg(test)]
+        tests::source_read_phase(tests::SourceReadPhase::AfterRead, self.attempt.expiry);
+        self.attempt.clock()?;
+        #[cfg(test)]
+        tests::source_read_phase(
+            tests::SourceReadPhase::BeforeFinalIdentity,
+            self.attempt.expiry,
+        );
         self.attempt.sources[index]
             .handle
             .validate()
             .map_err(identity)?;
+        #[cfg(test)]
+        tests::source_read_phase(
+            tests::SourceReadPhase::AfterFinalIdentity,
+            self.attempt.expiry,
+        );
+        self.attempt.clock()?;
         Ok(bytes)
     }
     /// Maximum of complete frames, complete tail headers and manifest claims.

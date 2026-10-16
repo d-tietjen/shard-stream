@@ -765,6 +765,218 @@ fn owned_native_long_root_ignored_discovery_paths_are_admitted_before_any_repair
     );
 }
 
+// Test-only scheduling at actual source-operation boundaries. The real saved
+// Instant, native reader, descriptors, storage bytes and OS leases are retained;
+// this cannot supply another clock, source handle or recovery permission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SourceReadPhase {
+    AfterInitialIdentity,
+    BeforeClone,
+    AfterClone,
+    AfterRead,
+    BeforeFinalIdentity,
+    AfterFinalIdentity,
+}
+struct SourceReadProbe {
+    pause: Option<SourceReadPhase>,
+    observed: Vec<SourceReadPhase>,
+}
+std::thread_local! {
+    static SOURCE_READ_PROBE: std::cell::RefCell<Option<SourceReadProbe>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+pub(super) fn source_read_phase(phase: SourceReadPhase, original_expiry: Instant) {
+    let pause = SOURCE_READ_PROBE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(probe) = slot.as_mut() else {
+            return false;
+        };
+        probe.observed.push(phase);
+        probe.pause == Some(phase)
+    });
+    if pause {
+        std::thread::sleep(
+            original_expiry.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+        );
+    }
+}
+struct SourceReadProbeGuard;
+impl SourceReadProbeGuard {
+    fn install(pause: Option<SourceReadPhase>) -> Self {
+        SOURCE_READ_PROBE.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(SourceReadProbe {
+                pause,
+                observed: Vec::new(),
+            });
+        });
+        Self
+    }
+    fn observed(&self) -> Vec<SourceReadPhase> {
+        SOURCE_READ_PROBE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .expect("installed real-operation observer")
+                .observed
+                .clone()
+        })
+    }
+}
+impl Drop for SourceReadProbeGuard {
+    fn drop(&mut self) {
+        SOURCE_READ_PROBE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+fn chunk_census(root: &Path, caps: NativeRecoveryLimits, expiry: Instant) -> NativeRecoveryCensus {
+    let owner = DirectoryOwnership::acquire(root).expect("actual source custody");
+    NativeRecoveryCensus::read_for_engine(config(root), owner, None, caps, expiry)
+        .expect("actual engine-path source census")
+}
+fn pack_source(census: &NativeRecoveryCensus, pack: &Path) -> usize {
+    census
+        .sources()
+        .position(|source| source.path == pack)
+        .expect("actual retained native pack index")
+}
+
+#[test]
+fn owned_native_chunk_copies_actual_bytes_with_cumulative_exact_and_short_caps() {
+    let temp = Temporary::new();
+    let pack = write_native(&temp.0);
+    let original = fs::read(&pack).expect("real source bytes");
+    let mut baseline = chunk_census(&temp.0, limits(), Instant::now() + Duration::from_secs(30));
+    let index = pack_source(&baseline, &pack);
+    let before = baseline.usage();
+    assert_eq!(
+        baseline
+            .read_source_chunk(index, 3, 7)
+            .expect("actual bounded source read"),
+        original[3..10]
+    );
+    let measured = baseline.usage();
+    assert_eq!(measured.read_bytes, before.read_bytes + 7);
+    assert_eq!(measured.declared_bytes, before.declared_bytes + 256 + 7);
+    assert_eq!(measured.files, before.files + 1);
+    drop(baseline);
+    let mut exact = limits();
+    exact.max_declared_bytes = measured.declared_bytes;
+    exact.max_read_bytes = measured.read_bytes;
+    let mut census = chunk_census(&temp.0, exact, Instant::now() + Duration::from_secs(30));
+    let index = pack_source(&census, &pack);
+    assert_eq!(
+        census
+            .read_source_chunk(index, 3, 7)
+            .expect("actual exact cumulative allowance"),
+        original[3..10]
+    );
+    drop(census);
+    for declared in [true, false] {
+        let mut short = exact;
+        if declared {
+            short.max_declared_bytes -= 1;
+        } else {
+            short.max_read_bytes -= 1;
+        }
+        let mut census = chunk_census(&temp.0, short, Instant::now() + Duration::from_secs(30));
+        let index = pack_source(&census, &pack);
+        let before = census.usage();
+        assert!(census.read_source_chunk(index, 3, 7).is_err());
+        assert_eq!(
+            census.usage().read_bytes,
+            before.read_bytes,
+            "no physical payload read after failed admission"
+        );
+        assert_eq!(fs::read(&pack).expect("source retained"), original);
+    }
+}
+
+#[test]
+fn owned_native_chunk_original_expiry_blocks_next_phase_and_late_success() {
+    use SourceReadPhase::*;
+    for pause in [AfterInitialIdentity, AfterRead, AfterFinalIdentity] {
+        let temp = Temporary::new();
+        let pack = write_native(&temp.0);
+        let original = fs::read(&pack).expect("real unchanged source");
+        let expiry = Instant::now() + Duration::from_secs(2);
+        let mut census = chunk_census(&temp.0, limits(), expiry);
+        assert_eq!(census.absolute_expiry(), expiry);
+        let index = pack_source(&census, &pack);
+        let before = census.usage();
+        let observer = SourceReadProbeGuard::install(Some(pause));
+        let error = census
+            .read_source_chunk(index, 3, 7)
+            .expect_err("original real E elapsed at the physical boundary");
+        assert!(error.to_string().contains("original expiry elapsed"));
+        assert_eq!(census.absolute_expiry(), expiry);
+        let observed = observer.observed();
+        match pause {
+            AfterInitialIdentity => {
+                assert_eq!(observed, vec![AfterInitialIdentity]);
+                assert_eq!(census.usage().read_bytes, before.read_bytes);
+            }
+            AfterRead => assert_eq!(
+                observed,
+                vec![AfterInitialIdentity, BeforeClone, AfterClone, AfterRead]
+            ),
+            AfterFinalIdentity => assert_eq!(
+                observed,
+                vec![
+                    AfterInitialIdentity,
+                    BeforeClone,
+                    AfterClone,
+                    AfterRead,
+                    BeforeFinalIdentity,
+                    AfterFinalIdentity
+                ]
+            ),
+            _ => unreachable!("only completed real source phases pause"),
+        }
+        drop(observer);
+        assert_eq!(fs::read(&pack).expect("no repair or mutation"), original);
+        assert!(matches!(
+            DirectoryOwnership::acquire(&temp.0),
+            Err(DirectoryOwnershipError::Contended)
+        ));
+        assert!(ShardStore::open(store_config(&temp.0)).is_err());
+        drop(census);
+        drop(
+            DirectoryOwnership::acquire(&temp.0)
+                .expect("physical drop releases the actual original owner"),
+        );
+        drop(
+            ShardStore::open(store_config(&temp.0))
+                .expect("physical drop releases actual native shard lease"),
+        );
+    }
+}
+
+#[test]
+fn owned_native_chunk_refuses_replaced_source_before_clone_or_payload_read() {
+    let temp = Temporary::new();
+    let pack = write_native(&temp.0);
+    let original = fs::read(&pack).expect("actual native bytes");
+    let mut census = chunk_census(&temp.0, limits(), Instant::now() + Duration::from_secs(30));
+    let index = pack_source(&census, &pack);
+    let before = census.usage();
+    let retained = pack.with_extension("retained-old-inode");
+    fs::rename(&pack, &retained).expect("actual directory entry replacement");
+    fs::write(&pack, &original).expect("same bytes in a different real inode");
+    let observer = SourceReadProbeGuard::install(None);
+    assert!(census.read_source_chunk(index, 3, 7).is_err());
+    assert!(observer.observed().is_empty());
+    assert_eq!(census.usage().read_bytes, before.read_bytes);
+    assert_eq!(
+        fs::read(&retained).expect("original source still retained"),
+        original
+    );
+    assert_eq!(fs::read(&pack).expect("replacement unmodified"), original);
+    assert!(matches!(
+        DirectoryOwnership::acquire(&temp.0),
+        Err(DirectoryOwnershipError::Contended)
+    ));
+}
+
 #[path = "owned_engine_tests.rs"]
 mod owned_engine;
 
