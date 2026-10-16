@@ -464,3 +464,63 @@ capture context never makes an otherwise possible local term foreign. Native
 frame validity alone cannot establish an active-active commit or activation.
 The archive source fixtures are source regressions until the normal dependency,
 typecheck and test workflow has actually run.
+
+
+### Shared engine custody in native adapters
+
+`EngineHandle` retains either the exact existing `Arc<StreamEngine>` or, on
+Unix, an actual `Arc<OwnedRecoveredEngine>`. The variants remain private. Clones
+retain that same allocation; `engine()` and `Deref` expose a borrow only. There
+is no bare-engine extraction, recreated directory owner, reopen, claimed digest
+or completion flag. This is ordinary resource custody, not a capability to
+serve, a currentness observation, or a substitute for a host's full recovery
+and durable activation sequence.
+
+`downgrade()` produces an opaque `WeakEngineHandle`. Its `upgrade()` retains
+the entire original strong owner for a callback or task. Strong and weak
+`ptr_eq` compare the actual underlying allocation within the same variant,
+including dead weak references; independently wrapping one ordinary/recovered
+Arc does not introduce a second outer identity. The last recovered strong
+handle runs the native wrapper's actual owned sink join, normal engine worker
+cleanup and then its retained native/root/tier custody destruction.
+
+The existing ordinary Arc APIs retain their signatures and delegate to the
+same implementations used by these parallel custody entries:
+
+- `DurableApplyQueue::spawn_with_engine_handle`;
+- `DurableApplyQueue::spawn_with_engine_handle_until`;
+- `shard_stream_grpc::serve_with_engine_handle`;
+- `shard_stream_h3::serve_with_engine_handle`;
+- `shard_stream_kafka::serve_with_engine_handle`; and
+- `shard_stream_kafka::serve_with_admin_and_engine_handle`.
+
+Replica admission/append workers, gRPC service/stream/blocking callbacks,
+HTTP/3 connection/request callbacks and Kafka broker/native topic-admin work
+clone the complete handle. Existing queue bounds, framing, RF1 durability,
+validation, fences, shutdown and custom topic-admin contracts remain in effect.
+An adapter does not authenticate a supplied assignment provider or prove that
+an independently supplied topic admin uses the same storage. Hosts must still
+join those actual components. The public RF1 REST binary remains unchanged;
+this unit introduces no alternate REST or startup factory.
+
+An owned startup uses `spawn_with_engine_handle_until` with its saved original
+absolute `Instant`. The constructor checks it before each channel and physical
+worker spawn, after each started worker has entered synchronous cleanup custody,
+and before success. Expiry can stop further work; an already-started spawn or
+cleanup may settle late. Refusal and unwind physically join all started workers
+before releasing the complete engine owner. The ordinary Arc and handle entries
+retain their existing construction behavior without an added expiry. Successful
+queues retain normal operation and shutdown behavior; a startup expiry is not a
+new per-request permission or a replacement duration clock.
+
+The genuine native custody fixtures produce object data, remove its primary
+pack, restore through the actual census and consuming native constructor, then
+exercise weak upgrades, real replica writes, blocked sink cleanup and unwind,
+and later normal restart. Additional adapter component fixtures exercise a real
+gRPC fetch, HTTP/3 finite configuration refusal without network, and a Kafka
+native topic-admin future. Queue expiry fixtures use the actual recovered engine
+and real spawns: expired entry starts no queue worker, and a paused first append
+or admission worker crosses the same original expiry without starting a later
+worker. Both directory owners remain contended until construction and worker
+cleanup settle. These authored groups remain source regressions
+until their normal dependency/typecheck and execution gates actually run.
