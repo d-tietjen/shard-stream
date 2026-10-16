@@ -1534,6 +1534,23 @@ pub(crate) fn decode_extent(
     })
 }
 
+// Complete borrowed inspection reuses the unchanged native decoder above.
+// The payload range belongs to this codec, rather than an external SSE8 layout.
+pub(crate) fn decode_extent_payload<'a>(
+    path: &Path,
+    frame_offset: u64,
+    frame: &'a [u8],
+) -> StorageResult<(ExtentLocation, &'a [u8])> {
+    let location = decode_extent(path, frame_offset, frame, ShardId::new(0))?;
+    let mut payload = Decoder::new(&frame[HEADER_LEN..frame.len() - CHECKSUM_LEN]);
+    let bytes = payload.take(location.payload_len)?;
+    debug_assert!(
+        payload.is_empty(),
+        "native decode consumed the complete payload"
+    );
+    Ok((location, bytes))
+}
+
 pub(crate) struct DecodedExtentHeader {
     pub(crate) reservation: Reservation,
     pub(crate) producer: Option<ProducerSequence>,

@@ -40,3 +40,10 @@ pub use shard_stream_protocol::ReplicaAppend;
 pub use shardlog::{
     JournalEvent, RecoveryExtentHeader, RecoveryExtentTail, RecoveryExtentTailUnknown,
 };
+
+// Ordinary native byte views/costs for hosts retaining the actual source owner.
+pub use shardlog::{
+    BorrowedRecoveryExtent, RecoveryExtentInspectionCost, RecoveryExtentInspectionError,
+    RecoveryExtentInspectionLimits, inspect_recovery_extent_payload,
+    recovery_extent_inspection_cost,
+};
