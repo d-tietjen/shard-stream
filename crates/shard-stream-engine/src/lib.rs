@@ -25,6 +25,9 @@ pub use durable_sink::{
     DurableSinkCheckpoint, DurableSinkConfig, DurableSinkLagPolicy, DurableSinkOptions,
     DurableSinkRecoveryMode, DurableSinkStats,
 };
+#[cfg(unix)]
+pub use engine::{OwnedEngineOpenError, OwnedRecoveredEngine};
+
 pub use engine::{
     AtomicGroupInspection, AtomicGroupState, FetchedBatch, PartitionEpochs, PartitionWatermarks,
     ProducerProgress, ReplicationProgress, ReplicationStats, ReplicationTicket,
@@ -32,3 +35,5 @@ pub use engine::{
 };
 pub use error::{EngineError, EngineResult};
 pub use shard_stream_protocol::ReplicaAppend;
+// The original native enum, also borrowed by the pre-open census.
+pub use shardlog::JournalEvent;

@@ -37,6 +37,16 @@ pub(crate) const ADMISSION_METADATA_BYTES: usize =
         + std::mem::size_of::<crate::coordinator::CommitControl>()
         + std::mem::size_of::<Arc<crate::coordinator::CoordinatorRouter>>();
 
+/// Concrete fixed native channel/value capacity before recovered worker startup.
+#[cfg(unix)]
+pub(crate) fn recovery_worker_bytes(config: &EngineConfig) -> Option<usize> {
+    config
+        .queue_slots_per_shard
+        .checked_mul(std::mem::size_of::<ShardCommand>())?
+        .checked_add(SYNC_QUEUE_SLOTS.checked_mul(std::mem::size_of::<SyncRequest>())?)?
+        .checked_add(std::mem::size_of::<ShardHandle>() + std::mem::size_of::<LaneStores>())
+}
+
 /// Computes the declared command charge without claiming a process RAM bound.
 pub(crate) fn append_command_charge(payload_bytes: usize, guarded: bool) -> Option<usize> {
     payload_bytes
@@ -181,6 +191,13 @@ enum ShardCommand {
         log_start: LogicalOffset,
         response: SyncSender<StorageResult<()>>,
     },
+    #[cfg(unix)]
+    GarbageCollectUntil {
+        topic_partition: TopicPartition,
+        log_start: LogicalOffset,
+        expiry: Instant,
+        response: SyncSender<StorageResult<()>>,
+    },
 }
 
 pub(crate) struct ShardHandle {
@@ -276,6 +293,98 @@ impl ShardHandle {
             },
             catalog,
         ))
+    }
+
+    /// Native worker continuation with already-open, same-lease stores.
+    #[cfg(unix)]
+    pub(crate) fn spawn_recovered(
+        config: &EngineConfig,
+        shard_id: ShardId,
+        primary: ShardStore,
+        mut tier: Option<LocalObjectTier>,
+        directory_ownership: Arc<shard_stream_core::DirectoryOwnership>,
+        expiry: Instant,
+    ) -> EngineResult<(Self, Vec<ExtentCatalogEntry>)> {
+        recovered_worker_clock(expiry)?;
+        if let Some(tier) = &mut tier {
+            offload_sealed_packs_until(&primary, tier, expiry)?;
+        }
+        recovered_worker_clock(expiry)?;
+        let mut catalog = primary.catalog_until(expiry)?;
+        if let Some(tier) = &tier {
+            let mut durable_packs = std::collections::HashSet::new();
+            for object in &tier.manifest().objects {
+                recovered_worker_clock(expiry)?;
+                durable_packs.insert(object.pack_sequence);
+            }
+            for entry in &mut catalog {
+                recovered_worker_clock(expiry)?;
+                entry.object_durable = durable_packs.contains(&entry.pack_sequence);
+            }
+        }
+        recovered_worker_clock(expiry)?;
+        let stores = LaneStores { primary, tier };
+        let (sync_sender, sync_receiver) = sync_channel(SYNC_QUEUE_SLOTS);
+        // The incremental real handle joins any already-spawned worker on
+        // every later failure; no half-open continuation detaches a worker.
+        let mut result = Self {
+            shard_id,
+            sender: None,
+            thread: None,
+            sync_sender: Some(sync_sender),
+            sync_thread: None,
+        };
+        let sync_ownership = Arc::clone(&directory_ownership);
+        recovered_worker_clock(expiry)?;
+        result.sync_thread = Some(
+            thread::Builder::new()
+                .name(format!("shard-stream-sync-{shard_id}"))
+                .spawn(move || {
+                    let ownership = sync_ownership;
+                    run_sync_worker(sync_receiver);
+                    drop(ownership);
+                })
+                .map_err(|e| {
+                    EngineError::InvalidConfig(format!("failed to spawn sync worker: {e}"))
+                })?,
+        );
+        #[cfg(test)]
+        recovered_open_test_step("sync-spawned");
+        recovered_worker_clock(expiry)?;
+        let (sender, receiver) =
+            byte_bounded_channel(config.queue_slots_per_shard, config.queue_bytes_per_shard)
+                .map_err(|e| EngineError::InvalidConfig(e.to_string()))?;
+        let append_linger = config.append_linger;
+        let max_pack_age = config.max_pack_age;
+        let append_sync_sender = result
+            .sync_sender
+            .as_ref()
+            .ok_or(EngineError::WorkerStopped(shard_id))?
+            .clone();
+        recovered_worker_clock(expiry)?;
+        result.thread = Some(
+            thread::Builder::new()
+                .name(format!("shard-stream-lane-{shard_id}"))
+                .spawn(move || {
+                    let ownership = directory_ownership;
+                    run_worker(
+                        stores,
+                        receiver,
+                        append_linger,
+                        max_pack_age,
+                        append_sync_sender,
+                    );
+                    drop(ownership);
+                })
+                .map_err(|e| {
+                    EngineError::InvalidConfig(format!("failed to spawn shard worker: {e}"))
+                })?,
+        );
+        result.sender = Some(sender);
+        #[cfg(test)]
+        recovered_open_test_step("lane-spawned");
+        recovered_worker_clock(expiry)?;
+        Ok((result, catalog))
     }
 
     pub(crate) fn append(
@@ -414,6 +523,32 @@ impl ShardHandle {
         receiver
             .recv()
             .map_err(|_| EngineError::WorkerStopped(self.shard_id))??;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn garbage_collect_until(
+        &self,
+        topic_partition: TopicPartition,
+        log_start: LogicalOffset,
+        expiry: Instant,
+    ) -> EngineResult<()> {
+        recovered_worker_clock(expiry)?;
+        let (response, receiver) = sync_channel(1);
+        recovered_worker_clock(expiry)?;
+        self.try_send(
+            ShardCommand::GarbageCollectUntil {
+                topic_partition,
+                log_start,
+                expiry,
+                response,
+            },
+            COMMAND_OVERHEAD_BYTES,
+        )?;
+        receiver
+            .recv()
+            .map_err(|_| EngineError::WorkerStopped(self.shard_id))??;
+        recovered_worker_clock(expiry)?;
         Ok(())
     }
 
@@ -610,6 +745,31 @@ fn run_worker(
                 response,
             } => {
                 let _ = response.send(stores.garbage_collect(topic_partition, log_start));
+            }
+            #[cfg(unix)]
+            ShardCommand::GarbageCollectUntil {
+                topic_partition,
+                log_start,
+                expiry,
+                response,
+            } => {
+                #[cfg(test)]
+                recovered_gc_queued_test_step(stores.primary.active_path().parent());
+                // Queue residence cannot create a new clock. No native work
+                // begins until the actual worker checks the original Instant.
+                let result = (|| {
+                    if Instant::now() >= expiry {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "native recovery original expiry elapsed",
+                        )
+                        .into());
+                    }
+                    let starts = HashMap::from([(topic_partition, log_start)]);
+                    stores.primary.garbage_collect_until(&starts, expiry)?;
+                    Ok(())
+                })();
+                let _ = response.send(result);
             }
             ShardCommand::ProposedAppend(_) => {
                 unreachable!("proposals are resolved before dispatch")
@@ -951,6 +1111,83 @@ fn offload_sealed_packs(store: &ShardStore, tier: &mut LocalObjectTier) -> Stora
         tier.offload_pack(pack.sequence, &pack.path, extents)?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn recovered_worker_clock(expiry: Instant) -> EngineResult<()> {
+    if Instant::now() >= expiry {
+        return Err(EngineError::InvalidConfig(
+            "native recovery original expiry elapsed".into(),
+        ));
+    }
+    Ok(())
+}
+
+// Native policy is identical; only the genuine owned opening clock bounds
+// independent catalog/offload steps. Ordinary workers use the original helper.
+#[cfg(unix)]
+fn offload_sealed_packs_until(
+    store: &ShardStore,
+    tier: &mut LocalObjectTier,
+    expiry: Instant,
+) -> EngineResult<()> {
+    recovered_worker_clock(expiry)?;
+    let packs = store.sealed_packs_until(expiry)?;
+    for pack in packs {
+        recovered_worker_clock(expiry)?;
+        let mut extents = Vec::new();
+        for entry in store.catalog_until(expiry)? {
+            recovered_worker_clock(expiry)?;
+            if entry.pack_sequence == pack.sequence {
+                extents.push(TierExtent::from_reservation(entry.reservation));
+            }
+        }
+        recovered_worker_clock(expiry)?;
+        tier.offload_pack_until(pack.sequence, &pack.path, extents, expiry)?;
+        #[cfg(test)]
+        recovered_open_test_step("pack-complete");
+        recovered_worker_clock(expiry)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    pub(crate) static RECOVERED_OPEN_STEP: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(all(unix, test))]
+fn recovered_open_test_step(step: &str) {
+    RECOVERED_OPEN_STEP.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(step);
+        }
+    });
+}
+
+#[cfg(all(unix, test))]
+type RecoveryGcBarrier = std::sync::Arc<(std::sync::Mutex<(bool, bool)>, std::sync::Condvar)>;
+#[cfg(all(unix, test))]
+pub(crate) static RECOVERY_GC_QUEUE_BARRIER: std::sync::Mutex<
+    Option<(std::path::PathBuf, RecoveryGcBarrier)>,
+> = std::sync::Mutex::new(None);
+#[cfg(all(unix, test))]
+fn recovered_gc_queued_test_step(directory: Option<&std::path::Path>) {
+    let barrier = RECOVERY_GC_QUEUE_BARRIER
+        .lock()
+        .expect("test hook")
+        .as_ref()
+        .filter(|(path, _)| Some(path.as_path()) == directory)
+        .map(|(_, barrier)| std::sync::Arc::clone(barrier));
+    if let Some(barrier) = barrier {
+        let (lock, changed) = &*barrier;
+        let mut state = lock.lock().expect("actual worker barrier");
+        state.0 = true;
+        changed.notify_all();
+        while !state.1 {
+            state = changed.wait(state).expect("release actual worker");
+        }
+    }
 }
 
 fn clone_storage_error(error: &shardlog::StorageError) -> shardlog::StorageError {

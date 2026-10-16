@@ -469,6 +469,46 @@ impl ControlJournal {
         })
     }
 
+    // Same native journal loop and physical Drop, original owned clock only.
+    #[cfg(unix)]
+    pub(crate) fn spawn_until(
+        mut journal: CoordinatorJournal,
+        expiry: std::time::Instant,
+    ) -> EngineResult<Self> {
+        recovery_start_clock(expiry)?;
+        let (sender, receiver) = sync_channel(CONTROL_QUEUE_SLOTS);
+        recovery_start_clock(expiry)?;
+        let thread = thread::Builder::new()
+            .name("shard-stream-coordinator-journal".into())
+            .spawn(move || {
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        ControlCommand::Append { event, response } => {
+                            let result = journal
+                                .append(&event, true)
+                                .map_err(|error| error.to_string());
+                            let _ = response.send(result);
+                        }
+                        ControlCommand::Sync { response } => {
+                            let result = journal.sync().map_err(|error| error.to_string());
+                            let _ = response.send(result);
+                        }
+                    }
+                }
+            })
+            .map_err(|error| {
+                EngineError::InvalidConfig(format!(
+                    "failed to spawn control journal worker: {error}"
+                ))
+            })?;
+        let result = Self {
+            handle: Some(ControlJournalHandle { sender }),
+            thread: Some(thread),
+        };
+        recovery_start_clock(expiry)?;
+        Ok(result)
+    }
+
     fn handle(&self) -> ControlJournalHandle {
         self.handle
             .as_ref()
@@ -793,6 +833,49 @@ impl CoordinatorPool {
             });
         }
         Ok(Self { workers })
+    }
+
+    // Already-created CoordinatorWorker values physically join on any late error.
+    #[cfg(unix)]
+    pub(crate) fn spawn_until(
+        worker_count: usize,
+        mut recovered: HashMap<TopicPartition, PartitionState>,
+        journal: &ControlJournal,
+        expiry: std::time::Instant,
+    ) -> EngineResult<Self> {
+        recovery_start_clock(expiry)?;
+        let worker_count = worker_count.max(1);
+        let mut worker_states = (0..worker_count)
+            .map(|_| HashMap::new())
+            .collect::<Vec<_>>();
+        for (topic_partition, state) in recovered.drain() {
+            recovery_start_clock(expiry)?;
+            let index = coordinator_index(topic_partition, worker_count);
+            worker_states[index].insert(topic_partition, state);
+        }
+
+        let mut workers = Vec::with_capacity(worker_count);
+        for (index, states) in worker_states.into_iter().enumerate() {
+            recovery_start_clock(expiry)?;
+            let (sender, receiver) = sync_channel(COORDINATOR_QUEUE_SLOTS);
+            let control = journal.handle();
+            recovery_start_clock(expiry)?;
+            let thread = thread::Builder::new()
+                .name(format!("shard-stream-coordinator-{index}"))
+                .spawn(move || run_coordinator(states, receiver, control))
+                .map_err(|error| {
+                    EngineError::InvalidConfig(format!(
+                        "failed to spawn partition coordinator: {error}"
+                    ))
+                })?;
+            workers.push(CoordinatorWorker {
+                sender: Some(sender),
+                thread: Some(thread),
+            });
+        }
+        let result = Self { workers };
+        recovery_start_clock(expiry)?;
+        Ok(result)
     }
 
     pub(crate) fn create_topic(
@@ -2489,6 +2572,37 @@ pub(crate) fn retention_hints(events: &[JournalEvent]) -> HashMap<TopicPartition
     hints
 }
 
+#[cfg(unix)]
+pub(crate) fn retention_hints_until(
+    events: &[JournalEvent],
+    expiry: std::time::Instant,
+) -> EngineResult<HashMap<TopicPartition, LogicalOffset>> {
+    recovery_reduce_clock(Some(expiry))?;
+    let mut hints = HashMap::new();
+    for event in events {
+        recovery_reduce_clock(Some(expiry))?;
+        match event {
+            JournalEvent::Truncate {
+                topic_partition,
+                log_start,
+            }
+            | JournalEvent::TruncateCheckpoint {
+                topic_partition,
+                log_start,
+                ..
+            } => {
+                hints
+                    .entry(*topic_partition)
+                    .and_modify(|current: &mut LogicalOffset| *current = (*current).max(*log_start))
+                    .or_insert(*log_start);
+            }
+            _ => {}
+        }
+    }
+    recovery_reduce_clock(Some(expiry))?;
+    Ok(hints)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RecoveredTruncation {
     log_start: LogicalOffset,
@@ -2516,12 +2630,165 @@ fn record_recovered_group_outcome(
     }
 }
 
+/// Source-derived logical native queue/map/dense-segment capacity, not RSS.
+#[cfg(unix)]
+pub(crate) fn recovery_coordinator_bytes(
+    workers: usize,
+    partitions: usize,
+    batches: usize,
+) -> Option<usize> {
+    use std::mem::size_of;
+    let queues = workers
+        .checked_mul(COORDINATOR_QUEUE_SLOTS.checked_mul(size_of::<CoordinatorCommand>())?)?
+        .checked_add(CONTROL_QUEUE_SLOTS.checked_mul(size_of::<ControlCommand>())?)?;
+    let dense = partitions
+        .checked_mul(ordered_segment_map::DEFAULT_SEGMENT_CAPACITY)?
+        .checked_add(batches)?;
+    let batch_values = dense.checked_mul(size_of::<BatchRuntime>() + size_of::<u128>())?;
+    let secondary = batches.checked_mul(
+        size_of::<AtomicGroupRuntime>()
+            + size_of::<u128>() * 4
+            + size_of::<ProducerCursor>()
+            + size_of::<DedupRecord>()
+            + size_of::<ExtentCatalogEntry>() * 4,
+    )?;
+    let maps = partitions.checked_mul(
+        size_of::<PartitionState>() * 4
+            + size_of::<TopicSequencer>() * 2
+            + size_of::<HashMap<TopicPartition, PartitionState>>() * 8
+            + 1024,
+    )?;
+    queues
+        .checked_add(batch_values)?
+        .checked_add(secondary)?
+        .checked_add(maps)
+}
+
+#[cfg(unix)]
+fn recovery_start_clock(expiry: std::time::Instant) -> EngineResult<()> {
+    if std::time::Instant::now() >= expiry {
+        return Err(EngineError::InvalidConfig(
+            "native recovery original expiry elapsed".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Bounds actual synthetic abort slots using borrowed retained native facts.
+///
+/// The caller prepays every quadratic visit before entry and admits the returned
+/// slots before real recovery. This is sizing, not a new acceptance policy.
+#[cfg(unix)]
+pub(crate) fn recovery_batch_slots(
+    events: &[JournalEvent],
+    catalog: &HashMap<(TopicPartition, BatchId), ExtentCatalogEntry>,
+    expiry: std::time::Instant,
+) -> EngineResult<usize> {
+    let mut count = catalog.len();
+    for (&(tp, _), entry) in catalog {
+        if std::time::Instant::now() >= expiry {
+            return Err(EngineError::InvalidConfig(
+                "native recovery original expiry elapsed".into(),
+            ));
+        }
+        let previous = catalog
+            .iter()
+            .filter(|((other, _), old)| {
+                *other == tp && old.reservation.first_offset < entry.reservation.first_offset
+            })
+            .max_by_key(|(_, old)| old.reservation.first_offset)
+            .and_then(|(_, old)| old.reservation.batch_id.get().checked_add(1))
+            .unwrap_or(0);
+        // Native recovery replaces the complete truncation state in event
+        // order. A later legacy Truncate clears an earlier sequencer floor.
+        let mut floor = 0;
+        for event in events {
+            if std::time::Instant::now() >= expiry {
+                return Err(EngineError::InvalidConfig(
+                    "native recovery original expiry elapsed".into(),
+                ));
+            }
+            match event {
+                JournalEvent::TruncateCheckpoint {
+                    topic_partition,
+                    next_batch_id,
+                    ..
+                } if *topic_partition == tp => floor = next_batch_id.get(),
+                JournalEvent::Truncate {
+                    topic_partition, ..
+                } if *topic_partition == tp => {
+                    floor = 0;
+                }
+                _ => {}
+            }
+        }
+        let gap = entry
+            .reservation
+            .batch_id
+            .get()
+            .saturating_sub(previous.max(floor))
+            .min(MAX_RECOVERED_GAP_BATCHES);
+        count = count
+            .checked_add(
+                usize::try_from(gap).map_err(|_| {
+                    EngineError::InvalidConfig("native recovery slot overflow".into())
+                })?,
+            )
+            .ok_or_else(|| EngineError::InvalidConfig("native recovery slot overflow".into()))?;
+    }
+    Ok(count)
+}
+
 pub(crate) fn recover_partition_states(
     config: &EngineConfig,
     events: &[JournalEvent],
     catalog: &HashMap<(TopicPartition, BatchId), ExtentCatalogEntry>,
     recovered_durable_replicas: u32,
 ) -> EngineResult<HashMap<TopicPartition, PartitionState>> {
+    recover_partition_states_inner(config, events, catalog, recovered_durable_replicas, None)
+}
+/// Same native reducer and policy with an existing owned recovery Instant.
+#[cfg(unix)]
+pub(crate) fn recover_partition_states_until(
+    config: &EngineConfig,
+    events: &[JournalEvent],
+    catalog: &HashMap<(TopicPartition, BatchId), ExtentCatalogEntry>,
+    recovered_durable_replicas: u32,
+    expiry: std::time::Instant,
+) -> EngineResult<HashMap<TopicPartition, PartitionState>> {
+    recover_partition_states_inner(
+        config,
+        events,
+        catalog,
+        recovered_durable_replicas,
+        Some(expiry),
+    )
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    pub(crate) static RECOVERY_REDUCE_STEP: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+// None has the ordinary reducer's original error order and no clock access.
+fn recovery_reduce_clock(expiry: Option<std::time::Instant>) -> EngineResult<()> {
+    if expiry.is_some_and(|end| std::time::Instant::now() >= end) {
+        return Err(EngineError::InvalidConfig(
+            "native recovery original expiry elapsed".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn recover_partition_states_inner(
+    config: &EngineConfig,
+    events: &[JournalEvent],
+    catalog: &HashMap<(TopicPartition, BatchId), ExtentCatalogEntry>,
+    recovered_durable_replicas: u32,
+    expiry: Option<std::time::Instant>,
+) -> EngineResult<HashMap<TopicPartition, PartitionState>> {
+    recovery_reduce_clock(expiry)?;
     if recovered_durable_replicas == 0 || recovered_durable_replicas > config.replication_factor {
         return Err(EngineError::InvalidConfig(
             "recovered durable replica count must be within the configured replication factor"
@@ -2533,6 +2800,7 @@ pub(crate) fn recover_partition_states(
     let mut truncations: HashMap<TopicPartition, RecoveredTruncation> = HashMap::new();
     let mut group_outcomes = HashMap::new();
     for event in events {
+        recovery_reduce_clock(expiry)?;
         match event {
             JournalEvent::Configure {
                 topic_partition,
@@ -2713,6 +2981,7 @@ pub(crate) fn recover_partition_states(
 
     let mut by_partition: HashMap<TopicPartition, Vec<ExtentCatalogEntry>> = HashMap::new();
     for (&(topic_partition, _), entry) in catalog {
+        recovery_reduce_clock(expiry)?;
         if !rings.contains_key(&topic_partition) {
             return Err(EngineError::CorruptState(format!(
                 "extent for unconfigured partition {}/{}",
@@ -2727,6 +2996,7 @@ pub(crate) fn recover_partition_states(
 
     let mut result = HashMap::new();
     for (topic_partition, history) in rings {
+        recovery_reduce_clock(expiry)?;
         let (&ring_epoch, shards) = history
             .last_key_value()
             .expect("configured partition has a ring");
@@ -2757,6 +3027,7 @@ pub(crate) fn recover_partition_states(
                 topic_partition.topic_id, topic_partition.partition_id
             )));
         }
+        recovery_reduce_clock(expiry)?;
         let mut state = PartitionState::empty(
             TopicSequencer::new(
                 topic_partition.topic_id,
@@ -2778,6 +3049,7 @@ pub(crate) fn recover_partition_states(
         }
 
         for entry in entries {
+            recovery_reduce_clock(expiry)?;
             let reservation = entry.reservation;
             let atomic_group = entry.atomic_group.map(|group| AtomicGroupIdentity {
                 transaction_id: group.transaction_id,
@@ -2809,17 +3081,33 @@ pub(crate) fn recover_partition_states(
                     reservation.batch_id
                 )));
             }
-            append_recovered_aborts(
-                &mut state,
-                &history,
-                topic_partition,
-                next_batch_id,
-                next_offset,
-                next_placement_sequence,
-                missing_batches,
-                missing_records,
-                reservation.placement.ring_epoch,
-            )?;
+            if let Some(expiry) = expiry {
+                append_recovered_aborts_until(
+                    &mut state,
+                    &history,
+                    topic_partition,
+                    next_batch_id,
+                    next_offset,
+                    next_placement_sequence,
+                    missing_batches,
+                    missing_records,
+                    reservation.placement.ring_epoch,
+                    expiry,
+                )?;
+            } else {
+                append_recovered_aborts(
+                    &mut state,
+                    &history,
+                    topic_partition,
+                    next_batch_id,
+                    next_offset,
+                    next_placement_sequence,
+                    missing_batches,
+                    missing_records,
+                    reservation.placement.ring_epoch,
+                )?;
+            }
+            recovery_reduce_clock(expiry)?;
             append_batch_runtime(
                 &mut state,
                 BatchRuntime {
@@ -2878,17 +3166,28 @@ pub(crate) fn recover_partition_states(
                 .ok_or_else(|| EngineError::CorruptState("placement sequence exhausted".into()))?;
         }
         for (&transaction_id, group) in &mut state.atomic_groups {
+            recovery_reduce_clock(expiry)?;
             group.state = group_outcomes
                 .get(&(topic_partition, transaction_id))
                 .copied()
                 .unwrap_or(AtomicGroupState::Unresolved);
         }
-        state.finalized_groups.extend(
-            group_outcomes
-                .iter()
-                .filter(|((partition, _), _)| *partition == topic_partition)
-                .map(|((_, transaction_id), outcome)| (*transaction_id, *outcome)),
-        );
+        if expiry.is_some() {
+            for ((partition, transaction_id), outcome) in &group_outcomes {
+                recovery_reduce_clock(expiry)?;
+                if *partition == topic_partition {
+                    state.finalized_groups.insert(*transaction_id, *outcome);
+                }
+            }
+        } else {
+            state.finalized_groups.extend(
+                group_outcomes
+                    .iter()
+                    .filter(|((partition, _), _)| *partition == topic_partition)
+                    .map(|((_, transaction_id), outcome)| (*transaction_id, *outcome)),
+            );
+        }
+        recovery_reduce_clock(expiry)?;
         state.sequencer = TopicSequencer::restore(SequencerState {
             topic_id: topic_partition.topic_id,
             partition_id: topic_partition.partition_id,
@@ -2920,8 +3219,10 @@ pub(crate) fn recover_partition_states(
             .batches
             .truncate_before(first_retained.expect("validated retained batch key"));
         state.reset_cached_watermarks_after_truncate();
+        recovery_reduce_clock(expiry)?;
         result.insert(topic_partition, state);
     }
+    recovery_reduce_clock(expiry)?;
     Ok(result)
 }
 
@@ -3035,6 +3336,97 @@ fn append_recovered_aborts(
         )?;
         offset = last_offset + 1;
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_recovered_aborts_until(
+    state: &mut PartitionState,
+    rings: &BTreeMap<RingEpoch, Vec<ShardId>>,
+    topic_partition: TopicPartition,
+    first_batch_id: u128,
+    first_offset: u64,
+    first_sequence: u64,
+    missing_batches: u128,
+    missing_records: u64,
+    ring_epoch: RingEpoch,
+    expiry: std::time::Instant,
+) -> EngineResult<()> {
+    recovery_reduce_clock(Some(expiry))?;
+    if missing_batches == 0 {
+        if missing_records == 0 {
+            return Ok(());
+        }
+        return Err(EngineError::CorruptState(
+            "logical offset gap has no missing reservations".into(),
+        ));
+    }
+    let missing_batches_u64 = u64::try_from(missing_batches)
+        .map_err(|_| EngineError::CorruptState("recovered batch gap exceeds u64".into()))?;
+    if missing_batches > MAX_RECOVERED_GAP_BATCHES
+        || missing_records < missing_batches_u64
+        || missing_records > missing_batches_u64.saturating_mul(u64::from(u32::MAX))
+    {
+        return Err(EngineError::CorruptState(
+            "recovered reservation gap exceeds safety bounds".into(),
+        ));
+    }
+    let shards = rings.get(&ring_epoch).ok_or_else(|| {
+        EngineError::CorruptState("recovered gap references an unknown ring".into())
+    })?;
+    let base = missing_records / missing_batches_u64;
+    let remainder = missing_records % missing_batches_u64;
+    let mut offset = first_offset;
+    for index in 0..missing_batches_u64 {
+        recovery_reduce_clock(Some(expiry))?;
+        let count = base + u64::from(index < remainder);
+        let count_u32 = u32::try_from(count)
+            .map_err(|_| EngineError::CorruptState("recovered abort is too large".into()))?;
+        let record_count = NonZeroU32::new(count_u32)
+            .ok_or_else(|| EngineError::CorruptState("zero recovered abort".into()))?;
+        let batch_id = first_batch_id + u128::from(index);
+        let sequence = first_sequence + index;
+        let shard_index = sequence as usize % shards.len();
+        let last_offset = offset
+            .checked_add(count - 1)
+            .ok_or_else(|| EngineError::CorruptState("abort offset overflow".into()))?;
+        let reservation = Reservation {
+            topic_id: topic_partition.topic_id,
+            partition_id: topic_partition.partition_id,
+            batch_id: BatchId::new(batch_id),
+            first_offset: LogicalOffset::new(offset),
+            last_offset: LogicalOffset::new(last_offset),
+            record_count,
+            placement: Placement {
+                virtual_lane_id: shards[shard_index],
+                ring_epoch,
+                leader_epoch: state.sequencer.state().leader_epoch,
+                sequence: PlacementSequence::new(sequence),
+            },
+        };
+        append_batch_runtime(
+            state,
+            BatchRuntime {
+                reservation,
+                status: BatchStatus::Aborted,
+                durable_replicas: 0,
+                replica_acks: 0,
+                producer: None,
+                atomic_group: None,
+                payload_digest: None,
+                payload_bytes: 0,
+                object_durable: false,
+            },
+        )?;
+        #[cfg(all(unix, test))]
+        RECOVERY_REDUCE_STEP.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook("abort-appended");
+            }
+        });
+        offset = last_offset + 1;
+    }
+    recovery_reduce_clock(Some(expiry))?;
     Ok(())
 }
 

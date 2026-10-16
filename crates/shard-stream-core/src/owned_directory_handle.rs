@@ -8,7 +8,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use rustix::fs::{AtFlags, Dir, Mode, OFlags, fstat, mkdirat, openat, statat};
+use rustix::fs::{AtFlags, Dir, Mode, OFlags, fstat, linkat, mkdirat, openat, statat, unlinkat};
 
 use crate::{DirectoryOwnership, DirectoryOwnershipError};
 
@@ -176,6 +176,108 @@ impl OwnedDirectoryHandle {
         })
     }
 
+    /// Durably synchronizes this retained directory without reopening its path.
+    ///
+    /// Callers admit the physical operation and check their original expiry;
+    /// this primitive supplies no timeout, authority or ownership reconstruction.
+    pub fn sync(&self) -> Result<()> {
+        self.validate()?;
+        self.inner.file.sync_all()?;
+        self.validate()
+    }
+
+    /// Publishes one already-written file in this SAME actual opened parent.
+    ///
+    /// The descriptor-relative hard link is atomic and never replaces an
+    /// existing destination. The caller must preadmit names/I/O and retain its
+    /// original deadline. After the final link is validated and synchronized,
+    /// only this exact known temporary name is unlinked and the SAME directory
+    /// synchronized again. Success leaves one link; the caller must also close
+    /// its temporary descriptor before ordinary GC can reclaim that inode.
+    /// An error can follow publication or unlink and must retain truthful
+    /// alternatives/custody. No unknown, source or final name is removed. This
+    /// supplies storage custody only, without validating file contents.
+    pub fn publish_new_file(&self, source: &OwnedFileHandle, name: &OsStr) -> Result<()> {
+        component(name)?;
+        self.validate()?;
+        source.validate()?;
+        if !Arc::ptr_eq(&self.inner, &source.parent.inner) {
+            return Err(DirectoryOwnershipError::IdentityMismatch);
+        }
+        source.file.sync_all()?;
+        linkat(
+            &self.inner.file,
+            &source.name,
+            &self.inner.file,
+            name,
+            AtFlags::empty(),
+        )
+        .map_err(io::Error::from)?;
+        validate_entry(&self.inner.file, name, &source.file, false)?;
+        self.inner.file.sync_all()?;
+        source.validate()?;
+        validate_entry(&self.inner.file, name, &source.file, false)?;
+        // The same validated parent/name still names this exact temporary FD.
+        // Unlink no caller-supplied arbitrary path and never the final name.
+        unlinkat(&self.inner.file, &source.name, AtFlags::empty()).map_err(io::Error::from)?;
+        self.inner.file.sync_all()?;
+        validate_entry(&self.inner.file, name, &source.file, false)?;
+        self.validate()
+    }
+
+    /// Publishes under the caller's original absolute recovery expiry.
+    ///
+    /// Identity and no-replacement policy match `publish_new_file`. Each later
+    /// sync/unlink phase checks the same E. A late error can retain both links
+    /// or an already-published final link; callers must retain truthful custody.
+    pub fn publish_new_file_until(
+        &self,
+        source: &OwnedFileHandle,
+        name: &OsStr,
+        expiry: std::time::Instant,
+    ) -> Result<()> {
+        publication_clock(expiry)?;
+        component(name)?;
+        publication_clock(expiry)?;
+        publication_clock(expiry)?;
+        self.validate()?;
+        publication_clock(expiry)?;
+        source.validate()?;
+        if !Arc::ptr_eq(&self.inner, &source.parent.inner) {
+            return Err(DirectoryOwnershipError::IdentityMismatch);
+        }
+        publication_clock(expiry)?;
+        source.file.sync_all()?;
+        publication_clock(expiry)?;
+        linkat(
+            &self.inner.file,
+            &source.name,
+            &self.inner.file,
+            name,
+            AtFlags::empty(),
+        )
+        .map_err(io::Error::from)?;
+        publication_clock(expiry)?;
+        validate_entry(&self.inner.file, name, &source.file, false)?;
+        publication_clock(expiry)?;
+        self.inner.file.sync_all()?;
+        publication_clock(expiry)?;
+        source.validate()?;
+        publication_clock(expiry)?;
+        validate_entry(&self.inner.file, name, &source.file, false)?;
+        // The same validated parent/name still names this exact temporary FD.
+        // Unlink no caller-supplied arbitrary path and never the final name.
+        publication_clock(expiry)?;
+        unlinkat(&self.inner.file, &source.name, AtFlags::empty()).map_err(io::Error::from)?;
+        publication_clock(expiry)?;
+        self.inner.file.sync_all()?;
+        publication_clock(expiry)?;
+        validate_entry(&self.inner.file, name, &source.file, false)?;
+        publication_clock(expiry)?;
+        self.validate()?;
+        publication_clock(expiry)
+    }
+
     /// Opens a native directory stream against the retained FD.
     pub fn entries(&self) -> Result<OwnedDirectoryEntries> {
         self.validate()?;
@@ -184,6 +286,17 @@ impl OwnedDirectoryHandle {
             _parent: self.retain(),
         })
     }
+}
+
+fn publication_clock(expiry: std::time::Instant) -> Result<()> {
+    if std::time::Instant::now() >= expiry {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "native recovery original expiry elapsed",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 impl OwnedFileHandle {
@@ -376,5 +489,66 @@ mod tests {
         drop(root);
         drop(owner);
         std::fs::remove_dir_all(path).expect("cleanup");
+    }
+    #[test]
+    fn anchored_publication_is_same_parent_no_replace_and_keeps_actual_custody() {
+        use std::io::Write;
+        let path = temporary();
+        let owner = DirectoryOwnership::acquire(&path).expect("actual OS owner");
+        let root = owner.root_handle().expect("opaque anchored root");
+        let source = root
+            .open_file(OsStr::new(".prepared-copy"), OwnedFileAccess::CreateNew)
+            .expect("real new native copy");
+        let mut file = source.file();
+        file.write_all(b"actual immutable copy")
+            .expect("real file write");
+        root.publish_new_file(&source, OsStr::new("pack.sse"))
+            .expect("actual atomic no-replace publication");
+        assert_eq!(
+            std::fs::read(path.join("pack.sse")).expect("published bytes"),
+            b"actual immutable copy"
+        );
+        assert!(!path.join(".prepared-copy").exists());
+        assert_eq!(
+            std::fs::metadata(path.join("pack.sse"))
+                .expect("one actual final link")
+                .nlink(),
+            1
+        );
+        let other = root
+            .open_file(OsStr::new(".conflicting-copy"), OwnedFileAccess::CreateNew)
+            .expect("real different copy");
+        let mut file = other.file();
+        file.write_all(b"different bytes").expect("write conflict");
+        assert!(
+            root.publish_new_file(&other, OsStr::new("pack.sse"))
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(path.join("pack.sse")).expect("never overwritten"),
+            b"actual immutable copy"
+        );
+        let child = root
+            .open_directory(OsStr::new("child"), true)
+            .expect("real other parent");
+        other
+            .validate()
+            .expect("failed conflict retains a valid source name");
+        assert!(
+            child
+                .publish_new_file(&other, OsStr::new("alias.sse"))
+                .is_err()
+        );
+        assert!(!path.join("child/alias.sse").exists());
+        drop(owner);
+        drop(root);
+        assert!(DirectoryOwnership::acquire(&path).is_err());
+        drop(child);
+        drop(other);
+        assert!(DirectoryOwnership::acquire(&path).is_err());
+        drop(source);
+        DirectoryOwnership::acquire(&path)
+            .expect("real final handle drop releases original custody");
+        std::fs::remove_dir_all(path).expect("fixture cleanup");
     }
 }

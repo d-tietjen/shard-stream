@@ -123,10 +123,10 @@ After the caller has durably preserved required raw observations and floors,
 Original observations then describe pre-open bytes, since normal native open
 may repair tails or remove pending deletions. The returned storage retains the
 original owners. It starts no engine/worker/sink and grants no serving rights.
-In particular, object-only floor observation does **not** implement operational
-object-only restore: the existing engine catalog/fetch path remains primary
-based, and real tier-backed fetch or rehydration is still required before such
-a consumer can serve. Existing unowned constructors retain their behavior.
+Object-only floor observation alone does **not** restore an engine catalog.
+The explicit consuming restore path below rehydrates verified CURRENT objects
+before the native primary scan. Existing unowned constructors retain their
+behavior.
 
 Allowances are finite cumulative logical admissions, not RSS/allocator or CPU
 metering. They cover native directory buffers, file opens/duplicates, parser
@@ -153,3 +153,128 @@ mutation. Those generated paths obey the same explicit path ceiling. The
 long-root fixture uses real ignored files and an interrupted native pack to
 check fitting admission and that one-less capacity does not repair its tail or
 create a new shard.
+
+
+### Consuming owned engine and object-only native restoration
+
+`NativeRecoveryCensus::read_for_engine` performs the same original bounded
+census, opening the actual coordinator descriptor writable without mutating it.
+It retains configured paths and normalizes the primary path to the actual
+anchored root only after admission. `restore_storage` then admits the complete
+CURRENT-object/primary conflict scan, file/handle/path/plan/scratch values,
+copy/read/hash/write passes, native store-open costs and repeated final source
+validation **before** publishing any payload. The latter is a closed exact
+prepayment from actual source sizes, consumed solely by that same validation
+pass; it creates no new allowance or refunded work.
+
+The operation accepts only the actual retained CURRENT manifest and objects
+already validated by native framing, BLAKE3, length and exact native extent
+coverage. Older manifests, orphan objects, primary/pending records and raw
+incomplete tails remain observations; they are not selected as substitutes.
+Every recognizable primary/pending copy of a CURRENT sequence must match its
+actual bytes/hash/tail. A conflict refuses before primary repair or GC and is
+never overwritten. Missing objects are copied from their pinned native source
+into an anchored exclusive temporary, hashed while copying, synchronized and
+published with descriptor-relative atomic `linkat` that cannot replace an
+existing name. After validating and synchronizing that final link, the exact
+known temporary name is unlinked and the same parent synchronized again.
+No unknown/source/final name is deleted. A failed or ambiguous cleanup retains
+its actual descriptor and refuses, without claiming no mutation. This path
+enables no unknown temporary or orphan pruning. Ancestor/file identities are checked; this is cooperating
+custody, not protection against malicious filesystem replacement.
+
+Missing primary directories and native lock files are created and synchronized
+under the SAME actual root and native leases. If the highest remaining primary
+would be a CURRENT object, a real empty native successor is created before
+primary discovery so later normal append cannot modify an immutable object.
+Sequence MAX without a successor refuses before payload mutation; it never
+wraps to zero. Parent directories, output files and publication directories
+are synchronized. Original current/unknown bytes are not fabricated or reset.
+The caller must already have durably preserved full raw lineage/floors before
+this mutable handoff; the storage API cannot attest that private startup step.
+
+`StreamEngine::open_recovered_storage` consumes the opaque storage rather than
+accepting maps or reopening/relocking stores. It uses the actual already-open
+primary/tier instances, the pinned writable coordinator descriptor and the
+normal native codecs, partition recovery, catalog, workers and fetch path.
+The original `JournalEvent` enum is re-exported for native-profile joins; it is
+not a second model or decoder. An opaque `OwnedRecoveredEngine` permits only a
+borrow of its normal engine. Original observations, root/tier handles and the
+SAME leases remain retained through errors, unwind and physical worker cleanup.
+After actual engine construction and worker setup have settled successfully,
+a final allocation-free handoff retains complete ordinary source/frame/manifest/
+journal/raw-tail facts plus root/tier/native guards, while closing retired
+payload snapshots and known copy descriptors. They must not pin unlinked pack
+bytes beyond the native GC/capacity account. Error/unwind before completed setup retains the original snapshot/copy handles
+until physical cleanup. If E elapses while the definite final retirement itself
+settles, refusal instead retains the completed opaque engine, ordinary facts
+and all guards; it never exposes that engine as successful startup.
+The shard continuation duplicates its SAME open-file-description lease; the
+tier continuation shares its actual unlocking value, avoiding both reacquisition
+and early explicit unlock. The ordinary constructors and unowned paths keep
+their existing behavior.
+
+Startup admission includes actual native channel slots, catalog copies,
+manifest/offload clone and JSON/error bounds, file hashes, coordinator maps and
+dense-segment floors. Synthetic recovered abort slots are bounded from actual
+borrowed journal checkpoints and retained batch gaps, with their quadratic
+sizing visits prepaid before native recovery. Ordered legacy `Truncate` events
+clear an earlier checkpoint's sequencer floor, exactly as native recovery does;
+sizing includes the aborts native recovery builds before final truncation.
+Component callbacks keep their existing external contracts; their arbitrary
+allocations/CPU are not claimed as native logical usage.
+
+The owned continuation carries the SAME absolute E into retained primary
+cleanup/discovery/frame-scan and coordinator scan/repair, catalog and native
+recovery/abort loops, tier CURRENT/object verification, chunked hashing/copy, conditional manifest publication, each pack
+offload and worker/channel start. A late first sink callback cannot start later
+callbacks or dispatchers. Control/coordinator starts also check that same E.
+Owned GC carries E through its real queue and checks again after dequeue,
+before each later pack and metadata/rename/dirsync/unlink phase. A late refusal
+can leave an actual native `.gc-pending` tombstone; it never claims unchanged
+storage, and normal native recovery retains its existing cleanup policy.
+A started kernel call or callback may settle late; it is never cancelled or
+detached to manufacture success, and no later independent work starts after
+observed expiry. Ordinary constructors, offload, GC and sink policies keep their
+existing behavior. The new owned path joins staged workers, including optional
+sink workers, through physical cleanup. Ordinary sink destruction remains
+bounded as before. A late construction refuses without granting a new timeout.
+
+These are custody/storage APIs. They do not authenticate signed assignment,
+lease/currentness, receipt keys or payload authority, consume an issuer start,
+write PREPARED/COMMITTED, manufacture a fence, or enable a server/follower.
+The closed consumer still must join actual full signed history, route aliases,
+metadata/AA child bodies, conservative local/native maxima and durable evidence
+under its original retained control Session before operational activation.
+Native tier storage is in scope; Pluribus and Mooncake are excluded.
+
+The new source fixtures use an actual native engine object ACK/offload, real
+missing-primary/whole-shard filesystems, the consuming path and normal native
+fetch/append/restart. Other source regressions cover conflicts/pending bytes,
+source/name races, all five exact storage caps and one-less boundaries, original
+expiry, real failed/unwinding component cleanup with blocked Drop, raw partial
+tails/opaque files, native MAX sequence and anchored no-replacement publication.
+The GC regression also exercises actual restore, native truncate/GC and ordinary
+restart; on Linux it checks the actual device/inode against `/proc/self/fd` to
+exclude both hidden links and retired payload descriptors after real unlink.
+They have not been compiled or executed here; source review and formatting are
+not runtime, restoration or serving qualification.
+
+Additional source regressions use genuine ordered checkpoint/legacy-truncate
+journal events and native pack recovery with exact/one-less admission. Actual
+first-pack publication, CURRENT verification, sink opening and GC rename are
+allowed to settle past E; observations require no later publication/callback/
+worker/pack phase. A real recovered worker queue barrier separately verifies
+that queue residence never renews E and leaves native bytes unchanged when the
+command expires before native GC begins. These remain source fixtures until
+actual compilation and execution; no operational startup claim follows.
+
+Owned primary discovery and pending-deletion cleanup check the same E before
+and after every actual directory `next`, including EOF and error visits.
+Owned tier-copy refusal leaves failed staging names as evidence. It never
+unlinks a predicted temporary name when source open or exclusive creation
+failed, nor a replacement at that name after rename. This grants no permission
+to prune unknown staging objects; ordinary native helpers remain unchanged.
+The additional source regressions use actual native packs, late directory
+visits/EOF, genuine stale-name collisions, source-open loss and a real
+post-rename replacement. They remain uncompiled and unexecuted.

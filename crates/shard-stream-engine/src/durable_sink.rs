@@ -556,6 +556,45 @@ impl fmt::Debug for DurableSinkDispatcher {
     }
 }
 
+#[cfg(unix)]
+pub(crate) fn recovery_dispatcher_bytes(
+    config: &DurableSinkConfig,
+    shards: usize,
+    inherited: usize,
+) -> Option<usize> {
+    use std::mem::size_of;
+    config
+        .options
+        .worker_count
+        .checked_mul(size_of::<JoinHandle<()>>() + size_of::<Sender<Command>>())?
+        .checked_add(shards.checked_mul(size_of::<(ShardId, Arc<dyn DurableAppendSink>)>())?)?
+        .checked_add(
+            config
+                .options
+                .max_pending_items
+                .checked_mul(size_of::<Command>())?,
+        )?
+        .checked_add(config.options.max_pending_bytes.unwrap_or(inherited))?
+        .checked_add(
+            size_of::<DurableSinkDispatcher>() + size_of::<Budget>() + size_of::<SharedProgress>(),
+        )
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    pub(crate) static RECOVERY_SINK_STARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// None is the original ordinary constructor: no new clock or policy.
+fn recovery_open_clock(expiry: Option<Instant>) -> EngineResult<()> {
+    if expiry.is_some_and(|end| Instant::now() >= end) {
+        return Err(EngineError::InvalidConfig(
+            "native recovery original expiry elapsed".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl DurableSinkDispatcher {
     pub(crate) fn open_with_ownership(
         config: DurableSinkConfig,
@@ -564,6 +603,47 @@ impl DurableSinkDispatcher {
         maximum_event_bytes: usize,
         directory_ownership: Option<Arc<shard_stream_core::DirectoryOwnership>>,
     ) -> EngineResult<Self> {
+        Self::open_inner_owned(
+            config,
+            shard_ids,
+            inherited_max_bytes,
+            maximum_event_bytes,
+            directory_ownership,
+            false,
+            None,
+        )
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn open_with_recovery_ownership(
+        config: DurableSinkConfig,
+        shard_ids: &[ShardId],
+        inherited_max_bytes: usize,
+        maximum_event_bytes: usize,
+        directory_ownership: Arc<shard_stream_core::DirectoryOwnership>,
+        expiry: Instant,
+    ) -> EngineResult<Self> {
+        Self::open_inner_owned(
+            config,
+            shard_ids,
+            inherited_max_bytes,
+            maximum_event_bytes,
+            Some(directory_ownership),
+            true,
+            Some(expiry),
+        )
+    }
+
+    fn open_inner_owned(
+        config: DurableSinkConfig,
+        shard_ids: &[ShardId],
+        inherited_max_bytes: usize,
+        maximum_event_bytes: usize,
+        directory_ownership: Option<Arc<shard_stream_core::DirectoryOwnership>>,
+        join_failed: bool,
+        expiry: Option<Instant>,
+    ) -> EngineResult<Self> {
+        recovery_open_clock(expiry)?;
         let DurableSinkConfig { factory, options } = config;
         if options.max_pending_items == 0 {
             return Err(EngineError::InvalidConfig(
@@ -596,6 +676,7 @@ impl DurableSinkDispatcher {
                 "durable sink max_pending_bytes {max_bytes} is below max_batch_bytes {maximum_event_bytes}"
             )));
         }
+        recovery_open_clock(expiry)?;
         if options.atomic_visibility == DurableSinkAtomicVisibility::CommittedOnly
             && !invoke_factory(|| Ok(factory.supports_committed_only()))?
         {
@@ -604,12 +685,17 @@ impl DurableSinkDispatcher {
                     .into(),
             ));
         }
+        recovery_open_clock(expiry)?;
         let sinks = shard_ids
             .iter()
             .map(|&shard_id| {
-                invoke_factory(|| factory.open_shard(shard_id)).map(|sink| (shard_id, sink))
+                recovery_open_clock(expiry)?;
+                let sink = invoke_factory(|| factory.open_shard(shard_id))?;
+                recovery_open_clock(expiry)?;
+                Ok((shard_id, sink))
             })
             .collect::<EngineResult<HashMap<_, _>>>()?;
+        recovery_open_clock(expiry)?;
         let budget = Arc::new(Budget {
             pending_items: AtomicUsize::new(0),
             pending_bytes: AtomicUsize::new(0),
@@ -632,14 +718,19 @@ impl DurableSinkDispatcher {
             stats: StatsState::default(),
         });
         let sinks = Arc::new(sinks);
+        let mut workers = OpeningWorkers {
+            threads: Vec::with_capacity(options.worker_count),
+            join_failed,
+        };
         let mut senders = Vec::with_capacity(options.worker_count);
-        let mut workers = Vec::with_capacity(options.worker_count);
         for worker_index in 0..options.worker_count {
+            recovery_open_clock(expiry)?;
             let (sender, receiver) = channel();
             let worker_factory = Arc::clone(&factory);
             let worker_sinks = Arc::clone(&sinks);
             let worker_shared = Arc::clone(&shared);
             let worker_ownership = directory_ownership.as_ref().map(Arc::clone);
+            recovery_open_clock(expiry)?;
             let worker = thread::Builder::new()
                 .name(format!("shard-stream-durable-sink-{worker_index}"))
                 .spawn(move || {
@@ -662,15 +753,21 @@ impl DurableSinkDispatcher {
                     ))
                 })?;
             senders.push(sender);
-            workers.push(worker);
+            workers.threads.push(worker);
+            #[cfg(all(unix, test))]
+            if expiry.is_some() {
+                RECOVERY_SINK_STARTS.with(|starts| starts.set(starts.get() + 1));
+            }
+            recovery_open_clock(expiry)?;
         }
+        recovery_open_clock(expiry)?;
         Ok(Self {
             factory,
             options,
             senders,
             budget,
             shared,
-            workers,
+            workers: std::mem::take(&mut workers.threads),
         })
     }
 
@@ -931,6 +1028,38 @@ impl DurableSinkDispatcher {
         let partition = u64::from(topic_partition.partition_id.get());
         let hash = folded_topic ^ partition.wrapping_mul(0x9e37_79b9_7f4a_7c15);
         &self.senders[hash as usize % self.senders.len()]
+    }
+}
+
+// On a new owned-opening failure, dropping senders precedes this group, so
+// disconnected workers physically finish before the outer storage owner drops.
+struct OpeningWorkers {
+    threads: Vec<JoinHandle<()>>,
+    join_failed: bool,
+}
+impl Drop for OpeningWorkers {
+    fn drop(&mut self) {
+        if self.join_failed {
+            for worker in self.threads.drain(..) {
+                let _ = worker.join();
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl DurableSinkDispatcher {
+    pub(crate) fn join_owned_recovery(&mut self) {
+        self.budget.stop();
+        self.shared.stopped.store(true, Ordering::Release);
+        self.shared.changed.notify_all();
+        self.shared.decision_changed.notify_all();
+        for sender in &self.senders {
+            let _ = sender.send(Command::Shutdown);
+        }
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
     }
 }
 

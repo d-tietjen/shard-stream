@@ -180,7 +180,7 @@ impl LocalObjectTier {
         #[cfg(unix)]
         let temporary;
         #[cfg(unix)]
-        let publication = match &self.recovery_guard {
+        let publication: &ManifestUpdateLock = match &self.recovery_guard {
             Some(guard) => &guard.publication,
             None => {
                 temporary = ManifestUpdateLock::acquire(&self.root, self.shard_id)?;
@@ -389,7 +389,7 @@ struct ManifestUpdateLock {
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct TierRecoveryGuard {
-    publication: ManifestUpdateLock,
+    publication: std::sync::Arc<ManifestUpdateLock>,
     root: PathBuf,
     shard_id: ShardId,
 }
@@ -405,7 +405,7 @@ impl TierRecoveryGuard {
         file.try_lock_exclusive()?;
         // Construct the unlocking RAII value only after actual acquisition.
         let result = Self {
-            publication: ManifestUpdateLock { file },
+            publication: std::sync::Arc::new(ManifestUpdateLock { file }),
             root,
             shard_id,
         };
@@ -440,6 +440,29 @@ fn validate_recovery_lock(file: &File, root: &Path, shard_id: ShardId) -> Storag
 
 #[cfg(unix)]
 impl LocalObjectTier {
+    /// Opens while the concrete recovery owner retains the SAME native lease.
+    ///
+    /// A private Arc keeps the original unlocking value alive through both the
+    /// storage owner and normal worker. No raw-file clone can silently unlock
+    /// this publication lease when an opening error destroys an intermediate.
+    pub fn open_under_census(
+        root: PathBuf,
+        shard_id: ShardId,
+        guard: &TierRecoveryGuard,
+    ) -> StorageResult<Self> {
+        if root != guard.root || shard_id != guard.shard_id {
+            return Err(tier_corrupt("tier recovery lease has another root/shard"));
+        }
+        guard.validate()?;
+        let mut result = Self::open(root, shard_id)?;
+        result.recovery_guard = Some(TierRecoveryGuard {
+            publication: std::sync::Arc::clone(&guard.publication),
+            root: guard.root.clone(),
+            shard_id,
+        });
+        Ok(result)
+    }
+
     /// Opens using the SAME concrete lease held by the native recovery census.
     ///
     /// This still verifies native CURRENT and every referenced object. It does
@@ -457,6 +480,436 @@ impl LocalObjectTier {
         result.recovery_guard = Some(guard);
         Ok(result)
     }
+}
+
+#[cfg(unix)]
+impl LocalObjectTier {
+    /// Native tier opening bounded by an existing absolute recovery expiry.
+    ///
+    /// This creates no clock, directory authority or serving permission. The
+    /// owning recovery operation must preadmit all native materialization.
+    pub fn open_until(
+        root: impl AsRef<Path>,
+        shard_id: ShardId,
+        expiry: std::time::Instant,
+    ) -> StorageResult<Self> {
+        tier_recovery_clock(expiry)?;
+        let root = root.as_ref().to_path_buf();
+        fs::create_dir_all(root.join("objects").join(shard_directory(shard_id)))?;
+        tier_recovery_clock(expiry)?;
+        fs::create_dir_all(root.join("manifests").join(shard_directory(shard_id)))?;
+        tier_recovery_clock(expiry)?;
+        let manifest = load_current_manifest_until(&root, shard_id, expiry)?;
+        manifest.validate(shard_id)?;
+        for object in &manifest.objects {
+            tier_recovery_clock(expiry)?;
+            verify_object_until(&root, object, expiry)?;
+        }
+        tier_recovery_clock(expiry)?;
+        Ok(Self {
+            root,
+            shard_id,
+            manifest,
+            recovery_guard: None,
+        })
+    }
+
+    /// Verifies CURRENT objects under the SAME retained native lease and Instant.
+    pub fn open_under_census_until(
+        root: PathBuf,
+        shard_id: ShardId,
+        guard: &TierRecoveryGuard,
+        expiry: std::time::Instant,
+    ) -> StorageResult<Self> {
+        tier_recovery_clock(expiry)?;
+        if root != guard.root || shard_id != guard.shard_id {
+            return Err(tier_corrupt("tier recovery lease has another root/shard"));
+        }
+        guard.validate()?;
+        tier_recovery_clock(expiry)?;
+        let mut result = Self::open_until(root, shard_id, expiry)?;
+        result.recovery_guard = Some(TierRecoveryGuard {
+            publication: std::sync::Arc::clone(&guard.publication),
+            root: guard.root.clone(),
+            shard_id,
+        });
+        tier_recovery_clock(expiry)?;
+        Ok(result)
+    }
+
+    /// Offloads using native hash/coverage/CURRENT rules under an original Instant.
+    ///
+    /// A started syscall may settle late. No subsequent copy, verification,
+    /// manifest publication or pack operation starts after the observed expiry;
+    /// a late error may follow durable native publication and is never unchanged.
+    pub fn offload_pack_until(
+        &mut self,
+        pack_sequence: u64,
+        source: impl AsRef<Path>,
+        extents: Vec<TierExtent>,
+        expiry: std::time::Instant,
+    ) -> StorageResult<TierObject> {
+        tier_recovery_clock(expiry)?;
+        if extents.is_empty() {
+            return Err(StorageError::InvalidInput(
+                "object manifest coverage cannot be empty".into(),
+            ));
+        }
+        // The real native writer lease spans object copy AND publication.
+        // Older writers that lock publication only are not made quiescent by
+        // this change; a recovery snapshot must still retain that distinction.
+        #[cfg(unix)]
+        let temporary;
+        #[cfg(unix)]
+        let publication: &ManifestUpdateLock = match &self.recovery_guard {
+            Some(guard) => &guard.publication,
+            None => {
+                temporary = ManifestUpdateLock::acquire(&self.root, self.shard_id)?;
+                &temporary
+            }
+        };
+        #[cfg(not(unix))]
+        let temporary = ManifestUpdateLock::acquire(&self.root, self.shard_id)?;
+        #[cfg(not(unix))]
+        let publication = &temporary;
+        if let Some(existing) = self
+            .manifest
+            .objects
+            .iter()
+            .find(|object| object.pack_sequence == pack_sequence)
+        {
+            let observed = hash_file_until(source.as_ref(), expiry)?;
+            if existing.bytes != observed.0 || existing.checksum != observed.1 {
+                return Err(tier_corrupt(format!(
+                    "sealed pack {pack_sequence} differs from its authoritative tier manifest"
+                )));
+            }
+            verify_object_until(&self.root, existing, expiry)?;
+            if existing.extents != extents {
+                return Err(tier_corrupt(format!(
+                    "sealed pack {pack_sequence} has different extent coverage"
+                )));
+            }
+            return Ok(existing.clone());
+        }
+        if self
+            .manifest
+            .objects
+            .last()
+            .is_some_and(|object| object.pack_sequence >= pack_sequence)
+        {
+            return Err(StorageError::InvalidInput(
+                "tier packs must be published in increasing sequence order".into(),
+            ));
+        }
+
+        tier_recovery_clock(expiry)?;
+        let source = source.as_ref();
+        let metadata = source.metadata()?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return Err(StorageError::InvalidInput(
+                "only nonempty sealed pack files can be offloaded".into(),
+            ));
+        }
+        tier_recovery_clock(expiry)?;
+        let object_key = format!(
+            "objects/{}/pack-{pack_sequence:020}.sse",
+            shard_directory(self.shard_id)
+        );
+        let destination = object_path(&self.root, &object_key)?;
+        let (bytes, checksum) = copy_object_atomically_until(source, &destination, expiry)?;
+        tier_recovery_clock(expiry)?;
+        let object = TierObject {
+            pack_sequence,
+            object_key,
+            bytes,
+            checksum_algorithm: CHECKSUM_BLAKE3.into(),
+            checksum,
+            created_unix_ms: now_unix_ms()?,
+            extents,
+        };
+        verify_object_until(&self.root, &object, expiry)?;
+
+        tier_recovery_clock(expiry)?;
+        let mut next = self.manifest.clone();
+        next.generation = next.generation.checked_add(1).ok_or_else(|| {
+            StorageError::LimitExceeded("tier manifest generation exhausted".into())
+        })?;
+        next.objects.push(object.clone());
+        tier_recovery_clock(expiry)?;
+        publish_manifest_until(
+            &self.root,
+            self.shard_id,
+            self.manifest.generation,
+            &next,
+            publication,
+            expiry,
+        )?;
+        // If the final native directory sync settled late, retain the old
+        // in-memory view and return a truthful refusal; never renew the clock.
+        tier_recovery_clock(expiry)?;
+        self.manifest = next;
+        Ok(object)
+    }
+}
+
+#[cfg(unix)]
+fn tier_recovery_clock(expiry: std::time::Instant) -> StorageResult<()> {
+    if std::time::Instant::now() >= expiry {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "native recovery original expiry elapsed",
+        )
+        .into());
+    }
+    Ok(())
+}
+#[cfg(all(unix, test))]
+thread_local! {
+    static TIER_RECOVERY_STEP: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(all(unix, test))]
+fn tier_recovery_test_step(step: &str) {
+    TIER_RECOVERY_STEP.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(step);
+        }
+    });
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    static TIER_COPY_STEP: std::cell::RefCell<Option<Box<dyn FnMut(&str, &Path)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(all(unix, test))]
+fn tier_copy_test_step(step: &str, path: &Path) {
+    TIER_COPY_STEP.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(step, path);
+        }
+    });
+}
+
+#[cfg(unix)]
+fn load_current_manifest_until(
+    root: &Path,
+    shard_id: ShardId,
+    expiry: std::time::Instant,
+) -> StorageResult<TierManifest> {
+    tier_recovery_clock(expiry)?;
+    let current = current_path(root, shard_id);
+    let generation = match fs::read_to_string(&current) {
+        Ok(value) => value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| tier_corrupt("invalid tier CURRENT generation"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(TierManifest::empty(shard_id));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    tier_recovery_clock(expiry)?;
+    let path = manifest_path(root, shard_id, generation);
+    let metadata = path.metadata()?;
+    if metadata.len() > MAX_MANIFEST_BYTES {
+        return Err(StorageError::LimitExceeded(
+            "tier manifest exceeds the read limit".into(),
+        ));
+    }
+    tier_recovery_clock(expiry)?;
+    let bytes = fs::read(path)?;
+    tier_recovery_clock(expiry)?;
+    let manifest: TierManifest = serde_json::from_slice(&bytes)
+        .map_err(|error| tier_corrupt(format!("invalid tier manifest: {error}")))?;
+    if manifest.generation != generation {
+        return Err(tier_corrupt(
+            "tier CURRENT and manifest generation disagree",
+        ));
+    }
+    tier_recovery_clock(expiry)?;
+    Ok(manifest)
+}
+
+#[cfg(unix)]
+fn publish_manifest_until(
+    root: &Path,
+    shard_id: ShardId,
+    expected_generation: u64,
+    manifest: &TierManifest,
+    _publication: &ManifestUpdateLock,
+    expiry: std::time::Instant,
+) -> StorageResult<()> {
+    tier_recovery_clock(expiry)?;
+    manifest.validate(shard_id)?;
+    tier_recovery_clock(expiry)?;
+    let observed = load_current_manifest_until(root, shard_id, expiry)?;
+    if observed.generation != expected_generation
+        || manifest.generation != expected_generation.saturating_add(1)
+    {
+        return Err(StorageError::InvalidInput(format!(
+            "conditional manifest update failed: expected generation {expected_generation}, observed {}",
+            observed.generation
+        )));
+    }
+    tier_recovery_clock(expiry)?;
+    let encoded = serde_json::to_vec(manifest).map_err(|error| {
+        StorageError::InvalidInput(format!("manifest encoding failed: {error}"))
+    })?;
+    if encoded.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(StorageError::LimitExceeded(
+            "tier manifest exceeds the write limit".into(),
+        ));
+    }
+    tier_recovery_clock(expiry)?;
+    let path = manifest_path(root, shard_id, manifest.generation);
+    match OpenOptions::new().create_new(true).write(true).open(&path) {
+        Ok(mut file) => {
+            tier_recovery_clock(expiry)?;
+            file.write_all(&encoded)?;
+            tier_recovery_clock(expiry)?;
+            file.sync_all()?;
+            tier_recovery_clock(expiry)?;
+            sync_directory(path.parent().expect("manifest has parent"))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            tier_recovery_clock(expiry)?;
+            if fs::read(&path)? != encoded {
+                return Err(StorageError::corrupt(
+                    &path,
+                    0,
+                    "immutable manifest generation has different content",
+                ));
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    tier_recovery_clock(expiry)?;
+    let current = current_path(root, shard_id);
+    let temporary = temporary_path(&current);
+    let mut pointer = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    tier_recovery_clock(expiry)?;
+    writeln!(pointer, "{}", manifest.generation)?;
+    tier_recovery_clock(expiry)?;
+    pointer.sync_all()?;
+    tier_recovery_clock(expiry)?;
+    fs::rename(&temporary, &current)?;
+    tier_recovery_clock(expiry)?;
+    sync_directory(current.parent().expect("CURRENT has parent"))?;
+    tier_recovery_clock(expiry)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_object_atomically_until(
+    source: &Path,
+    destination: &Path,
+    expiry: std::time::Instant,
+) -> StorageResult<(u64, String)> {
+    tier_recovery_clock(expiry)?;
+    if destination.exists() {
+        let source_digest = hash_file_until(source, expiry)?;
+        let destination_digest = hash_file_until(destination, expiry)?;
+        if source_digest != destination_digest {
+            return Err(StorageError::corrupt(
+                destination,
+                0,
+                "immutable object already exists with different content",
+            ));
+        }
+        return Ok(destination_digest);
+    }
+    tier_recovery_clock(expiry)?;
+    let temporary = temporary_path(destination);
+    #[cfg(test)]
+    tier_copy_test_step("temporary-chosen", &temporary);
+    // Refusal preserves staging evidence. No pathname cleanup is safe here:
+    // source open/create_new may have failed before this call created a file,
+    // or a late rename error may leave a different file at the old temp name.
+    tier_recovery_clock(expiry)?;
+    let mut input = File::open(source)?;
+    tier_recovery_clock(expiry)?;
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    tier_recovery_clock(expiry)?;
+    let mut digest = blake3::Hasher::new();
+    let mut bytes = 0u64;
+    let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
+    loop {
+        tier_recovery_clock(expiry)?;
+        let read = input.read(&mut buffer)?;
+        tier_recovery_clock(expiry)?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read])?;
+        digest.update(&buffer[..read]);
+        bytes = bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| StorageError::LimitExceeded("object size overflow".into()))?;
+    }
+    tier_recovery_clock(expiry)?;
+    output.sync_all()?;
+    tier_recovery_clock(expiry)?;
+    fs::rename(&temporary, destination)?;
+    #[cfg(test)]
+    tier_copy_test_step("renamed", &temporary);
+    tier_recovery_clock(expiry)?;
+    sync_directory(destination.parent().expect("object has parent"))?;
+    tier_recovery_clock(expiry)?;
+    Ok((bytes, digest.finalize().to_hex().to_string()))
+}
+
+#[cfg(unix)]
+fn verify_object_until(
+    root: &Path,
+    object: &TierObject,
+    expiry: std::time::Instant,
+) -> StorageResult<()> {
+    tier_recovery_clock(expiry)?;
+    let path = object_path(root, &object.object_key)?;
+    let (bytes, checksum) = hash_file_until(&path, expiry)?;
+    if bytes != object.bytes || checksum != object.checksum {
+        return Err(StorageError::corrupt(
+            &path,
+            0,
+            "tier object length or checksum mismatch",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn hash_file_until(path: &Path, expiry: std::time::Instant) -> StorageResult<(u64, String)> {
+    tier_recovery_clock(expiry)?;
+    #[cfg(test)]
+    tier_recovery_test_step("hash-start");
+    tier_recovery_clock(expiry)?;
+    let mut file = File::open(path)?;
+    let mut digest = blake3::Hasher::new();
+    let mut bytes = 0u64;
+    let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
+    loop {
+        tier_recovery_clock(expiry)?;
+        let read = file.read(&mut buffer)?;
+        tier_recovery_clock(expiry)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+        bytes = checked_object_bytes(bytes, read)?;
+    }
+    #[cfg(test)]
+    tier_recovery_test_step("hash-complete");
+    tier_recovery_clock(expiry)?;
+    Ok((bytes, digest.finalize().to_hex().to_string()))
 }
 
 impl ManifestUpdateLock {
@@ -720,5 +1173,332 @@ mod tests {
             stale.offload_pack(1, &second_source, coverage()),
             Err(StorageError::InvalidInput(_))
         ));
+    }
+}
+
+#[cfg(all(unix, test))]
+mod owned_expiry_tests {
+    use super::*;
+    use crate::{
+        BatchId, LeaderEpoch, LogicalPartitionId, Placement, PlacementSequence, RingEpoch,
+        ShardStore, ShardStoreConfig, TopicId, VirtualLaneId,
+    };
+    use std::num::NonZeroU32;
+    use std::time::{Duration, Instant};
+
+    struct ActualRoot(PathBuf);
+    impl Drop for ActualRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TIER_RECOVERY_STEP.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+    fn delay_first_complete(expiry: Instant) -> std::rc::Rc<std::cell::Cell<usize>> {
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = reads.clone();
+        TIER_RECOVERY_STEP.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |step| {
+                if step == "hash-start" {
+                    observed.set(observed.get() + 1);
+                }
+                if step == "hash-complete" {
+                    std::thread::sleep(
+                        expiry.saturating_duration_since(Instant::now()) + Duration::from_millis(5),
+                    );
+                }
+            }))
+        });
+        reads
+    }
+    #[test]
+    fn owned_native_open_and_offload_stop_after_first_late_hash_before_later_verification_or_current()
+     {
+        let root = ActualRoot(std::env::temp_dir().join(format!(
+            "tier-owned-expiry-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        fs::create_dir_all(&root.0).expect("actual native root");
+        let tier_root = root.0.join("tier");
+        let mut primary = ShardStore::open(ShardStoreConfig {
+            directory: root.0.join("primary"),
+            shard_id: ShardId::new(0),
+            target_pack_bytes: 4096,
+            max_batch_bytes: 4096,
+        })
+        .expect("actual native primary");
+        let mut native =
+            LocalObjectTier::open(&tier_root, ShardId::new(0)).expect("actual native tier");
+        let mut last = None;
+        for sequence in 0..3 {
+            let reservation = Reservation {
+                topic_id: TopicId::new(11),
+                partition_id: LogicalPartitionId::new(0),
+                batch_id: BatchId::new(u128::from(sequence)),
+                first_offset: LogicalOffset::new(sequence),
+                last_offset: LogicalOffset::new(sequence),
+                record_count: NonZeroU32::new(1).expect("one"),
+                placement: Placement {
+                    virtual_lane_id: VirtualLaneId::new(0),
+                    ring_epoch: RingEpoch::new(1),
+                    leader_epoch: LeaderEpoch::new(91),
+                    sequence: PlacementSequence::new(sequence),
+                },
+            };
+            primary
+                .append(reservation, None, b"actual native encoded pack", true)
+                .expect("native SSE8 writer");
+            let pack = primary
+                .seal_active()
+                .expect("seal")
+                .expect("actual nonempty pack");
+            let coverage: Vec<_> = primary
+                .catalog()
+                .into_iter()
+                .filter(|entry| entry.pack_sequence == pack.sequence)
+                .map(|entry| TierExtent::from_reservation(entry.reservation))
+                .collect();
+            if sequence < 2 {
+                native
+                    .offload_pack(pack.sequence, &pack.path, coverage)
+                    .expect("actual native CURRENT producer");
+            } else {
+                last = Some((pack, coverage));
+            }
+        }
+        drop(primary);
+        drop(native);
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tier_root.join("manifests/shard-0/UPDATE.lock"))
+            .expect("actual native lock inode");
+        let guard = TierRecoveryGuard::try_acquire(lock, tier_root.clone(), ShardId::new(0))
+            .expect("same actual publication lease");
+        let expiry = Instant::now() + Duration::from_millis(50);
+        let reads = delay_first_complete(expiry);
+        let reset = Reset;
+        assert!(
+            LocalObjectTier::open_under_census_until(
+                tier_root.clone(),
+                ShardId::new(0),
+                &guard,
+                expiry
+            )
+            .is_err()
+        );
+        assert_eq!(
+            reads.get(),
+            1,
+            "second actual CURRENT object was never opened after E"
+        );
+        drop(reset);
+        guard.validate().expect("original native lease remains");
+        let mut owned = LocalObjectTier::open_under_census_until(
+            tier_root.clone(),
+            ShardId::new(0),
+            &guard,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .expect("actual fresh native component opening");
+        let (pack, coverage) = last.expect("third actual pack");
+        let expiry = Instant::now() + Duration::from_millis(50);
+        let reads = delay_first_complete(expiry);
+        let reset = Reset;
+        assert!(
+            owned
+                .offload_pack_until(pack.sequence, &pack.path, coverage.clone(), expiry)
+                .is_err()
+        );
+        assert_eq!(reads.get(), 1);
+        drop(reset);
+        assert_eq!(
+            load_current_manifest(&tier_root, ShardId::new(0))
+                .expect("actual durable pointer")
+                .generation,
+            2,
+            "late verification did not begin manifest publication"
+        );
+        assert!(
+            tier_root
+                .join(format!("objects/shard-0/pack-{:020}.sse", pack.sequence))
+                .exists(),
+            "completed native copy remains truthful evidence"
+        );
+        drop(owned);
+        drop(guard);
+        let mut ordinary =
+            LocalObjectTier::open(&tier_root, ShardId::new(0)).expect("ordinary native reopen");
+        ordinary
+            .offload_pack(pack.sequence, pack.path, coverage)
+            .expect("ordinary native rejoin validates retained exact copied bytes");
+        assert_eq!(ordinary.manifest().generation, 3);
+    }
+
+    #[test]
+    fn owned_native_copy_refusal_never_unlinks_stale_temp_source_failure_or_postrename_replacement()
+    {
+        struct CopyReset;
+        impl Drop for CopyReset {
+            fn drop(&mut self) {
+                TIER_COPY_STEP.with(|hook| *hook.borrow_mut() = None);
+            }
+        }
+        let root = ActualRoot(std::env::temp_dir().join(format!(
+            "tier-copy-evidence-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        fs::create_dir_all(&root.0).expect("actual root");
+        let mut primary = ShardStore::open(ShardStoreConfig {
+            directory: root.0.join("primary"),
+            shard_id: ShardId::new(0),
+            target_pack_bytes: 4096,
+            max_batch_bytes: 4096,
+        })
+        .expect("actual native source");
+        let reservation = Reservation {
+            topic_id: TopicId::new(11),
+            partition_id: LogicalPartitionId::new(0),
+            batch_id: BatchId::new(0),
+            first_offset: LogicalOffset::new(0),
+            last_offset: LogicalOffset::new(0),
+            record_count: NonZeroU32::new(1).expect("one"),
+            placement: Placement {
+                virtual_lane_id: VirtualLaneId::new(0),
+                ring_epoch: RingEpoch::new(1),
+                leader_epoch: LeaderEpoch::new(91),
+                sequence: PlacementSequence::new(0),
+            },
+        };
+        primary
+            .append(reservation, None, b"actual native immutable source", true)
+            .expect("real SSE8 writer");
+        let pack = primary
+            .seal_active()
+            .expect("seal")
+            .expect("real native pack");
+        let coverage: Vec<_> = primary
+            .catalog()
+            .into_iter()
+            .filter(|entry| entry.pack_sequence == pack.sequence)
+            .map(|entry| TierExtent::from_reservation(entry.reservation))
+            .collect();
+        drop(primary);
+        let expected = fs::read(&pack.path).expect("real source bytes");
+        let mut tier =
+            LocalObjectTier::open(root.0.join("tier"), ShardId::new(0)).expect("real native tier");
+        let unknown = b"preexisting unknown evidence";
+        for source_failure in [false, true] {
+            let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let saved = observed.clone();
+            let source = pack.path.clone();
+            let moved_source = root.0.join("original-source-evidence");
+            let moved = moved_source.clone();
+            TIER_COPY_STEP.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |step, path| {
+                    if step == "temporary-chosen" {
+                        let mut old = OpenOptions::new()
+                            .create_new(true)
+                            .write(true)
+                            .open(path)
+                            .expect("genuine stale PID/sequence-name collision");
+                        old.write_all(unknown).expect("unknown prior bytes");
+                        old.sync_all().expect("actual old evidence");
+                        *saved.borrow_mut() = Some(path.to_owned());
+                        if source_failure {
+                            fs::rename(&source, &moved).expect(
+                                "preserve real source while its original open becomes NotFound",
+                            );
+                        }
+                    }
+                }))
+            });
+            let reset = CopyReset;
+            assert!(
+                tier.offload_pack_until(
+                    pack.sequence,
+                    &pack.path,
+                    coverage.clone(),
+                    Instant::now() + Duration::from_secs(2)
+                )
+                .is_err()
+            );
+            drop(reset);
+            let actual = observed
+                .borrow()
+                .clone()
+                .expect("helper actually selected its native temporary");
+            assert_eq!(
+                fs::read(actual).expect("failed native copy cannot delete unknown bytes"),
+                unknown
+            );
+            assert_eq!(tier.manifest().generation, 0);
+            if source_failure {
+                assert_eq!(
+                    fs::read(&moved_source).expect("source evidence retained"),
+                    expected
+                );
+                fs::rename(&moved_source, &pack.path)
+                    .expect("restore exact original fixture source");
+            }
+        }
+        let expiry = Instant::now() + Duration::from_secs(2);
+        let replacement = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let saved = replacement.clone();
+        TIER_COPY_STEP.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |step, path| {
+                if step == "renamed" {
+                    let mut old = OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .open(path)
+                        .expect("real replacement at vacated temp name");
+                    old.write_all(unknown).expect("replacement evidence");
+                    old.sync_all().expect("actual replacement file");
+                    *saved.borrow_mut() = Some(path.to_owned());
+                    std::thread::sleep(
+                        expiry.saturating_duration_since(Instant::now()) + Duration::from_millis(5),
+                    );
+                }
+            }))
+        });
+        let reset = CopyReset;
+        assert!(
+            tier.offload_pack_until(pack.sequence, &pack.path, coverage, expiry)
+                .is_err()
+        );
+        drop(reset);
+        let actual = replacement
+            .borrow()
+            .clone()
+            .expect("real rename occurred before expiry refusal");
+        assert_eq!(
+            fs::read(actual).expect("late error cannot remove another file at old temp path"),
+            unknown
+        );
+        assert_eq!(
+            fs::read(&pack.path).expect("original native source unchanged"),
+            expected
+        );
+        assert_eq!(
+            fs::read(
+                tier.root
+                    .join(format!("objects/shard-0/pack-{:020}.sse", pack.sequence))
+            )
+            .expect("completed native copy is retained truthful evidence"),
+            expected
+        );
+        assert_eq!(
+            load_current_manifest(&tier.root, ShardId::new(0))
+                .expect("actual CURRENT")
+                .generation,
+            0
+        );
     }
 }

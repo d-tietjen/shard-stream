@@ -34,6 +34,12 @@ use crate::{
     EngineConfig, EngineError, EngineResult, PartitionReplicationPolicy, TopicConfig,
 };
 
+#[cfg(unix)]
+#[path = "owned_engine.rs"]
+mod owned;
+#[cfg(unix)]
+pub use owned::{OwnedEngineOpenError, OwnedRecoveredEngine};
+
 const MAX_FETCH_PLAN_BATCHES_PER_SHARD: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

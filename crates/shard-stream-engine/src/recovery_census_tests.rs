@@ -764,3 +764,6 @@ fn owned_native_long_root_ignored_discovery_paths_are_admitted_before_any_repair
         original
     );
 }
+
+#[path = "owned_engine_tests.rs"]
+mod owned_engine;

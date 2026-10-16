@@ -133,6 +133,36 @@ impl CoordinatorJournal {
         Ok((Self { path, file }, recovered))
     }
 
+    /// Continues the native journal with a caller-retained writable descriptor.
+    ///
+    /// This ordinary storage operation infers no directory ownership. An owned
+    /// caller must retain its actual anchored handle through worker destruction
+    /// and admit the existing native repair/decode work before this call.
+    pub fn open_existing_file(
+        path: PathBuf,
+        mut file: File,
+    ) -> StorageResult<(Self, RecoveredJournal)> {
+        let recovered = scan_and_repair(&path, &mut file)?;
+        file.seek(SeekFrom::End(0))?;
+        Ok((Self { path, file }, recovered))
+    }
+
+    /// Continues an admitted writable descriptor using the original absolute E.
+    /// Native decoding and tail repair remain unchanged; no owner is inferred.
+    #[cfg(unix)]
+    pub fn open_existing_file_until(
+        path: PathBuf,
+        mut file: File,
+        expiry: std::time::Instant,
+    ) -> StorageResult<(Self, RecoveredJournal)> {
+        recovery_journal_clock(expiry)?;
+        let recovered = scan_and_repair_until(&path, &mut file, expiry)?;
+        recovery_journal_clock(expiry)?;
+        file.seek(SeekFrom::End(0))?;
+        recovery_journal_clock(expiry)?;
+        Ok((Self { path, file }, recovered))
+    }
+
     pub fn append(&mut self, event: &JournalEvent, sync: bool) -> StorageResult<()> {
         let encoded = encode_event(event)?;
         let start = self.file.seek(SeekFrom::End(0))?;
@@ -221,6 +251,94 @@ fn scan_and_repair(path: &Path, file: &mut File) -> StorageResult<RecoveredJourn
     })
 }
 
+#[cfg(unix)]
+fn recovery_journal_clock(expiry: std::time::Instant) -> StorageResult<()> {
+    if std::time::Instant::now() >= expiry {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "native recovery original expiry elapsed",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn scan_and_repair_until(
+    path: &Path,
+    file: &mut File,
+    expiry: std::time::Instant,
+) -> StorageResult<RecoveredJournal> {
+    recovery_journal_clock(expiry)?;
+    let file_len = file.metadata()?.len();
+    let mut offset = 0u64;
+    let mut events = Vec::new();
+    let mut repaired_partial_tail = false;
+    while offset < file_len {
+        recovery_journal_clock(expiry)?;
+        if file_len - offset < PREFIX_LEN as u64 {
+            recovery_journal_clock(expiry)?;
+            file.set_len(offset)?;
+            recovery_journal_clock(expiry)?;
+            repaired_partial_tail = true;
+            break;
+        }
+        recovery_journal_clock(expiry)?;
+        file.seek(SeekFrom::Start(offset))?;
+        recovery_journal_clock(expiry)?;
+        let mut prefix = [0u8; PREFIX_LEN];
+        file.read_exact(&mut prefix)?;
+        recovery_journal_clock(expiry)?;
+        validate_prefix(path, offset, &prefix)?;
+        let body_len = u32::from_le_bytes(prefix[8..12].try_into().expect("body length")) as usize;
+        if body_len > MAX_EVENT_BYTES {
+            return Err(StorageError::corrupt(
+                path,
+                offset,
+                "journal event exceeds maximum size",
+            ));
+        }
+        let frame_len = PREFIX_LEN
+            .checked_add(body_len)
+            .and_then(|value| value.checked_add(CRC_LEN))
+            .ok_or_else(|| StorageError::corrupt(path, offset, "journal length overflow"))?;
+        if offset
+            .checked_add(frame_len as u64)
+            .is_none_or(|end| end > file_len)
+        {
+            recovery_journal_clock(expiry)?;
+            file.set_len(offset)?;
+            recovery_journal_clock(expiry)?;
+            repaired_partial_tail = true;
+            break;
+        }
+        recovery_journal_clock(expiry)?;
+        let mut frame = vec![0u8; frame_len];
+        frame[..PREFIX_LEN].copy_from_slice(&prefix);
+        file.read_exact(&mut frame[PREFIX_LEN..])?;
+        recovery_journal_clock(expiry)?;
+        let expected_crc =
+            u32::from_le_bytes(frame[frame_len - CRC_LEN..].try_into().expect("CRC width"));
+        if crc32fast::hash(&frame[..frame_len - CRC_LEN]) != expected_crc {
+            return Err(StorageError::corrupt(
+                path,
+                offset,
+                "journal checksum mismatch",
+            ));
+        }
+        recovery_journal_clock(expiry)?;
+        let kind = prefix[5];
+        let event = decode_event(path, offset, kind, &frame[PREFIX_LEN..frame_len - CRC_LEN])?;
+        recovery_journal_clock(expiry)?;
+        events.push(event);
+        offset += frame_len as u64;
+    }
+    recovery_journal_clock(expiry)?;
+    Ok(RecoveredJournal {
+        events,
+        repaired_partial_tail,
+    })
+}
 fn encode_event(event: &JournalEvent) -> StorageResult<Vec<u8>> {
     let (kind, body) = match event {
         JournalEvent::Configure {

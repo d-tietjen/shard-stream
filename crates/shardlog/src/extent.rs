@@ -347,6 +347,20 @@ impl ShardStore {
         Self::open_inner(config, Some(guard.file))
     }
 
+    /// Continues the same native lease while the recovery owner retains it.
+    ///
+    /// Cloning this descriptor preserves the same open-file-description lock;
+    /// it neither opens the pathname nor acquires a second lease. The recovery
+    /// owner retains its original guard even if native repair refuses.
+    #[cfg(unix)]
+    pub fn open_under_census(
+        config: ShardStoreConfig,
+        guard: &ShardRecoveryGuard,
+    ) -> StorageResult<Self> {
+        guard.validate(&config.directory)?;
+        Self::open_inner(config, Some(guard.file.try_clone()?))
+    }
+
     fn open_inner(config: ShardStoreConfig, held_lock: Option<File>) -> StorageResult<Self> {
         config.validate()?;
         let directory_existed = config.directory.exists();
@@ -439,6 +453,147 @@ impl ShardStore {
             pack_paths,
             read_buffer_pool: ReadBufferPool::new(),
         })
+    }
+
+    /// Native primary opening under an already-admitted absolute recovery expiry.
+    /// No clock, ownership or serving permission is created by this storage API.
+    #[cfg(unix)]
+    pub fn open_until(config: ShardStoreConfig, expiry: Instant) -> StorageResult<Self> {
+        Self::open_inner_until(config, None, expiry)
+    }
+
+    /// Continues the SAME native lease, checking E across pack scan/repair phases.
+    #[cfg(unix)]
+    pub fn open_under_census_until(
+        config: ShardStoreConfig,
+        guard: &ShardRecoveryGuard,
+        expiry: Instant,
+    ) -> StorageResult<Self> {
+        recovery_gc_clock(expiry)?;
+        guard.validate(&config.directory)?;
+        recovery_gc_clock(expiry)?;
+        Self::open_inner_until(config, Some(guard.file.try_clone()?), expiry)
+    }
+
+    #[cfg(unix)]
+    fn open_inner_until(
+        config: ShardStoreConfig,
+        held_lock: Option<File>,
+        expiry: Instant,
+    ) -> StorageResult<Self> {
+        recovery_gc_clock(expiry)?;
+        config.validate()?;
+        recovery_gc_clock(expiry)?;
+        let directory_existed = config.directory.exists();
+        recovery_gc_clock(expiry)?;
+        fs::create_dir_all(&config.directory)?;
+        if !directory_existed && let Some(parent) = config.directory.parent() {
+            recovery_gc_clock(expiry)?;
+            sync_directory(parent)?;
+        }
+        recovery_gc_clock(expiry)?;
+        let lock_path = config.directory.join(".shard-store.lock");
+        let lock_existed = lock_path.exists();
+        recovery_gc_clock(expiry)?;
+        let lock_file = match held_lock {
+            Some(file) => file,
+            None => {
+                recovery_gc_clock(expiry)?;
+                let file = OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(lock_path)?;
+                recovery_gc_clock(expiry)?;
+                fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
+                    StorageError::InvalidInput(format!(
+                        "shard store directory is already open: {error}"
+                    ))
+                })?;
+                file
+            }
+        };
+        if !lock_existed {
+            recovery_gc_clock(expiry)?;
+            lock_file.sync_all()?;
+            recovery_gc_clock(expiry)?;
+            sync_directory(&config.directory)?;
+        }
+        cleanup_pending_pack_deletions_until(&config.directory, expiry)?;
+        let mut pack_paths = discover_packs_until(&config.directory, expiry)?;
+        if pack_paths.is_empty() {
+            let path = pack_path(&config.directory, 0);
+            recovery_gc_clock(expiry)?;
+            OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            pack_paths.insert(0, path);
+            recovery_gc_clock(expiry)?;
+            sync_directory(&config.directory)?;
+        }
+
+        let last_sequence = *pack_paths.last_key_value().expect("pack map is nonempty").0;
+        let mut index: HashMap<TopicPartition, Vec<ExtentLocation>> = HashMap::new();
+        let mut by_batch = HashMap::new();
+        for (&sequence, path) in &pack_paths {
+            recovery_gc_clock(expiry)?;
+            let permit_tail_repair = sequence == last_sequence;
+            scan_pack_until(
+                path,
+                sequence,
+                config.shard_id,
+                config.max_batch_bytes,
+                permit_tail_repair,
+                &mut index,
+                &mut by_batch,
+                expiry,
+            )?;
+        }
+        for locations in index.values_mut() {
+            recovery_gc_clock(expiry)?;
+            locations.sort_by_key(|location| location.reservation.first_offset);
+        }
+
+        recovery_gc_clock(expiry)?;
+        let active_path = pack_paths
+            .get(&last_sequence)
+            .expect("last pack exists")
+            .clone();
+        recovery_gc_clock(expiry)?;
+        let active_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&active_path)?;
+        recovery_gc_clock(expiry)?;
+        let active_bytes = active_file.metadata()?.len();
+        recovery_gc_clock(expiry)?;
+        let store_token = NEXT_STORE_TOKEN
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
+                token.checked_add(1)
+            })
+            .map_err(|_| StorageError::LimitExceeded("store token space exhausted".into()))?;
+        recovery_gc_clock(expiry)?;
+        let result = Self {
+            config,
+            _lock_file: lock_file,
+            store_token,
+            plan_epoch: 0,
+            active: ActivePack {
+                sequence: last_sequence,
+                file: active_file,
+                bytes: active_bytes,
+                opened_at: Instant::now(),
+            },
+            index,
+            by_batch,
+            pack_paths,
+            read_buffer_pool: ReadBufferPool::new(),
+        };
+        recovery_gc_clock(expiry)?;
+        Ok(result)
     }
 
     pub fn append(
@@ -854,6 +1009,12 @@ impl ShardStore {
         self.read_fetch_plan(&planned)
     }
 
+    /// Actual native catalog count before a bounded caller materializes a copy.
+    #[must_use]
+    pub fn recovery_catalog_len(&self) -> usize {
+        self.by_batch.len()
+    }
+
     #[must_use]
     pub fn catalog(&self) -> Vec<ExtentCatalogEntry> {
         let mut entries = self
@@ -876,6 +1037,55 @@ impl ShardStore {
             )
         });
         entries
+    }
+
+    /// Materializes the native catalog under the original admitted recovery E.
+    #[cfg(unix)]
+    pub fn catalog_until(&self, expiry: Instant) -> StorageResult<Vec<ExtentCatalogEntry>> {
+        recovery_gc_clock(expiry)?;
+        let mut entries = Vec::with_capacity(self.by_batch.len());
+        for location in self.by_batch.values() {
+            recovery_gc_clock(expiry)?;
+            entries.push(ExtentCatalogEntry {
+                reservation: location.reservation,
+                producer: location.producer,
+                atomic_group: location.atomic_group,
+                payload_bytes: location.payload_len as u64,
+                pack_sequence: location.pack_sequence,
+                object_durable: false,
+            });
+        }
+        recovery_gc_clock(expiry)?;
+        entries.sort_by_key(|entry| {
+            (
+                entry.reservation.topic_id,
+                entry.reservation.partition_id,
+                entry.reservation.first_offset,
+            )
+        });
+        recovery_gc_clock(expiry)?;
+        Ok(entries)
+    }
+
+    /// Discovers actual sealed pack metadata without renewing recovery expiry.
+    #[cfg(unix)]
+    pub fn sealed_packs_until(&self, expiry: Instant) -> StorageResult<Vec<SealedPack>> {
+        recovery_gc_clock(expiry)?;
+        let mut packs = Vec::new();
+        for (&sequence, path) in self.pack_paths.range(..self.active.sequence) {
+            recovery_gc_clock(expiry)?;
+            let bytes = path.metadata()?.len();
+            recovery_gc_clock(expiry)?;
+            if bytes > 0 {
+                packs.push(SealedPack {
+                    sequence,
+                    path: path.clone(),
+                    bytes,
+                });
+            }
+        }
+        recovery_gc_clock(expiry)?;
+        Ok(packs)
     }
 
     pub fn sync(&mut self) -> StorageResult<()> {
@@ -970,6 +1180,81 @@ impl ShardStore {
             stats.extents_removed = stats.extents_removed.saturating_add(extents);
             stats.bytes_removed = stats.bytes_removed.saturating_add(bytes);
         }
+        Ok(stats)
+    }
+
+    /// Applies native pack GC under a retained operation's original Instant.
+    ///
+    /// This changes no retention policy. A late error may leave a real native
+    /// gc-pending tombstone; normal recovery keeps its existing cleanup rules.
+    #[cfg(unix)]
+    pub fn garbage_collect_until(
+        &mut self,
+        log_starts: &HashMap<TopicPartition, LogicalOffset>,
+        expiry: Instant,
+    ) -> StorageResult<GarbageCollectionStats> {
+        recovery_gc_clock(expiry)?;
+        let mut removable = Vec::new();
+        for (&sequence, path) in self.pack_paths.range(..self.active.sequence) {
+            recovery_gc_clock(expiry)?;
+            let locations = self
+                .by_batch
+                .values()
+                .filter(|location| location.pack_sequence == sequence)
+                .collect::<Vec<_>>();
+            recovery_gc_clock(expiry)?;
+            if !locations.is_empty()
+                && locations.iter().all(|location| {
+                    log_starts
+                        .get(&TopicPartition::new(
+                            location.reservation.topic_id,
+                            location.reservation.partition_id,
+                        ))
+                        .is_some_and(|start| location.reservation.last_offset < *start)
+                })
+            {
+                recovery_gc_clock(expiry)?;
+                removable.push((sequence, path.clone(), locations.len() as u64));
+            }
+        }
+        recovery_gc_clock(expiry)?;
+        if !removable.is_empty() {
+            self.plan_epoch = self
+                .plan_epoch
+                .checked_add(1)
+                .ok_or_else(|| StorageError::LimitExceeded("fetch plan epoch exhausted".into()))?;
+        }
+        let mut stats = GarbageCollectionStats::default();
+        for (sequence, path, extents) in removable {
+            recovery_gc_clock(expiry)?;
+            let bytes = path.metadata()?.len();
+            recovery_gc_clock(expiry)?;
+            let tombstone = pending_pack_deletion_path(&path);
+            recovery_gc_clock(expiry)?;
+            fs::rename(&path, &tombstone)?;
+            #[cfg(test)]
+            recovery_gc_test_step("renamed");
+            recovery_gc_clock(expiry)?;
+            sync_directory(&self.config.directory)?;
+            recovery_gc_clock(expiry)?;
+            self.pack_paths.remove(&sequence);
+            self.by_batch
+                .retain(|_, location| location.pack_sequence != sequence);
+            for locations in self.index.values_mut() {
+                recovery_gc_clock(expiry)?;
+                locations.retain(|location| location.pack_sequence != sequence);
+            }
+            self.index.retain(|_, locations| !locations.is_empty());
+            recovery_gc_clock(expiry)?;
+            fs::remove_file(tombstone)?;
+            recovery_gc_clock(expiry)?;
+            sync_directory(&self.config.directory)?;
+            recovery_gc_clock(expiry)?;
+            stats.packs_removed = stats.packs_removed.saturating_add(1);
+            stats.extents_removed = stats.extents_removed.saturating_add(extents);
+            stats.bytes_removed = stats.bytes_removed.saturating_add(bytes);
+        }
+        recovery_gc_clock(expiry)?;
         Ok(stats)
     }
 
@@ -1514,6 +1799,228 @@ fn pack_path(directory: &Path, sequence: u64) -> PathBuf {
     directory.join(format!("pack-{sequence:020}.sse"))
 }
 
+#[cfg(unix)]
+fn scan_pack_until(
+    path: &Path,
+    pack_sequence: u64,
+    expected_shard: ShardId,
+    max_batch_bytes: usize,
+    permit_tail_repair: bool,
+    index: &mut HashMap<TopicPartition, Vec<ExtentLocation>>,
+    by_batch: &mut HashMap<(TopicPartition, BatchId), ExtentLocation>,
+    expiry: Instant,
+) -> StorageResult<()> {
+    recovery_gc_clock(expiry)?;
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    recovery_gc_clock(expiry)?;
+    let file_len = file.metadata()?.len();
+    let mut offset = 0u64;
+    while offset < file_len {
+        recovery_gc_clock(expiry)?;
+        let remaining = file_len - offset;
+        if remaining < PREFIX_LEN as u64 {
+            if permit_tail_repair {
+                recovery_gc_clock(expiry)?;
+                file.set_len(offset)?;
+                recovery_gc_clock(expiry)?;
+                file.sync_data()?;
+                recovery_gc_clock(expiry)?;
+                break;
+            }
+            return Err(StorageError::corrupt(
+                path,
+                offset,
+                "truncated prefix in sealed pack",
+            ));
+        }
+        recovery_gc_clock(expiry)?;
+        file.seek(SeekFrom::Start(offset))?;
+        recovery_gc_clock(expiry)?;
+        let mut prefix = [0u8; PREFIX_LEN];
+        file.read_exact(&mut prefix)?;
+        recovery_gc_clock(expiry)?;
+        validate_prefix(path, offset, &prefix)?;
+        let frame_len = u64::from_le_bytes(prefix[8..16].try_into().expect("frame length"));
+        let max_frame_len = (HEADER_LEN as u64)
+            .checked_add(max_batch_bytes as u64)
+            .and_then(|value| value.checked_add(CHECKSUM_LEN as u64))
+            .ok_or_else(|| StorageError::LimitExceeded("configured frame limit overflow".into()))?;
+        if frame_len < (HEADER_LEN + CHECKSUM_LEN) as u64 || frame_len > max_frame_len {
+            return Err(StorageError::corrupt(
+                path,
+                offset,
+                format!("invalid frame length {frame_len}"),
+            ));
+        }
+        if offset
+            .checked_add(frame_len)
+            .is_none_or(|end| end > file_len)
+        {
+            if permit_tail_repair {
+                recovery_gc_clock(expiry)?;
+                file.set_len(offset)?;
+                recovery_gc_clock(expiry)?;
+                file.sync_data()?;
+                recovery_gc_clock(expiry)?;
+                break;
+            }
+            return Err(StorageError::corrupt(
+                path,
+                offset,
+                "truncated frame in sealed pack",
+            ));
+        }
+        let frame_len_usize = usize::try_from(frame_len)
+            .map_err(|_| StorageError::corrupt(path, offset, "frame length exceeds usize"))?;
+        recovery_gc_clock(expiry)?;
+        let mut frame = vec![0u8; frame_len_usize];
+        frame[..PREFIX_LEN].copy_from_slice(&prefix);
+        file.read_exact(&mut frame[PREFIX_LEN..])?;
+        recovery_gc_clock(expiry)?;
+        let mut location = decode_extent(path, offset, &frame, expected_shard)?;
+        recovery_gc_clock(expiry)?;
+        location.pack_sequence = pack_sequence;
+        let topic_partition = TopicPartition::new(
+            location.reservation.topic_id,
+            location.reservation.partition_id,
+        );
+        let key = (topic_partition, location.reservation.batch_id);
+        if by_batch.insert(key, location.clone()).is_some() {
+            return Err(StorageError::corrupt(path, offset, "duplicate batch ID"));
+        }
+        index.entry(topic_partition).or_default().push(location);
+        offset += frame_len;
+    }
+    recovery_gc_clock(expiry)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn discover_packs_until(
+    directory: &Path,
+    expiry: Instant,
+) -> StorageResult<BTreeMap<u64, PathBuf>> {
+    recovery_gc_clock(expiry)?;
+    let mut packs = BTreeMap::new();
+    let mut entries = fs::read_dir(directory)?;
+    loop {
+        recovery_gc_clock(expiry)?;
+        #[cfg(test)]
+        recovery_directory_test_step("discover-next-start");
+        recovery_gc_clock(expiry)?;
+        let entry = entries.next();
+        #[cfg(test)]
+        recovery_directory_test_step("discover-next-complete");
+        // EOF and errors are physical visits too, never a renewed clock.
+        recovery_gc_clock(expiry)?;
+        let Some(entry) = entry else { break };
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            #[cfg(test)]
+            recovery_directory_test_step("discover-entry-complete");
+            continue;
+        };
+        let Some(sequence) = name
+            .strip_prefix("pack-")
+            .and_then(|name| name.strip_suffix(".sse"))
+            .and_then(|digits| digits.parse::<u64>().ok())
+        else {
+            #[cfg(test)]
+            recovery_directory_test_step("discover-entry-complete");
+            continue;
+        };
+        if packs.insert(sequence, path).is_some() {
+            return Err(StorageError::InvalidInput(format!(
+                "duplicate pack sequence {sequence}"
+            )));
+        }
+        #[cfg(test)]
+        recovery_directory_test_step("discover-entry-complete");
+    }
+    recovery_gc_clock(expiry)?;
+    Ok(packs)
+}
+
+#[cfg(unix)]
+fn cleanup_pending_pack_deletions_until(directory: &Path, expiry: Instant) -> StorageResult<()> {
+    recovery_gc_clock(expiry)?;
+    let mut pending = Vec::new();
+    let mut entries = fs::read_dir(directory)?;
+    loop {
+        recovery_gc_clock(expiry)?;
+        #[cfg(test)]
+        recovery_directory_test_step("cleanup-next-start");
+        recovery_gc_clock(expiry)?;
+        let entry = entries.next();
+        #[cfg(test)]
+        recovery_directory_test_step("cleanup-next-complete");
+        // EOF and errors are physical visits too, never a renewed clock.
+        recovery_gc_clock(expiry)?;
+        let Some(entry) = entry else { break };
+        if let Ok(entry) = entry {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("pack-") && name.ends_with(".sse.gc-pending"))
+            {
+                pending.push(path);
+            }
+        }
+        #[cfg(test)]
+        recovery_directory_test_step("cleanup-entry-complete");
+    }
+    for path in &pending {
+        recovery_gc_clock(expiry)?;
+        fs::remove_file(path)?;
+    }
+    recovery_gc_clock(expiry)?;
+    if !pending.is_empty() {
+        sync_directory(directory)?;
+    }
+    recovery_gc_clock(expiry)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn recovery_gc_clock(expiry: Instant) -> StorageResult<()> {
+    if Instant::now() >= expiry {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "native recovery original expiry elapsed",
+        )
+        .into());
+    }
+    Ok(())
+}
+#[cfg(all(unix, test))]
+thread_local! {
+    static RECOVERY_DIRECTORY_STEP: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(all(unix, test))]
+fn recovery_directory_test_step(step: &str) {
+    RECOVERY_DIRECTORY_STEP.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(step);
+        }
+    });
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    static RECOVERY_GC_STEP: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(all(unix, test))]
+fn recovery_gc_test_step(step: &str) {
+    RECOVERY_GC_STEP.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(step);
+        }
+    });
+}
+
 fn pending_pack_deletion_path(path: &Path) -> PathBuf {
     path.with_extension("sse.gc-pending")
 }
@@ -2046,5 +2553,176 @@ mod tests {
             ShardStore::open(config(&temp.0, 4096)),
             Err(StorageError::Corrupt { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_gc_late_first_rename_keeps_tombstone_and_starts_no_second_pack_work() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                RECOVERY_GC_STEP.with(|hook| *hook.borrow_mut() = None);
+            }
+        }
+        let temp = TempDir::new("owned-gc-expiry");
+        let cfg = config(&temp.0, 1);
+        let mut store = ShardStore::open(cfg.clone()).expect("actual native store");
+        for n in 0..3 {
+            store
+                .append(
+                    reservation(u128::from(n), n * 2, 3),
+                    None,
+                    b"actual native pack",
+                    true,
+                )
+                .expect("native append");
+        }
+        let first = pack_path(&temp.0, 0);
+        let second = pack_path(&temp.0, 1);
+        let second_bytes = fs::read(&second).expect("native second pack bytes");
+        let expiry = Instant::now() + Duration::from_millis(50);
+        let steps = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = steps.clone();
+        RECOVERY_GC_STEP.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |step| {
+                assert_eq!(step, "renamed");
+                seen.set(seen.get() + 1);
+                std::thread::sleep(
+                    expiry.saturating_duration_since(Instant::now()) + Duration::from_millis(5),
+                );
+            }))
+        });
+        let reset = Reset;
+        let starts = HashMap::from([(
+            TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0)),
+            LogicalOffset::new(4),
+        )]);
+        assert!(store.garbage_collect_until(&starts, expiry).is_err());
+        assert_eq!(steps.get(), 1);
+        drop(reset);
+        assert!(!first.exists());
+        assert!(
+            pending_pack_deletion_path(&first).exists(),
+            "truthful native ambiguous directory tail remains"
+        );
+        assert_eq!(
+            fs::read(&second).expect("second pack never renamed/unlinked"),
+            second_bytes
+        );
+        assert!(!pending_pack_deletion_path(&second).exists());
+        drop(store);
+        let mut reopened = ShardStore::open(cfg).expect("ordinary native pending cleanup");
+        assert!(!pending_pack_deletion_path(&first).exists());
+        assert_eq!(reopened.catalog().len(), 2);
+        reopened
+            .garbage_collect(&starts)
+            .expect("ordinary native GC preserves its established policy");
+        assert_eq!(reopened.catalog().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_directory_iteration_checks_original_expiry_before_each_next_and_after_eof() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                RECOVERY_DIRECTORY_STEP.with(|hook| *hook.borrow_mut() = None);
+            }
+        }
+        for cleanup in [false, true] {
+            let temp = TempDir::new("owned-directory-next-expiry");
+            let cfg = config(&temp.0, 1);
+            let mut store = ShardStore::open(cfg.clone()).expect("actual native packs");
+            for n in 0..3 {
+                store
+                    .append(
+                        reservation(u128::from(n), n * 2, 3),
+                        None,
+                        b"actual native directory entry",
+                        true,
+                    )
+                    .expect("real native frame");
+            }
+            drop(store);
+            let first = pack_path(&temp.0, 0);
+            let pending = pending_pack_deletion_path(&first);
+            fs::rename(&first, &pending).expect("actual interrupted native GC");
+            let expected = fs::read(&pending).expect("retained interrupted bytes");
+            let expiry = Instant::now() + Duration::from_millis(50);
+            let visits = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let observed = visits.clone();
+            RECOVERY_DIRECTORY_STEP.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |step| {
+                    observed.borrow_mut().push(step.to_owned());
+                    if step.ends_with("-entry-complete") {
+                        std::thread::sleep(
+                            expiry.saturating_duration_since(Instant::now())
+                                + Duration::from_millis(5),
+                        );
+                    }
+                }))
+            });
+            let reset = Reset;
+            if cleanup {
+                assert!(cleanup_pending_pack_deletions_until(&temp.0, expiry).is_err());
+                assert_eq!(
+                    &*visits.borrow(),
+                    &[
+                        "cleanup-next-start",
+                        "cleanup-next-complete",
+                        "cleanup-entry-complete"
+                    ]
+                );
+            } else {
+                assert!(discover_packs_until(&temp.0, expiry).is_err());
+                assert_eq!(
+                    &*visits.borrow(),
+                    &[
+                        "discover-next-start",
+                        "discover-next-complete",
+                        "discover-entry-complete"
+                    ]
+                );
+            }
+            drop(reset);
+            assert_eq!(
+                fs::read(&pending).expect("late entry work starts no later read/unlink"),
+                expected
+            );
+            assert!(
+                discover_packs_until(&temp.0, Instant::now() + Duration::from_secs(2))
+                    .expect("fitting real traversal")
+                    .len()
+                    >= 2
+            );
+            cleanup_pending_pack_deletions_until(&temp.0, Instant::now() + Duration::from_secs(2))
+                .expect("fitting real cleanup");
+            assert!(!pending.exists());
+        }
+        // An actual empty native directory still performs one EOF next; its
+        // late completion must be checked before returning a successful scan.
+        let empty = TempDir::new("owned-directory-eof-expiry");
+        let expiry = Instant::now() + Duration::from_millis(50);
+        let visits = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = visits.clone();
+        RECOVERY_DIRECTORY_STEP.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |step| {
+                if step == "discover-next-complete" {
+                    observed.set(observed.get() + 1);
+                    std::thread::sleep(
+                        expiry.saturating_duration_since(Instant::now()) + Duration::from_millis(5),
+                    );
+                }
+            }))
+        });
+        let reset = Reset;
+        assert!(discover_packs_until(&empty.0, expiry).is_err());
+        assert_eq!(visits.get(), 1);
+        drop(reset);
+        assert!(
+            discover_packs_until(&empty.0, Instant::now() + Duration::from_secs(2))
+                .expect("normal empty native scan")
+                .is_empty()
+        );
     }
 }

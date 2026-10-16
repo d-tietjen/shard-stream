@@ -26,6 +26,10 @@ use shardlog::{
 
 use crate::{EngineConfig, EngineError};
 
+#[path = "recovery_restore.rs"]
+mod restore;
+pub(crate) use restore::OwnedEngineCustody;
+
 /// Explicit finite logical allowances; the original Instant is separate.
 #[derive(Clone, Copy, Debug)]
 pub struct NativeRecoveryLimits {
@@ -116,6 +120,14 @@ struct Attempt {
     limits: NativeRecoveryLimits,
     expiry: Instant,
     usage: NativeRecoveryUsage,
+    writable_journal: bool,
+    restore_started: bool,
+    storage_open_prepaid: bool,
+    validation_prepaid: Option<NativeRecoveryUsage>,
+    validation_credit: Option<NativeRecoveryUsage>,
+    restored_parents: Vec<OwnedDirectoryHandle>,
+    restored_files: Vec<OwnedFileHandle>,
+    engine_facts: Vec<RecoverySourceFact>,
     native_discovery_visits: usize,
     native_discovery_path_bytes: usize,
     sources: Vec<Source>,
@@ -177,11 +189,29 @@ pub struct NativeRecoveryCensus {
 
 /// Native stores opened by consuming the actual pre-open leases.
 ///
-/// This does not install an engine, merge object-only data, resume sinks or
-/// authorize serving. The pre-open facts remain historical observations after
-/// native repair/cleanup, not claims that those old file paths remain intact.
+/// `open_storage` opens native stores without object rehydration; the explicit
+/// `restore_storage` path first copies verified CURRENT objects into primary
+/// storage. The consuming engine constructor can then install these real stores
+/// in normal workers. None of these steps authenticates currentness, resumes
+/// sinks or authorizes serving. Pre-open facts remain historical observations
+/// after repair/cleanup, not claims that their old paths remain intact.
 pub struct OwnedRecoveryStorage {
     attempt: Attempt,
+}
+
+impl std::fmt::Debug for OwnedRecoveryStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedRecoveryStorage")
+            .field("usage", &self.attempt.usage)
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Debug for NativeRecoveryCensus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeRecoveryCensus")
+            .field("usage", &self.attempt.usage)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OwnedRecoveryStorage {
@@ -227,11 +257,45 @@ impl NativeRecoveryCensus {
         limits: NativeRecoveryLimits,
         expiry: Instant,
     ) -> std::result::Result<Self, NativeRecoveryError> {
+        Self::read_inner(config, owner, tier_root, limits, expiry, false)
+    }
+
+    /// Same nonmutating census, retaining a writable coordinator descriptor.
+    ///
+    /// Use this before `restore_storage` and the consuming engine constructor.
+    /// Opening RDWR does not repair or write; the actual journal remains pinned
+    /// and no engine path later reopens it or reacquires the native leases.
+    pub fn read_for_engine(
+        config: EngineConfig,
+        owner: Arc<DirectoryOwnership>,
+        tier_root: Option<OwnedDirectoryHandle>,
+        limits: NativeRecoveryLimits,
+        expiry: Instant,
+    ) -> std::result::Result<Self, NativeRecoveryError> {
+        Self::read_inner(config, owner, tier_root, limits, expiry, true)
+    }
+
+    fn read_inner(
+        config: EngineConfig,
+        owner: Arc<DirectoryOwnership>,
+        tier_root: Option<OwnedDirectoryHandle>,
+        limits: NativeRecoveryLimits,
+        expiry: Instant,
+        writable_journal: bool,
+    ) -> std::result::Result<Self, NativeRecoveryError> {
         let mut attempt = Attempt {
             config,
             limits,
             expiry,
             usage: NativeRecoveryUsage::default(),
+            writable_journal,
+            restore_started: false,
+            storage_open_prepaid: false,
+            validation_prepaid: None,
+            validation_credit: None,
+            restored_parents: Vec::new(),
+            restored_files: Vec::new(),
+            engine_facts: Vec::new(),
             native_discovery_visits: 0,
             native_discovery_path_bytes: 0,
             sources: Vec::new(),
@@ -247,7 +311,28 @@ impl NativeRecoveryCensus {
             tier_root,
             owner,
         };
-        match attempt.read() {
+        let result = (|| {
+            if writable_journal {
+                attempt.clock()?;
+                let held = attempt
+                    .config
+                    .data_dir
+                    .as_os_str()
+                    .len()
+                    .checked_add(
+                        attempt
+                            .config
+                            .object_store_dir
+                            .as_ref()
+                            .map_or(0, |p| p.as_os_str().len()),
+                    )
+                    .and_then(|n| n.checked_add(size_of::<EngineConfig>()))
+                    .ok_or_else(limited)?;
+                attempt.charge(0, 1, held, 0, held as u64)?;
+            }
+            attempt.read()
+        })();
+        match result {
             Ok(()) => Ok(Self { attempt }),
             Err(error) => Err(NativeRecoveryError {
                 error,
@@ -266,6 +351,11 @@ impl NativeRecoveryCensus {
     /// not certify that their objects exist, are valid or can be served.
     pub fn tier_manifests(&self) -> &[RecoveryTierManifestObservation] {
         &self.attempt.tier_manifests
+    }
+    /// Actual root owner retained by this census, for exact Arc identity joins.
+    /// This borrow creates no owner, recovery authority or serving permission.
+    pub fn directory_ownership(&self) -> &Arc<DirectoryOwnership> {
+        &self.attempt.owner
     }
     /// Actual native coordinator events; they contain no leader-term maximum.
     pub fn journal(&self) -> &[JournalEvent] {
@@ -352,6 +442,30 @@ impl NativeRecoveryCensus {
                     }),
             )
             .max()
+    }
+
+    /// Rehydrates verified CURRENT objects before any mutable primary scan.
+    ///
+    /// Only the actual retained native manifest/object snapshot is used. An
+    /// existing primary must match exactly; publication never replaces a name.
+    /// All old source facts, incomplete tails and uncertain copy results remain
+    /// retained on refusal. Persist their lineage/floors BEFORE this mutation.
+    pub fn restore_storage(
+        mut self,
+    ) -> std::result::Result<OwnedRecoveryStorage, NativeRecoveryError> {
+        let result = self
+            .attempt
+            .restore_objects()
+            .and_then(|()| self.attempt.open_storage_inner(true));
+        match result {
+            Ok(()) => Ok(OwnedRecoveryStorage {
+                attempt: self.attempt,
+            }),
+            Err(error) => Err(NativeRecoveryError {
+                error,
+                attempt: Box::new(self.attempt),
+            }),
+        }
     }
 
     /// Consumes concrete native leases into the actual storage openers.
@@ -506,8 +620,38 @@ impl Attempt {
     }
 
     fn open_storage(&mut self) -> Result<()> {
-        self.validate_sources()?;
+        self.open_storage_inner(false)
+    }
+
+    fn open_storage_inner(&mut self, retained: bool) -> Result<()> {
+        if let Some(credit) = self.validation_prepaid.take() {
+            self.validation_credit = Some(credit);
+            self.validate_sources()?;
+            let left = self.validation_credit.take().ok_or_else(limited)?;
+            if (
+                left.files,
+                left.entries,
+                left.declared_bytes,
+                left.read_bytes,
+                left.work_bytes,
+            ) != (0, 0, 0, 0, 0)
+            {
+                return Err(limited());
+            }
+        } else {
+            self.validate_sources()?;
+        }
         for path in &self.missing_paths {
+            if self.restore_started {
+                if let Some(parent) = self
+                    .restored_parents
+                    .iter()
+                    .find(|held| held.path() == path)
+                {
+                    parent.validate().map_err(identity)?;
+                    continue;
+                }
+            }
             match std::fs::symlink_metadata(path) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 _ => {
@@ -517,14 +661,16 @@ impl Attempt {
                 }
             }
         }
-        let admitted = self.storage_open_admission()?;
-        self.charge(
-            admitted.files,
-            admitted.entries,
-            admitted.declared_bytes,
-            admitted.read_bytes,
-            admitted.work_bytes,
-        )?;
+        if !self.storage_open_prepaid {
+            let admitted = self.storage_open_admission()?;
+            self.charge(
+                admitted.files,
+                admitted.entries,
+                admitted.declared_bytes,
+                admitted.read_bytes,
+                admitted.work_bytes,
+            )?;
+        }
         // Reserve actual output slots up front, before any native mutation.
         self.opened
             .try_reserve_exact(usize::try_from(self.config.shard_count).map_err(|_| limited())?)
@@ -542,20 +688,42 @@ impl Attempt {
                 max_batch_bytes: self.config.max_batch_bytes,
             };
             let store = if let Some(index) = self.shards.iter().position(|(id, _)| *id == shard) {
-                let (_, guard) = self.shards.swap_remove(index);
-                ShardStore::open_after_census(config, guard)?
+                if retained {
+                    ShardStore::open_under_census_until(config, &self.shards[index].1, self.expiry)?
+                } else {
+                    let (_, guard) = self.shards.swap_remove(index);
+                    ShardStore::open_after_census(config, guard)?
+                }
             } else {
                 // No pre-open shard existed. A native new store acquires its
                 // own concrete lease; absence never supplied a permission.
-                ShardStore::open(config)?
+                if retained {
+                    ShardStore::open_until(config, self.expiry)?
+                } else {
+                    ShardStore::open(config)?
+                }
             };
             self.opened.push((shard, store, None));
+            if retained {
+                self.clock()?;
+            }
             if let Some(root) = self.tier_root.as_ref() {
                 root.validate().map_err(identity)?;
                 let path = root.path().to_owned();
                 let tier = if let Some(index) = self.tiers.iter().position(|(id, _)| *id == shard) {
-                    let (_, guard) = self.tiers.swap_remove(index);
-                    LocalObjectTier::open_after_census(path, shard, guard)?
+                    if retained {
+                        LocalObjectTier::open_under_census_until(
+                            path,
+                            shard,
+                            &self.tiers[index].1,
+                            self.expiry,
+                        )?
+                    } else {
+                        let (_, guard) = self.tiers.swap_remove(index);
+                        LocalObjectTier::open_after_census(path, shard, guard)?
+                    }
+                } else if retained {
+                    LocalObjectTier::open_until(path, shard, self.expiry)?
                 } else {
                     LocalObjectTier::open(path, shard)?
                 };
@@ -589,6 +757,14 @@ impl Attempt {
         self.charge(1, 1, size_of::<Self>() + 65_536, 0, 0)?;
         self.root = Some(self.owner.root_handle().map_err(identity)?);
         let root = self.root.as_ref().ok_or_else(limited)?.retain();
+        if self.writable_journal {
+            let bytes = root.path().as_os_str().len();
+            if bytes > self.limits.max_path_bytes {
+                return Err(limited());
+            }
+            self.charge(0, 1, bytes, 0, bytes as u64)?;
+            self.config.data_dir = root.path().to_owned();
+        }
         if let Some(journal) = self.optional_file(&root, OsStr::new("coordinator.ssj"))? {
             self.scan_source(journal, RecoverySourceKind::Coordinator, ShardId::new(0), 0)?;
         }
@@ -678,7 +854,12 @@ impl Attempt {
     ) -> Result<Option<OwnedFileHandle>> {
         self.path(root, name)?;
         self.charge(1, 1, size_of::<OwnedFileHandle>() + 256, 0, 256)?;
-        match root.open_file(name, OwnedFileAccess::ReadOnly) {
+        let access = if self.writable_journal && name == OsStr::new("coordinator.ssj") {
+            OwnedFileAccess::ReadWrite
+        } else {
+            OwnedFileAccess::ReadOnly
+        };
+        match root.open_file(name, access) {
             Ok(file) => {
                 self.clock()?;
                 Ok(Some(file))
@@ -1344,6 +1525,22 @@ impl Attempt {
         work: u64,
     ) -> Result<()> {
         self.clock()?;
+        // Closed prepayment for this exact repeated source-validation pass.
+        // It comes only from actual retained source sizes, is never refunded,
+        // and cannot be used by a caller or a different native operation.
+        if let Some(credit) = &mut self.validation_credit {
+            *credit = NativeRecoveryUsage {
+                files: credit.files.checked_sub(files).ok_or_else(limited)?,
+                entries: credit.entries.checked_sub(entries).ok_or_else(limited)?,
+                declared_bytes: credit
+                    .declared_bytes
+                    .checked_sub(bytes)
+                    .ok_or_else(limited)?,
+                read_bytes: credit.read_bytes.checked_sub(read).ok_or_else(limited)?,
+                work_bytes: credit.work_bytes.checked_sub(work).ok_or_else(limited)?,
+            };
+            return Ok(());
+        }
         let add = |a: usize, b: usize, max: usize| {
             a.checked_add(b).filter(|n| *n <= max).ok_or_else(limited)
         };
