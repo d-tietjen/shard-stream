@@ -5,6 +5,10 @@ use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use self::SourceReadPhase::{
+    AfterClone, AfterFinalIdentity, AfterInitialIdentity, AfterRead, BeforeClone,
+    BeforeFinalIdentity,
+};
 use shardlog::{
     BatchId, CoordinatorJournal, LeaderEpoch, LogicalOffset, LogicalPartitionId, Placement,
     PlacementSequence, Reservation, RingEpoch, TopicId, VirtualLaneId,
@@ -982,3 +986,184 @@ mod owned_engine;
 
 #[path = "recovery_extent_tail_tests.rs"]
 mod extent_tails;
+
+#[test]
+fn common_expiry_cap_preserves_native_usage_sources_and_custody_without_widening() {
+    let temp = Temporary::new();
+    let pack = write_native(&temp.0);
+    let original = fs::read(&pack).expect("actual original native source");
+    let original_expiry = Instant::now() + Duration::from_secs(30);
+    let mut census = chunk_census(&temp.0, limits(), original_expiry);
+    let index = pack_source(&census, &pack);
+    assert_eq!(
+        census
+            .read_source_chunk(index, 3, 7)
+            .expect("real charged first read"),
+        original[3..10]
+    );
+    let before = census.usage();
+    let sources = census.sources().count();
+    let owner = Arc::as_ptr(census.directory_ownership());
+    let earlier = Instant::now() + Duration::from_secs(10);
+    census.cap_expiry(earlier);
+    census.cap_expiry(original_expiry + Duration::from_secs(30));
+    assert_eq!(census.absolute_expiry(), earlier);
+    let after = census.usage();
+    assert_eq!(
+        (
+            after.files,
+            after.entries,
+            after.read_bytes,
+            after.declared_bytes,
+            after.work_bytes
+        ),
+        (
+            before.files,
+            before.entries,
+            before.read_bytes,
+            before.declared_bytes,
+            before.work_bytes
+        )
+    );
+    assert_eq!(census.sources().count(), sources);
+    assert_eq!(Arc::as_ptr(census.directory_ownership()), owner);
+    assert!(matches!(
+        DirectoryOwnership::acquire(&temp.0),
+        Err(DirectoryOwnershipError::Contended)
+    ));
+    assert!(ShardStore::open(store_config(&temp.0)).is_err());
+    assert_eq!(
+        census
+            .read_source_chunk(index, 3, 7)
+            .expect("real read under tightened common clock"),
+        original[3..10]
+    );
+    assert_eq!(census.usage().read_bytes, before.read_bytes + 7);
+    assert_eq!(fs::read(&pack).expect("no source mutation"), original);
+    drop(census);
+    drop(
+        DirectoryOwnership::acquire(&temp.0)
+            .expect("original owner released only after physical drop"),
+    );
+    drop(
+        ShardStore::open(store_config(&temp.0))
+            .expect("actual native lease released after physical drop"),
+    );
+}
+
+#[test]
+fn elapsed_common_expiry_cap_refuses_before_first_native_phase_and_cannot_be_renewed() {
+    let temp = Temporary::new();
+    let pack = write_native(&temp.0);
+    let original = fs::read(&pack).expect("whole native original");
+    let original_expiry = Instant::now() + Duration::from_secs(30);
+    let mut census = chunk_census(&temp.0, limits(), original_expiry);
+    let index = pack_source(&census, &pack);
+    let before = census.usage();
+    let elapsed = Instant::now();
+    census.cap_expiry(elapsed);
+    census.cap_expiry(original_expiry);
+    let observer = SourceReadProbeGuard::install(None);
+    let error = census
+        .read_source_chunk(index, 3, 7)
+        .expect_err("actual common cap already elapsed");
+    assert!(error.to_string().contains("original expiry elapsed"));
+    assert_eq!(census.absolute_expiry(), elapsed);
+    assert!(observer.observed().is_empty());
+    let after = census.usage();
+    assert_eq!(
+        (
+            after.files,
+            after.entries,
+            after.read_bytes,
+            after.declared_bytes,
+            after.work_bytes
+        ),
+        (
+            before.files,
+            before.entries,
+            before.read_bytes,
+            before.declared_bytes,
+            before.work_bytes
+        )
+    );
+    assert_eq!(fs::read(&pack).expect("source remains whole"), original);
+    assert!(matches!(
+        DirectoryOwnership::acquire(&temp.0),
+        Err(DirectoryOwnershipError::Contended)
+    ));
+    assert!(ShardStore::open(store_config(&temp.0)).is_err());
+    drop(observer);
+    drop(census);
+    drop(
+        DirectoryOwnership::acquire(&temp.0)
+            .expect("real root custody released after refusal cleanup"),
+    );
+    drop(
+        ShardStore::open(store_config(&temp.0))
+            .expect("real native lease released after refusal cleanup"),
+    );
+}
+
+#[test]
+fn tightened_common_expiry_blocks_later_native_phases_and_late_success() {
+    for pause in [AfterInitialIdentity, AfterRead, AfterFinalIdentity] {
+        let temp = Temporary::new();
+        let pack = write_native(&temp.0);
+        let original = fs::read(&pack).expect("whole native original");
+        let original_expiry = Instant::now() + Duration::from_secs(30);
+        let mut census = chunk_census(&temp.0, limits(), original_expiry);
+        let index = pack_source(&census, &pack);
+        let before = census.usage();
+        let common_expiry = Instant::now() + Duration::from_secs(2);
+        census.cap_expiry(common_expiry);
+        census.cap_expiry(original_expiry);
+        let observer = SourceReadProbeGuard::install(Some(pause));
+        let error = census
+            .read_source_chunk(index, 3, 7)
+            .expect_err("actual common cap elapsed during native phase");
+        assert!(error.to_string().contains("original expiry elapsed"));
+        assert_eq!(census.absolute_expiry(), common_expiry);
+        assert!(
+            Instant::now() < original_expiry,
+            "the old longer clock still fits"
+        );
+        let expected = match pause {
+            AfterInitialIdentity => vec![AfterInitialIdentity],
+            AfterRead => vec![AfterInitialIdentity, BeforeClone, AfterClone, AfterRead],
+            AfterFinalIdentity => vec![
+                AfterInitialIdentity,
+                BeforeClone,
+                AfterClone,
+                AfterRead,
+                BeforeFinalIdentity,
+                AfterFinalIdentity,
+            ],
+            _ => unreachable!("only completed actual physical phases pause"),
+        };
+        assert_eq!(observer.observed(), expected);
+        assert_eq!(
+            census.usage().read_bytes,
+            before.read_bytes + if pause == AfterInitialIdentity { 0 } else { 7 }
+        );
+        assert_eq!(
+            fs::read(&pack).expect("no source repair or mutation"),
+            original
+        );
+        assert!(matches!(
+            DirectoryOwnership::acquire(&temp.0),
+            Err(DirectoryOwnershipError::Contended)
+        ));
+        assert!(ShardStore::open(store_config(&temp.0)).is_err());
+        drop(observer);
+        drop(census);
+        drop(
+            DirectoryOwnership::acquire(&temp.0)
+                .expect("root owner retained through late physical settlement"),
+        );
+        drop(
+            ShardStore::open(store_config(&temp.0))
+                .expect("native lease retained through late physical settlement"),
+        );
+    }
+}

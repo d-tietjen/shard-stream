@@ -486,3 +486,21 @@ paths still require same-set source membership, original source retention,
 full object length/hash and native extent coverage; they authenticate no
 physical root, placement, currentness or serving permission. Existing ordinary
 tier loaders and native path/key policies keep their behavior.
+
+
+### Tightening a retained native recovery deadline
+
+`NativeRecoveryCensus::cap_expiry` takes an absolute `Instant` and retains the
+earlier of that value and the census deadline. A closed host must propagate
+each tighter common deadline to its retained census before starting another
+native read or restore operation. An outer precheck alone cannot make a native
+operation use a shorter deadline between its physical phases. The method
+changes no resource limits, cumulative reservations, original sources, locks or
+recovery authority, and a later call cannot renew an elapsed deadline.
+
+The added source fixtures use actual native storage, the existing physical
+source-read observers and real directory/shard lock contention to cover an
+elapsed entry and shorter deadlines after identity validation, payload reading
+and final validation. They also check that tightening does not reset charged
+usage or release custody. These fixtures remain uncompiled and unexecuted;
+full dependency, lint, test and startup qualification remain required.

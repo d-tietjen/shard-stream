@@ -406,6 +406,14 @@ impl NativeRecoveryCensus {
     pub fn absolute_expiry(&self) -> Instant {
         self.attempt.expiry
     }
+    /// Tightens every subsequent native phase to the caller's common expiry.
+    ///
+    /// A later value cannot extend the captured clock. This changes no limits,
+    /// cumulative reservations, retained sources or physical ownership. An
+    /// elapsed cap remains elapsed; the next existing phase check refuses it.
+    pub fn cap_expiry(&mut self, earlier: Instant) {
+        self.attempt.expiry = self.attempt.expiry.min(earlier);
+    }
     /// Copies bounded original bytes from a retained source before mutable open.
     ///
     /// This debits actual read/copy work under the SAME saved expiry and keeps
