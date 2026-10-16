@@ -852,3 +852,27 @@ witness. The caller must retain the SAME pin/Core parent through this owner and
 all later jobs. Fifteen genuine opener groups and the actual bounded-open/GC
 composition group remain uncompiled and unexecuted. Later ordinary store methods
 do not become bounded by being called on a successfully opened store.
+
+### Core owner for pinned native open
+
+On Linux and Android, `OwnedShardDirectory::open_store_until` consumes the
+actual Core-derived pinned directory into `OwnedPinnedShardStore`. It uses the
+same cumulative `NativeDirectoryBudget` and minimum original deadline for
+recursive Core validation and native discovery/read/decode/repair. Its required
+composing checks deny the same work and captured health before entered native
+repair settlement. Late failure retains the actual partial or opened store,
+typed outcomes and independent panic payloads ahead of the original Core parent.
+`owned_pinned_shard_store_cost` includes the native configured ceilings, bridge
+values and actual shared-directory allocation; Core validation charges its own
+actual phases to those same counters.
+
+`retain_directory` returns opaque strong custody of the same pin, acquired lock
+and Core parent for a physical worker. Internal synchronization retains the
+complete native state, including any Send-only observation/error values; clones
+expose only the original parent diagnostics. Each entered job must prepay the
+fixed clone value/entry/work and keep that custody outside its actual file/request/
+result frames until they are destroyed. This is necessary for a sync worker
+that outlives the primary store. There is no pin, guard, descriptor or store
+extraction, fresh startup budget or serving permission. Borrowed ordinary store
+methods keep their existing behavior; bounded GC, append/rotation and actual
+engine worker distribution require their own composed producers and validation.

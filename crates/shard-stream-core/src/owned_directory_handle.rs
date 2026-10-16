@@ -28,6 +28,11 @@ pub use file_replacement::{
 
 #[path = "owned_shard_directory.rs"]
 mod shard_directory;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use shard_directory::{
+    OwnedPinnedShardStore, OwnedPinnedShardStoreCost, OwnedPinnedShardStoreFailure,
+    OwnedShardStoreDirectory, RetainedOwnedPinnedShardStoreError, owned_pinned_shard_store_cost,
+};
 pub use shard_directory::{
     OwnedShardDirectory, OwnedShardDirectoryCost, OwnedShardDirectoryFailure,
     RetainedOwnedShardDirectoryError, owned_shard_directory_cost,

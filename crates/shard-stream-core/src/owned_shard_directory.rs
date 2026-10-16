@@ -18,6 +18,15 @@ use std::fmt;
 use std::mem::size_of;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[path = "owned_pinned_shard_store.rs"]
+mod store;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use store::{
+    OwnedPinnedShardStore, OwnedPinnedShardStoreCost, OwnedPinnedShardStoreFailure,
+    OwnedShardStoreDirectory, RetainedOwnedPinnedShardStoreError, owned_pinned_shard_store_cost,
+};
+
 /// Plain source-visible bridge/native values before actual continuation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnedShardDirectoryCost {

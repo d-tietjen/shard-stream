@@ -38,6 +38,11 @@ pub use owned_directory_handle::{
     NativeFileReplacementFailure, NativeFileReplacementLimits, NativeFileReplacementOutcome,
     NativeFileReplacementPhase, RetainedNativeFileReplacementError, native_file_replacement_cost,
 };
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use owned_directory_handle::{
+    OwnedPinnedShardStore, OwnedPinnedShardStoreCost, OwnedPinnedShardStoreFailure,
+    OwnedShardStoreDirectory, RetainedOwnedPinnedShardStoreError, owned_pinned_shard_store_cost,
+};
 #[cfg(unix)]
 pub use owned_directory_handle::{
     OwnedShardDirectory, OwnedShardDirectoryCost, OwnedShardDirectoryFailure,
