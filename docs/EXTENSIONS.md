@@ -605,3 +605,109 @@ same-inode rename and install a real symlink after ancestor observations;
 alternate names start no native phase and the descriptor walk refuses the late
 symlink. Ordinary alias validation remains supported. They remain uncompiled and unexecuted
 until the normal native dependency, type and test gates run.
+
+### Native active-file durability under an original expiry
+
+`ShardLog::sync_until` and `ShardStore::sync_until` use the same actual active
+file as ordinary synchronization. The composing owner first admits
+`storage_durability_cost`, constructs a `StorageDurabilityBudget` with finite
+`max_io_calls` and its original absolute expiry, and retains that budget with
+the same native log/store. A successful synchronization consumes two slots:
+the actual `File::flush` and `File::sync_data`. Slots never refund or recycle.
+
+The producer saves each original typed I/O result before checking the clock
+after that call. A late success or native error therefore remains visible in
+`outcomes`; an entered slot without a result identifies an unwind before
+normal completion. A late reservation can remain unentered. Once refused,
+the budget cannot enter another native call. Synchronous calls settle before
+return, and callers must retain the actual store and budget on every refusal.
+The counters supply no ownership, admission, currentness or serving permission.
+
+Costs describe declared source values and requested outcome-vector slots,
+excluding allocator, kernel, device and process RSS overhead. This additive
+surface covers active-file synchronization only. Native opening, appending,
+reading, rotation and compaction need their own original-expiry producers;
+calling an ordinary operation inside an outer clock check does not qualify it.
+The ordinary synchronization APIs keep their existing behavior. The genuine
+sync/reopen, lock-retention, one-less-slot, late-phase and actual Linux device
+error regression source remains uncompiled and unexecuted pending the normal
+native dependency and validation gates.
+
+### Finite native fetch and retained directory operations
+
+`EngineHandle::fetch_until` uses one original operation deadline and one shared
+`NativeFetchLimits` budget across real coordinator selection, physical shard
+planning, reads and result construction. Metadata batch counts, including zero
+payload batches, and the committed batch-ID bitmap span have explicit limits
+before allocation. Read retries, errors and EOF attempts spend the same counters.
+A selected batch cap returns an ordinary native prefix for pagination. The old
+fetch API retains its existing byte and visibility policy through the same
+native selector and storage algorithms.
+
+`RetainedNativeFetchError` holds the same `EngineHandle`, native child refusals,
+queue errors and completed payload owners. Every entered bounded command is
+drained before return or unwind. A stopped worker is a failure; it does not claim
+that the whole engine has been destroyed. The same engine retains its actual
+worker join and root-custody obligations until its last strong owner is dropped.
+
+`NativeDirectoryBudget` carries one original deadline, cumulative finite counters
+and min-only `cap_expiry` across the actual root, child directories and files.
+`root_handle_until`, recursive `validate_until`, child `open_directory_until`,
+`open_file_until` and directory `sync_until` check that same minimum inside every
+native physical phase. Root validation shares the existing native canonical-name
+and descriptor-walk algorithm. Child validation shares the ordinary native
+identity predicate. New file opens use `NOFOLLOW` and `NONBLOCK`, validate the
+actual regular-file identity and preserve nontruncating regular-file behavior.
+Existing ordinary entry points retain their behavior.
+
+`open_optional_directory_until` and `open_optional_file_until` use the same
+physical read-only openers and treat only
+fitting native NotFound as `None`, with the actual parent revalidated before
+success. It leaves the carried budget usable for genuine first boot.
+`entry_kind_until` performs a native no-follow probe: regular files, directories
+and other real kinds are ordinary traces; symlinks refuse. These observations
+provide neither source completeness nor startup permission.
+
+`RetainedDirectoryError` keeps the same native root/parent, known mkdir/probe
+outcomes and any newly opened producer descriptor before post-call deadline
+observation. It never unlinks a failed/uncertain name. Borrowed validation targets
+remain owned by the caller. Transient native validator descriptors settle during
+the synchronous call; the error retains newly opened child/root-handle producer
+outcomes. A late fitting absence or native error is a refusal, with the completed
+native error retained when available.
+
+The plain cost helpers describe source-visible logical setup values, retained
+slots, path buffers and configured cumulative ceilings. String costs are a
+subset of declared bytes. Their counters are prepaid conservative fees, including
+unused fees when a later entry check refuses. Allocator/library/kernel internals
+and whole-process RSS/performance remain separate measured gates. These ordinary
+budgets grant no process, currentness, fencing or serving authority. Native sink
+and replication resumes, topic creation, ShardLog open/append/rotation/compaction
+and the final consuming startup remain separate required continuations.
+
+### Native recovery lock acquisition under an original expiry
+
+`ShardRecoveryGuard::try_acquire_until` consumes the actual supplied lock file
+and directory. After admitting `shard_guard_acquire_cost` for that same path,
+the caller supplies finite `ShardGuardAcquireLimits` and its original absolute
+expiry. The producer performs the existing native identity policy, actual
+nonblocking `fs2` lock, then the same identity policy again. It keeps both typed
+validation results and the exact lock result before their post-call clocks.
+Five cumulative native-call slots cover the fitting path; a smaller allowance
+can refuse partway through the final validation while retaining the acquired
+lock and actual metadata observations.
+
+Success returns `AcquiredShardRecoveryGuard`, which borrows only the same
+successfully acquired native guard and retains all observations. Refusal returns
+`RetainedShardGuardAcquireError`, which keeps the actual input file and any lock
+acquired before expiry or a final identity refusal. Its diagnostic observation
+cannot expose an unacquired guard or raw descriptor to another native open API.
+No retry, pathname reopen, descriptor clone, explicit unlock or fresh expiry is
+hidden in acquisition. The ordinary acquisition API remains unchanged.
+
+These costs describe source values and logical path bytes; callers already own
+the input allocation and descriptor before entry. Allocator/kernel/RSS bounds,
+parent-directory validation, native store opening/repair and serving permission
+remain separate requirements. The genuine lock contention, late native phases,
+one-less-call, changed-name and public cleanup test sources have not been
+compiled or executed.

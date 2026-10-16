@@ -22,6 +22,10 @@ use crate::{
     TopicConfig,
 };
 
+#[path = "coordinator_fetch.rs"]
+mod bounded_fetch;
+pub(crate) use bounded_fetch::Failure as BoundedFetchCoordinatorFailure;
+
 mod catalog;
 pub(crate) use catalog::apply_recovered_catalog_event;
 
@@ -210,31 +214,8 @@ impl PartitionState {
         candidates: &[BatchId],
         include_unresolved: bool,
     ) -> EngineResult<CommittedBatchSet> {
-        let Some(first) = candidates.iter().map(|batch_id| batch_id.get()).min() else {
-            return Ok(CommittedBatchSet::new(0, 0));
-        };
-        let last = candidates
-            .iter()
-            .map(|batch_id| batch_id.get())
-            .max()
-            .expect("nonempty candidates have a maximum");
-        let len = last
-            .checked_sub(first)
-            .and_then(|span| span.checked_add(1))
-            .and_then(|span| usize::try_from(span).ok())
-            .ok_or_else(|| {
-                EngineError::InvalidConfig("fetch candidate window exceeds usize".into())
-            })?;
-        let mut committed = CommittedBatchSet::new(first, len);
-        for batch_id in candidates {
-            if self.batches.get(batch_id.get()).is_some_and(|batch| {
-                batch.status == BatchStatus::Committed
-                    || (include_unresolved && batch.status == BatchStatus::Unresolved)
-            }) {
-                committed.insert(*batch_id);
-            }
-        }
-        Ok(committed)
+        bounded_fetch::committed_candidates(self, candidates, include_unresolved, None, usize::MAX)
+            .map_err(bounded_fetch::Failure::into_engine_error)
     }
 
     fn advance_cached_watermarks(&mut self) {
@@ -534,6 +515,7 @@ impl Drop for ControlJournal {
 }
 
 enum CoordinatorCommand {
+    BoundedFetch(bounded_fetch::Command),
     Create {
         topic_partition: TopicPartition,
         shards: Vec<ShardId>,
@@ -1377,6 +1359,7 @@ fn run_coordinator(
 ) {
     while let Ok(command) = receiver.recv() {
         match command {
+            CoordinatorCommand::BoundedFetch(command) => bounded_fetch::execute(&states, command),
             CoordinatorCommand::Create {
                 topic_partition,
                 shards,

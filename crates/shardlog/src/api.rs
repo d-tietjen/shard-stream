@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 
+#[path = "api_durability.rs"]
+mod durability;
+
 use crate::{
     BatchId, LeaderEpoch, LogicalOffset, LogicalPartitionId, Placement, PlacementSequence,
     Reservation, RingEpoch, ShardId, ShardStore, ShardStoreConfig, StorageError, TopicId,

@@ -1,6 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::mem::size_of;
 use std::num::NonZeroU32;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{Receiver, channel, sync_channel};
@@ -39,6 +40,13 @@ use crate::{
 mod owned;
 #[cfg(unix)]
 pub use owned::{OwnedEngineOpenError, OwnedRecoveredEngine};
+
+#[path = "bounded_fetch.rs"]
+mod bounded_fetch;
+pub use bounded_fetch::{
+    NativeFetchCost, NativeFetchFailure, NativeFetchLimits, NativeFetchResult,
+    RetainedNativeFetchError, native_fetch_cost,
+};
 
 const MAX_FETCH_PLAN_BATCHES_PER_SHARD: usize = 4_096;
 
@@ -1355,24 +1363,8 @@ impl StreamEngine {
     }
 
     pub fn fetch(&self, request: FetchRequest) -> EngineResult<Vec<FetchedBatch>> {
-        self.fetch_stored(request).map(|batches| {
-            batches
-                .into_iter()
-                .map(|batch| FetchedBatch {
-                    batch_id: batch.reservation.batch_id,
-                    event_id: batch.producer.and_then(|producer| producer.event_id),
-                    atomic_group: batch.atomic_group.map(|group| AtomicGroupIdentity {
-                        transaction_id: group.transaction_id,
-                        chunk_sequence: group.chunk_sequence,
-                    }),
-                    first_offset: batch.reservation.first_offset,
-                    last_offset: batch.reservation.last_offset,
-                    record_count: batch.reservation.record_count,
-                    payload: batch.payload,
-                    placement: batch.reservation.placement,
-                })
-                .collect()
-        })
+        self.fetch_stored(request)
+            .map(|batches| batches.into_iter().map(fetched_batch).collect())
     }
 
     fn fetch_stored(&self, request: FetchRequest) -> EngineResult<Vec<StoredBatch>> {
@@ -2077,21 +2069,44 @@ fn durable_append_from_stored(config: &EngineConfig, batch: StoredBatch) -> Dura
     )
 }
 
+fn fetched_batch(batch: StoredBatch) -> FetchedBatch {
+    FetchedBatch {
+        batch_id: batch.reservation.batch_id,
+        event_id: batch.producer.and_then(|producer| producer.event_id),
+        atomic_group: batch.atomic_group.map(|group| AtomicGroupIdentity {
+            transaction_id: group.transaction_id,
+            chunk_sequence: group.chunk_sequence,
+        }),
+        first_offset: batch.reservation.first_offset,
+        last_offset: batch.reservation.last_offset,
+        record_count: batch.reservation.record_count,
+        payload: batch.payload,
+        placement: batch.reservation.placement,
+    }
+}
+
 fn materialize_stored_batches(
     mut lanes: Vec<VecDeque<StoredBatch>>,
     merge_order: &[usize],
 ) -> EngineResult<Vec<StoredBatch>> {
     let mut result = Vec::with_capacity(merge_order.len());
     for &lane in merge_order {
-        let batch = lanes
-            .get_mut(lane)
-            .and_then(VecDeque::pop_front)
-            .ok_or_else(|| {
-                EngineError::CorruptState("fetch materialization did not match its plan".into())
-            })?;
+        let batch = pop_materialized_batch(&mut lanes, lane)?;
         result.push(batch);
     }
     Ok(result)
+}
+
+fn pop_materialized_batch(
+    lanes: &mut [VecDeque<StoredBatch>],
+    lane: usize,
+) -> EngineResult<StoredBatch> {
+    lanes
+        .get_mut(lane)
+        .and_then(VecDeque::pop_front)
+        .ok_or_else(|| {
+            EngineError::CorruptState("fetch materialization did not match its plan".into())
+        })
 }
 
 struct FetchSelection {
@@ -2106,23 +2121,151 @@ fn select_fetch_plan(
     committed: Option<&CommittedBatchSet>,
     max_bytes: usize,
 ) -> EngineResult<FetchSelection> {
+    select_fetch_plan_bounded(
+        shard_plans,
+        mode,
+        ordered_end,
+        committed,
+        max_bytes,
+        usize::MAX,
+        None,
+    )
+    .map_err(|error| match error {
+        NativeFetchFailure::Engine(error) => error,
+        error => EngineError::CorruptState(error.to_string()),
+    })
+}
+
+fn select_fetch_plan_bounded(
+    shard_plans: &[Vec<StoredBatchMetadata>],
+    mode: FetchMode,
+    ordered_end: LogicalOffset,
+    committed: Option<&CommittedBatchSet>,
+    max_bytes: usize,
+    max_batches: usize,
+    budget: Option<&shardlog::StorageFetchBudget>,
+) -> Result<FetchSelection, NativeFetchFailure> {
+    let check = || match budget {
+        Some(budget) => budget.check(),
+        None => Ok(()),
+    };
+    check()?;
+    if let Some(budget) = budget {
+        let lanes = shard_plans.len();
+        let candidates = shard_plans.iter().try_fold(0usize, |total, planned| {
+            total
+                .checked_add(planned.len())
+                .ok_or(shardlog::StorageFetchFailure::Capacity)
+        })?;
+        let selected_capacity = candidates.min(max_batches);
+        // One heap value and position per lane; one result metadata and merge
+        // position per possible selected batch. Each lane may independently
+        // supply the entire bounded prefix, so reserve/pay each real capacity.
+        let lane_capacity = shard_plans.iter().try_fold(0usize, |total, planned| {
+            total
+                .checked_add(planned.len().min(max_batches))
+                .ok_or(shardlog::StorageFetchFailure::Capacity)
+        })?;
+        let bytes = lanes
+            .checked_mul(
+                size_of::<usize>()
+                    + size_of::<Reverse<(LogicalOffset, usize)>>()
+                    + size_of::<Vec<StoredBatchMetadata>>(),
+            )
+            .and_then(|value| {
+                lane_capacity
+                    .checked_mul(size_of::<StoredBatchMetadata>())
+                    .and_then(|slots| value.checked_add(slots))
+            })
+            .and_then(|value| {
+                selected_capacity
+                    .checked_mul(size_of::<usize>())
+                    .and_then(|slots| value.checked_add(slots))
+            })
+            .and_then(|value| {
+                value.checked_add(
+                    size_of::<FetchSelection>()
+                        + size_of::<Vec<usize>>()
+                        + size_of::<BinaryHeap<Reverse<(LogicalOffset, usize)>>>(),
+                )
+            })
+            .ok_or(shardlog::StorageFetchFailure::Capacity)?;
+        let entries = lanes
+            .checked_mul(3)
+            .and_then(|value| value.checked_add(lane_capacity))
+            .and_then(|value| value.checked_add(selected_capacity))
+            .and_then(|value| value.checked_add(3))
+            .ok_or(shardlog::StorageFetchFailure::Capacity)?;
+        let work = candidates
+            .checked_mul(size_of::<StoredBatchMetadata>())
+            .and_then(|value| value.checked_add(bytes))
+            .ok_or(shardlog::StorageFetchFailure::Capacity)?;
+        budget.charge_values(bytes, entries, work)?;
+    }
+    check()?;
     let mut positions = vec![0usize; shard_plans.len()];
+    check()?;
     let mut ready = BinaryHeap::with_capacity(shard_plans.len());
-    let mut selected = shard_plans.iter().map(|_| Vec::new()).collect::<Vec<_>>();
-    let mut merge_order = Vec::new();
+    check()?;
+    let mut selected = if budget.is_some() {
+        shard_plans
+            .iter()
+            .map(|planned| Vec::with_capacity(planned.len().min(max_batches)))
+            .collect::<Vec<_>>()
+    } else {
+        shard_plans.iter().map(|_| Vec::new()).collect::<Vec<_>>()
+    };
+    check()?;
+    let mut merge_order = if budget.is_some() {
+        let capacity = shard_plans
+            .iter()
+            .try_fold(0usize, |total, planned| {
+                total
+                    .checked_add(planned.len())
+                    .ok_or(shardlog::StorageFetchFailure::Capacity)
+            })?
+            .min(max_batches);
+        Vec::with_capacity(capacity)
+    } else {
+        Vec::new()
+    };
+    check()?;
     for (lane, planned) in shard_plans.iter().enumerate() {
+        check()?;
         if let Some(metadata) = planned.first() {
             ready.push(Reverse((metadata.reservation().first_offset, lane)));
         }
+        check()?;
     }
 
     let mut used = 0usize;
     let mut selected_count = 0usize;
-    while let Some(Reverse((_, lane))) = ready.pop() {
+    loop {
+        check()?;
+        if selected_count == max_batches {
+            break;
+        }
+        if let Some(budget) = budget {
+            let work = (usize::BITS as usize + 1)
+                .checked_mul(
+                    2 * size_of::<Reverse<(LogicalOffset, usize)>>()
+                        + size_of::<StoredBatchMetadata>(),
+                )
+                .ok_or(shardlog::StorageFetchFailure::Capacity)?;
+            budget.charge_values(0, 0, work)?;
+        }
+        check()?;
+        let next_ready = ready.pop();
+        check()?;
+        let Some(Reverse((_, lane))) = next_ready else {
+            break;
+        };
         let metadata = shard_plans[lane][positions[lane]];
         positions[lane] += 1;
         if let Some(next) = shard_plans[lane].get(positions[lane]) {
+            check()?;
             ready.push(Reverse((next.reservation().first_offset, lane)));
+            check()?;
         }
 
         if matches!(mode, FetchMode::Ordered | FetchMode::Replicated)
@@ -2133,6 +2276,7 @@ fn select_fetch_plan(
         let visible = committed
             .expect("fetch planning has a committed snapshot")
             .contains(metadata.reservation().batch_id);
+        check()?;
         if !visible {
             if mode == FetchMode::AsAvailable {
                 continue;
@@ -2150,10 +2294,13 @@ fn select_fetch_plan(
             break;
         }
         used = next;
+        check()?;
         selected[lane].push(metadata);
         merge_order.push(lane);
         selected_count += 1;
+        check()?;
     }
+    check()?;
     Ok(FetchSelection {
         by_shard: selected,
         merge_order,

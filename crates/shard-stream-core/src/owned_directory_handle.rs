@@ -14,6 +14,10 @@ use crate::{DirectoryOwnership, DirectoryOwnershipError};
 
 type Result<T> = std::result::Result<T, DirectoryOwnershipError>;
 
+#[path = "owned_directory_until.rs"]
+pub(crate) mod operation_until;
+pub use operation_until::{NativeDirectoryProgress, OwnedEntryKind, RetainedDirectoryError};
+
 /// Native file opening modes; none silently truncates an existing file.
 #[derive(Clone, Copy, Debug)]
 pub enum OwnedFileAccess {
@@ -363,6 +367,15 @@ fn validate_entry(parent: &File, name: &OsStr, file: &File, directory: bool) -> 
     // std MetadataExt widens dev_t differently on platforms such as Apple.
     let opened = fstat(file).map_err(io::Error::from)?;
     let named = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+    validate_entry_identity(&actual, &opened, &named, directory)
+}
+
+fn validate_entry_identity(
+    actual: &std::fs::Metadata,
+    opened: &rustix::fs::Stat,
+    named: &rustix::fs::Stat,
+    directory: bool,
+) -> Result<()> {
     if (directory && !actual.is_dir())
         || (!directory && !actual.is_file())
         || named.st_dev != opened.st_dev

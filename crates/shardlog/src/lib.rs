@@ -5,10 +5,12 @@
 mod api;
 #[allow(missing_docs)]
 mod codec;
+mod durability;
 #[allow(missing_docs)]
 mod error;
 #[allow(missing_docs)]
 mod extent;
+mod fetch_limits;
 #[allow(missing_docs)]
 mod journal;
 #[allow(missing_docs)]
@@ -22,6 +24,11 @@ pub use api::{
     ShardLog, ShardLogAppendReceipt, ShardLogCompactionReceipt, ShardLogConfig, ShardLogRecord,
     ShardLogResult,
 };
+pub use durability::{
+    RetainedStorageDurabilitySetupError, StorageDurabilityBudget, StorageDurabilityCost,
+    StorageDurabilityFailure, StorageDurabilityLimits, StorageDurabilityOperation,
+    StorageDurabilityOutcome, storage_durability_cost,
+};
 /// Error returned by ShardLog storage and recovery operations.
 pub use error::StorageError as ShardLogError;
 
@@ -29,10 +36,21 @@ pub use error::StorageError as ShardLogError;
 pub use error::{StorageError, StorageResult};
 #[cfg(unix)]
 pub use extent::ShardRecoveryGuard;
+#[cfg(unix)]
+pub use extent::{
+    AcquiredShardRecoveryGuard, RetainedShardGuardAcquireError, ShardGuardAcquireCost,
+    ShardGuardAcquireFailure, ShardGuardAcquireLimits, ShardGuardAcquireObservation,
+    shard_guard_acquire_cost,
+};
 #[doc(hidden)]
 pub use extent::{
     ExtentCatalogEntry, GarbageCollectionStats, PreparedExtent, SealedPack, ShardStore,
     ShardStoreConfig, StoredBatch, StoredBatchMetadata,
+};
+#[cfg(unix)]
+pub use extent::{
+    ShardGuardValidation, ShardGuardValidationCost, ShardGuardValidationError,
+    ShardGuardValidationFailure, ShardGuardValidationLimits, shard_guard_validation_cost,
 };
 #[doc(hidden)]
 pub use journal::{
@@ -70,4 +88,9 @@ pub use recovery_payload::{
     BorrowedRecoveryExtent, RecoveryExtentInspectionCost, RecoveryExtentInspectionError,
     RecoveryExtentInspectionLimits, inspect_recovery_extent_payload,
     recovery_extent_inspection_cost,
+};
+
+pub use fetch_limits::{
+    StorageFetchBudget, StorageFetchCost, StorageFetchFailure, StorageFetchLimits,
+    StorageFetchPlanError, StorageFetchReadError, StorageFetchUsage, storage_fetch_cost,
 };

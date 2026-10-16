@@ -58,6 +58,15 @@ pub(crate) fn append_command_charge(payload_bytes: usize, guarded: bool) -> Opti
 #[path = "worker_physical_admission_tests.rs"]
 mod physical_admission_tests;
 
+#[path = "worker_fetch.rs"]
+mod bounded_fetch;
+#[cfg(test)]
+pub(crate) use bounded_fetch::observe as observe_bounded_fetch;
+pub(crate) use bounded_fetch::{
+    BoundedFetchCompletion, DispatchError as BoundedFetchDispatchError,
+    PlanInput as BoundedFetchPlanInput, bounded_fetch_command_bytes,
+};
+
 mod proposal;
 pub(crate) use proposal::{ProposedAppendOutcome, ProposedAppendTicket};
 
@@ -168,6 +177,7 @@ pub(crate) enum FetchCompletion {
 // batch; queue memory is already bounded by slots and charged bytes.
 #[allow(clippy::large_enum_variant)]
 enum ShardCommand {
+    BoundedFetch(bounded_fetch::Command),
     Append(AppendCommand),
     ProposedAppend(Box<proposal::ProposedAppendCommand>),
     PlanFetch {
@@ -657,6 +667,7 @@ fn run_worker(
             continue;
         };
         match command {
+            ShardCommand::BoundedFetch(command) => bounded_fetch::execute(&mut stores, command),
             ShardCommand::Append(first) => {
                 let started = Instant::now();
                 let deadline = started + append_group_tuner.begin_group(started);
@@ -781,11 +792,16 @@ fn run_worker(
 fn retain_physical_charge(command: Budgeted<ShardCommand>) -> ShardCommand {
     if !matches!(&*command, ShardCommand::Append(append) if append.admission.is_some())
         && !matches!(&*command, ShardCommand::ProposedAppend(_))
+        && !matches!(&*command, ShardCommand::BoundedFetch(_))
     {
         return command.into_inner();
     }
     let (command, charge) = command.into_parts();
     match command {
+        ShardCommand::BoundedFetch(mut command) => {
+            command.byte_charge = Some(charge);
+            ShardCommand::BoundedFetch(command)
+        }
         ShardCommand::Append(mut command) => {
             if command.admission.is_some() {
                 command._byte_charge = Some(charge);

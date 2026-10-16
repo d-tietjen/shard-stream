@@ -5,6 +5,8 @@ mod directory_ownership;
 mod fencing;
 mod ids;
 #[cfg(unix)]
+mod native_directory_budget;
+#[cfg(unix)]
 mod owned_directory_handle;
 mod sequencer;
 mod topology;
@@ -27,7 +29,8 @@ pub use ids::{
 };
 #[cfg(unix)]
 pub use owned_directory_handle::{
-    OwnedDirectoryEntries, OwnedDirectoryHandle, OwnedFileAccess, OwnedFileHandle,
+    NativeDirectoryProgress, OwnedDirectoryEntries, OwnedDirectoryHandle, OwnedEntryKind,
+    OwnedFileAccess, OwnedFileHandle, RetainedDirectoryError,
 };
 pub use sequencer::{
     Placement, Reservation, ReservationProposal, SequencerError, SequencerState, TopicSequencer,
@@ -35,4 +38,10 @@ pub use sequencer::{
 pub use topology::{
     AssignmentProvider, BrokerDescriptor, ExtentDescriptor, PartitionAssignment, ReplicaProgress,
     SingleNodeAssignment,
+};
+
+#[cfg(unix)]
+pub use native_directory_budget::{
+    NativeDirectoryBudget, NativeDirectoryCost, NativeDirectoryFailure, NativeDirectoryLimits,
+    NativeDirectoryUsage, native_directory_cost,
 };

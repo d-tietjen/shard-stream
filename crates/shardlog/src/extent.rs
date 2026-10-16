@@ -20,6 +20,31 @@ use crate::codec::{Decoder, push_u32, push_u64, push_u128};
 use crate::journal::{AtomicGroupSequence, DIGEST_XXH3_128, ProducerSequence};
 use crate::{StorageError, StorageResult};
 
+#[path = "extent_durability.rs"]
+mod durability;
+#[cfg(test)]
+#[path = "extent_durability_tests.rs"]
+mod durability_tests;
+#[path = "extent_fetch.rs"]
+mod fetch;
+#[cfg(unix)]
+#[path = "guard_acquire.rs"]
+mod guard_acquire;
+#[cfg(unix)]
+pub use guard_acquire::{
+    AcquiredShardRecoveryGuard, RetainedShardGuardAcquireError, ShardGuardAcquireCost,
+    ShardGuardAcquireFailure, ShardGuardAcquireLimits, ShardGuardAcquireObservation,
+    shard_guard_acquire_cost,
+};
+#[cfg(unix)]
+#[path = "guard_validation.rs"]
+mod guard_validation;
+#[cfg(unix)]
+pub use guard_validation::{
+    ShardGuardValidation, ShardGuardValidationCost, ShardGuardValidationError,
+    ShardGuardValidationFailure, ShardGuardValidationLimits, shard_guard_validation_cost,
+};
+
 const EXTENT_MAGIC: &[u8; 4] = b"SSE8";
 const EXTENT_VERSION: u8 = 8;
 const EXTENT_FLAGS: u8 = 0;
@@ -297,15 +322,9 @@ impl ShardRecoveryGuard {
 
     /// Checks the same concrete lease against the native directory/lock path.
     pub fn validate(&self, directory: &Path) -> StorageResult<()> {
-        use std::os::unix::fs::MetadataExt;
         let named = fs::symlink_metadata(directory.join(".shard-store.lock"))?;
         let actual = self.file.metadata()?;
-        if directory != self.directory
-            || !named.is_file()
-            || named.file_type().is_symlink()
-            || actual.dev() != named.dev()
-            || actual.ino() != named.ino()
-        {
+        if guard_validation::identity_changed(self, directory, &named, &actual) {
             return Err(StorageError::InvalidInput(
                 "shard recovery lease identity changed".into(),
             ));
@@ -905,104 +924,6 @@ impl ShardStore {
         Ok(self.read_fetch_plan(&[planned])?.pop())
     }
 
-    pub fn plan_fetch(
-        &self,
-        topic_partition: TopicPartition,
-        start_offset: LogicalOffset,
-        max_bytes: usize,
-        max_batches: usize,
-    ) -> StorageResult<Vec<StoredBatchMetadata>> {
-        if max_bytes == 0 || max_batches == 0 {
-            return Err(StorageError::InvalidInput(
-                "fetch byte and batch limits must be nonzero".into(),
-            ));
-        }
-        let Some(locations) = self.index.get(&topic_partition) else {
-            return Ok(Vec::new());
-        };
-
-        let first =
-            locations.partition_point(|location| location.reservation.last_offset < start_offset);
-        let capacity = FETCH_PLAN_INITIAL_CAPACITY
-            .min(max_batches)
-            .min(locations.len().saturating_sub(first));
-        let mut result = Vec::with_capacity(capacity);
-        let mut used = 0usize;
-        for location in &locations[first..] {
-            if result.len() == max_batches {
-                break;
-            }
-            let next = used
-                .checked_add(location.payload_len)
-                .ok_or_else(|| StorageError::LimitExceeded("fetch byte count overflow".into()))?;
-            if !result.is_empty() && next > max_bytes {
-                break;
-            }
-            result.push(self.metadata_for(location));
-            used = next;
-        }
-        Ok(result)
-    }
-
-    pub fn read_fetch_plan(
-        &mut self,
-        planned: &[StoredBatchMetadata],
-    ) -> StorageResult<Vec<StoredBatch>> {
-        if planned.iter().any(|metadata| {
-            metadata.store_token != self.store_token || metadata.plan_epoch != self.plan_epoch
-        }) {
-            return Err(StorageError::InvalidInput(
-                "fetch plan does not belong to the current store generation".into(),
-            ));
-        }
-        let mut result = Vec::with_capacity(planned.len());
-        let mut first = 0usize;
-        while first < planned.len() {
-            let mut end = first + 1;
-            let mut range_end = payload_end(&planned[first])?;
-            while end < planned.len() {
-                let next = planned[end];
-                if next.pack_sequence != planned[first].pack_sequence
-                    || next.payload_offset < range_end
-                    || next.payload_offset - range_end > MAX_COALESCED_READ_GAP
-                {
-                    break;
-                }
-                range_end = payload_end(&next)?;
-                end += 1;
-            }
-
-            let range_start = planned[first].payload_offset;
-            let range_len = usize::try_from(range_end - range_start)
-                .map_err(|_| StorageError::LimitExceeded("fetch range exceeds usize".into()))?;
-            let reader = self.open_pack_reader(planned[first].pack_sequence)?;
-            let mut buffer = self.read_buffer_pool.take(range_len);
-            if let Err(error) = read_exact_at(&reader, &mut buffer, range_start) {
-                self.read_buffer_pool.recycle_now(buffer);
-                return Err(error.into());
-            }
-            let buffer = self.read_buffer_pool.lease_bytes(buffer);
-
-            for metadata in &planned[first..end] {
-                let payload_start = usize::try_from(metadata.payload_offset - range_start)
-                    .map_err(|_| {
-                        StorageError::LimitExceeded("payload offset exceeds usize".into())
-                    })?;
-                let payload_end = payload_start
-                    .checked_add(metadata.payload_len)
-                    .ok_or_else(|| StorageError::LimitExceeded("payload range overflow".into()))?;
-                result.push(StoredBatch {
-                    reservation: metadata.reservation,
-                    producer: metadata.producer,
-                    atomic_group: metadata.atomic_group,
-                    payload: buffer.slice(payload_start..payload_end),
-                });
-            }
-            first = end;
-        }
-        Ok(result)
-    }
-
     pub fn fetch(
         &mut self,
         topic_partition: TopicPartition,
@@ -1323,36 +1244,6 @@ impl ShardStore {
             .ok_or_else(|| StorageError::InvalidInput("planned pack is missing".into()))?;
         Ok(OpenOptions::new().read(true).open(path)?)
     }
-}
-
-fn payload_end(metadata: &StoredBatchMetadata) -> StorageResult<u64> {
-    metadata
-        .payload_offset
-        .checked_add(
-            u64::try_from(metadata.payload_len)
-                .map_err(|_| StorageError::LimitExceeded("payload length exceeds u64".into()))?,
-        )
-        .ok_or_else(|| StorageError::LimitExceeded("payload end overflow".into()))
-}
-
-fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> std::io::Result<()> {
-    while !buffer.is_empty() {
-        match file.read_at(buffer, offset)? {
-            0 => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "planned extent ended before its payload",
-                ));
-            }
-            read => {
-                offset = offset
-                    .checked_add(read as u64)
-                    .ok_or_else(|| std::io::Error::other("read offset overflow"))?;
-                buffer = &mut buffer[read..];
-            }
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug)]

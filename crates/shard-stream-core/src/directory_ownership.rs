@@ -1,5 +1,9 @@
 //! Exclusive, cooperating-process custody of an engine's local directory.
 
+#[cfg(unix)]
+#[path = "directory_root_until.rs"]
+mod root_until;
+
 #[path = "directory_validation_until.rs"]
 mod validation_until;
 pub use validation_until::{DirectoryOwnershipUntilError, DirectoryValidationCost};

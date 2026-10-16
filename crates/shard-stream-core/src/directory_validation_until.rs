@@ -112,11 +112,94 @@ fn clock(expiry: Instant) -> Result<(), DirectoryOwnershipUntilError> {
     Ok(())
 }
 
+// Both entries use the same native phases. The original entry keeps its
+// deadline-first error precedence; carried work preserves a completed native
+// failure in its same budget before the post-call deadline observation.
+trait ValidationChecks {
+    fn check(&self) -> Result<(), DirectoryOwnershipUntilError>;
+    fn completed<T>(
+        &self,
+        observed: Result<T, DirectoryOwnershipError>,
+    ) -> Result<T, DirectoryOwnershipUntilError>;
+    fn completed_optional<T>(
+        &self,
+        observed: Result<T, DirectoryOwnershipError>,
+    ) -> Result<Option<T>, DirectoryOwnershipUntilError>;
+}
+
+struct OriginalChecks(Instant);
+impl ValidationChecks for OriginalChecks {
+    fn check(&self) -> Result<(), DirectoryOwnershipUntilError> {
+        clock(self.0)
+    }
+    fn completed<T>(
+        &self,
+        observed: Result<T, DirectoryOwnershipError>,
+    ) -> Result<T, DirectoryOwnershipUntilError> {
+        self.check()?;
+        observed.map_err(Into::into)
+    }
+    fn completed_optional<T>(
+        &self,
+        observed: Result<T, DirectoryOwnershipError>,
+    ) -> Result<Option<T>, DirectoryOwnershipUntilError> {
+        self.check()?;
+        match observed {
+            Err(DirectoryOwnershipError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            observed => observed.map(Some).map_err(Into::into),
+        }
+    }
+}
+
+#[cfg(unix)]
+struct BudgetChecks<'a> {
+    budget: &'a crate::NativeDirectoryBudget,
+    refusal: std::cell::RefCell<Option<crate::NativeDirectoryFailure>>,
+}
+#[cfg(unix)]
+impl BudgetChecks<'_> {
+    fn retain<T>(
+        &self,
+        observed: Result<T, crate::NativeDirectoryFailure>,
+    ) -> Result<T, DirectoryOwnershipUntilError> {
+        observed.map_err(|error| {
+            *self.refusal.borrow_mut() = Some(error);
+            DirectoryOwnershipUntilError::Capacity
+        })
+    }
+}
+#[cfg(unix)]
+impl ValidationChecks for BudgetChecks<'_> {
+    fn check(&self) -> Result<(), DirectoryOwnershipUntilError> {
+        self.retain(self.budget.check())
+    }
+    fn completed<T>(
+        &self,
+        observed: Result<T, DirectoryOwnershipError>,
+    ) -> Result<T, DirectoryOwnershipUntilError> {
+        self.retain(self.budget.completed(observed))
+    }
+    fn completed_optional<T>(
+        &self,
+        observed: Result<T, DirectoryOwnershipError>,
+    ) -> Result<Option<T>, DirectoryOwnershipUntilError> {
+        self.retain(self.budget.completed_optional(observed))
+    }
+}
+
 #[cfg(unix)]
 macro_rules! completed {
     ($owner:expr, $phase:ident) => {
         #[cfg(test)]
         tests::completed($owner, tests::Phase::$phase);
+        #[cfg(test)]
+        crate::owned_directory_handle::operation_until::completed_native_root_phase(stringify!(
+            $phase
+        ));
     };
 }
 
@@ -229,7 +312,38 @@ impl DirectoryOwnership {
         directory: &Path,
         original_expiry: Instant,
     ) -> Result<(), DirectoryOwnershipUntilError> {
-        clock(original_expiry)?;
+        self.validate_directory_checked(directory, &OriginalChecks(original_expiry))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn validate_directory_with_budget(
+        &self,
+        directory: &Path,
+        budget: &crate::NativeDirectoryBudget,
+    ) -> Result<(), crate::NativeDirectoryFailure> {
+        // Keep the genuine native failure type even though the shared original
+        // validator has the existing public error type. No native policy or
+        // physical operation is copied into this adapter.
+        let bytes = size_of::<BudgetChecks<'_>>();
+        budget.charge(0, 0, bytes, 0, 1, bytes)?;
+        let checks = BudgetChecks {
+            budget,
+            refusal: std::cell::RefCell::new(None),
+        };
+        let observed = self.validate_directory_checked(directory, &checks);
+        let observed = match checks.refusal.into_inner() {
+            Some(error) => Err(error),
+            None => observed.map_err(crate::NativeDirectoryFailure::from),
+        };
+        budget.finish(observed)
+    }
+
+    fn validate_directory_checked(
+        &self,
+        directory: &Path,
+        check: &impl ValidationChecks,
+    ) -> Result<(), DirectoryOwnershipUntilError> {
+        check.check()?;
         self.directory_validation_cost(directory)?;
         #[cfg(not(unix))]
         {
@@ -237,68 +351,63 @@ impl DirectoryOwnership {
         }
         #[cfg(unix)]
         {
-            clock(original_expiry)?;
+            check.check()?;
             let metadata = fs::symlink_metadata(directory);
             completed!(self, PathMetadata);
-            clock(original_expiry)?;
-            let metadata = metadata.map_err(DirectoryOwnershipError::from)?;
+            let metadata = check.completed(metadata.map_err(DirectoryOwnershipError::from))?;
             for ancestor in directory
                 .ancestors()
                 .filter(|path| !path.as_os_str().is_empty())
             {
-                clock(original_expiry)?;
+                check.check()?;
                 let observed = fs::symlink_metadata(ancestor);
                 completed!(self, AncestorMetadata);
-                clock(original_expiry)?;
-                let observed = match observed {
-                    Ok(value) => value,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(DirectoryOwnershipError::from(error).into()),
+                let observed = match check
+                    .completed_optional(observed.map_err(DirectoryOwnershipError::from))?
+                {
+                    Some(value) => value,
+                    None => continue,
                 };
                 if !observed.is_dir() || observed.file_type().is_symlink() {
                     return Err(DirectoryOwnershipError::IdentityMismatch.into());
                 }
             }
             completed!(self, AncestorsValidated);
-            clock(original_expiry)?;
+            check.check()?;
             if !metadata.is_dir()
                 || metadata.file_type().is_symlink()
                 || FileIdentity::of(&metadata) != self.directory_identity
             {
                 return Err(DirectoryOwnershipError::IdentityMismatch.into());
             }
-            clock(original_expiry)?;
+            check.check()?;
             let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
             let root = openat(CWD, "/", flags, Mode::empty());
             completed!(self, DirectoryOpened);
-            clock(original_expiry)?;
-            let mut resolved = root.map_err(native_error)?;
+            let mut resolved = check.completed(root.map_err(native_ownership_error))?;
             for component in directory.components() {
                 let name = match component {
                     Component::RootDir => continue,
                     Component::Normal(name) => name,
                     _ => return Err(DirectoryOwnershipError::IdentityMismatch.into()),
                 };
-                clock(original_expiry)?;
+                check.check()?;
                 let next = openat(&resolved, name, flags, Mode::empty());
                 completed!(self, DirectoryOpened);
-                clock(original_expiry)?;
                 // The parent remains open through the actual child operation.
                 // On a late/error return both temporary descriptors are cleaned
                 // up while the borrowed original owner remains held.
-                resolved = next.map_err(native_error)?;
-                clock(original_expiry)?;
+                resolved = check.completed(next.map_err(native_ownership_error))?;
+                check.check()?;
             }
-            clock(original_expiry)?;
+            check.check()?;
             let opened = fstat(&resolved);
             completed!(self, OpenedMetadata);
-            clock(original_expiry)?;
-            let opened = opened.map_err(native_error)?;
-            clock(original_expiry)?;
+            let opened = check.completed(opened.map_err(native_ownership_error))?;
+            check.check()?;
             let retained = fstat(&self._directory);
             completed!(self, RetainedDirectoryMetadata);
-            clock(original_expiry)?;
-            let retained = retained.map_err(native_error)?;
+            let retained = check.completed(retained.map_err(native_ownership_error))?;
             // Both values use the SAME native stat types on every Unix target.
             if FileType::from_raw_mode(opened.st_mode) != FileType::Directory
                 || opened.st_dev != retained.st_dev
@@ -306,16 +415,14 @@ impl DirectoryOwnership {
             {
                 return Err(DirectoryOwnershipError::IdentityMismatch.into());
             }
-            clock(original_expiry)?;
+            check.check()?;
             let named = statat(&resolved, LOCK_NAME, AtFlags::SYMLINK_NOFOLLOW);
             completed!(self, LockMetadata);
-            clock(original_expiry)?;
-            let named = named.map_err(native_error)?;
-            clock(original_expiry)?;
+            let named = check.completed(named.map_err(native_ownership_error))?;
+            check.check()?;
             let retained = fstat(&self._lock);
             completed!(self, RetainedLockMetadata);
-            clock(original_expiry)?;
-            let retained = retained.map_err(native_error)?;
+            let retained = check.completed(retained.map_err(native_ownership_error))?;
             if FileType::from_raw_mode(named.st_mode) != FileType::RegularFile
                 || named.st_nlink != 1
                 || retained.st_nlink != 1
@@ -324,14 +431,14 @@ impl DirectoryOwnership {
             {
                 return Err(DirectoryOwnershipError::IdentityMismatch.into());
             }
-            clock(original_expiry)
+            check.check()
         }
     }
 }
 
 #[cfg(unix)]
-fn native_error(error: rustix::io::Errno) -> DirectoryOwnershipUntilError {
-    DirectoryOwnershipError::from(io::Error::from(error)).into()
+fn native_ownership_error(error: rustix::io::Errno) -> DirectoryOwnershipError {
+    DirectoryOwnershipError::from(io::Error::from(error))
 }
 
 #[cfg(all(test, unix))]

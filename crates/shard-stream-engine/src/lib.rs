@@ -35,9 +35,10 @@ pub use durable_sink::{
 pub use engine::{OwnedEngineOpenError, OwnedRecoveredEngine};
 
 pub use engine::{
-    AtomicGroupInspection, AtomicGroupState, FetchedBatch, PartitionEpochs, PartitionWatermarks,
-    ProducerProgress, ReplicationProgress, ReplicationStats, ReplicationTicket,
-    ReplicationTransport, RetentionGuard, StreamEngine,
+    AtomicGroupInspection, AtomicGroupState, FetchedBatch, NativeFetchCost, NativeFetchFailure,
+    NativeFetchLimits, NativeFetchResult, PartitionEpochs, PartitionWatermarks, ProducerProgress,
+    ReplicationProgress, ReplicationStats, ReplicationTicket, ReplicationTransport,
+    RetainedNativeFetchError, RetentionGuard, StreamEngine, native_fetch_cost,
 };
 pub use engine_handle::{EngineHandle, WeakEngineHandle};
 pub use error::{EngineError, EngineResult};
@@ -67,3 +68,6 @@ pub use recovery_archived::{
     NativeArchivedSourceError, NativeArchivedSourceLimits, UnverifiedNativeArchivedSource,
     inspect_archived_native_source, native_archived_source_inspection_cost,
 };
+
+/// Actual cumulative native fetch debit facts, without resource/serving admission.
+pub use shardlog::StorageFetchUsage as NativeFetchUsage;
