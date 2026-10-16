@@ -18,6 +18,14 @@ type Result<T> = std::result::Result<T, DirectoryOwnershipError>;
 pub(crate) mod operation_until;
 pub use operation_until::{NativeDirectoryProgress, OwnedEntryKind, RetainedDirectoryError};
 
+#[path = "owned_file_replacement.rs"]
+mod file_replacement;
+pub use file_replacement::{
+    NativeFileIdentity, NativeFileReplacement, NativeFileReplacementCost,
+    NativeFileReplacementFailure, NativeFileReplacementLimits, NativeFileReplacementOutcome,
+    NativeFileReplacementPhase, RetainedNativeFileReplacementError, native_file_replacement_cost,
+};
+
 /// Native file opening modes; none silently truncates an existing file.
 #[derive(Clone, Copy, Debug)]
 pub enum OwnedFileAccess {

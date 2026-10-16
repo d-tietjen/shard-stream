@@ -711,3 +711,50 @@ parent-directory validation, native store opening/repair and serving permission
 remain separate requirements. The genuine lock contention, late native phases,
 one-less-call, changed-name and public cleanup test sources have not been
 compiled or executed.
+
+### Retained native atomic file replacement
+
+`OwnedDirectoryHandle::replace_file_until` creates a new literal temporary file
+in the same retained parent, writes an already-encoded body in finite physical
+attempts, flushes and synchronizes that file, validates its actual identity,
+performs descriptor-relative replacement `renameat`, then synchronizes the same
+actual parent. The existing `NativeDirectoryBudget` supplies cumulative native
+fees and its original/minimum deadline inside recursive validation and each
+physical phase. No pathname-based reopen or ordinary unbounded file writer is
+hidden inside the producer. A caller supplies a bounded unique temporary name;
+an unrecognized existing temporary is refused and preserved.
+
+Every actual write/metadata/flush/sync/rename result is retained before the next
+clock check. Write attempt limits include short writes and Interrupted results;
+one write requests at most the configured chunk size. The encoded input body,
+original names, observed device/inode facts, actual file and same original root
+survive in `NativeFileReplacement` or `RetainedNativeFileReplacementError`.
+The descriptor's retained name changes only when actual rename returns success.
+No failed temporary or destination is automatically unlinked, and an error does
+not claim rollback. Pre-entry refusal retains the input and root without
+allocating the entered producer or entering filesystem work.
+
+Before rename, both rename and parent synchronization are prepaid. If actual
+rename succeeds after the minimum deadline, the producer physically completes
+that already-admitted parent synchronization before reporting refusal. Its raw
+rename and synchronization outcomes remain available, including known changed
+namespace effects on late/error paths. This physical settlement supplies no
+fresh deadline or permission to publish a recovered state.
+
+The actual carrier remains outside the producer's unwind boundary. A native
+phase panic denies the same budget first and retains its original panic payload,
+file, raw outcomes and encoded body. If a rename was entered without a saved
+result, its namespace effect remains uncertain. The already-prepaid parent sync
+settles once after a successful or uncertain entered rename, without a cleanup
+callback or a new clock/admission. An already-entered parent sync is never
+retried. A cleanup unwind retains its own payload and unfinished-phase fact;
+it cannot be presented as a completed native result.
+
+`native_file_replacement_cost` covers producer values, retained input capacity,
+name buffers/native conversions and configured raw outcome slots. Recursive
+native open/validation and each entered call spend the same directory budget
+separately. These are source-visible logical costs; allocator/kernel/RSS and
+performance measurements remain required. Serialization, content validation,
+source census comparison and consuming HLC recovery remain separate required
+work under the original deadline. The nine genuine filesystem regression
+groups are uncompiled and unexecuted pending normal native validation.

@@ -32,6 +32,12 @@ pub use owned_directory_handle::{
     NativeDirectoryProgress, OwnedDirectoryEntries, OwnedDirectoryHandle, OwnedEntryKind,
     OwnedFileAccess, OwnedFileHandle, RetainedDirectoryError,
 };
+#[cfg(unix)]
+pub use owned_directory_handle::{
+    NativeFileIdentity, NativeFileReplacement, NativeFileReplacementCost,
+    NativeFileReplacementFailure, NativeFileReplacementLimits, NativeFileReplacementOutcome,
+    NativeFileReplacementPhase, RetainedNativeFileReplacementError, native_file_replacement_cost,
+};
 pub use sequencer::{
     Placement, Reservation, ReservationProposal, SequencerError, SequencerState, TopicSequencer,
 };
