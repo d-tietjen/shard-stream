@@ -394,3 +394,21 @@ the ordinary decoder's checksum/range refusals, exact/one-less cost limits and
 the original saved expiry. They have not been compiled or executed in this
 source unit; formatting, type checks and full composition qualification remain
 separate required work.
+
+## Native extent sizing through the engine
+
+The engine also re-exports shardlog's actual `RECOVERY_EXTENT_PREFIX_BYTES` and
+`recovery_extent_frame_bytes`. A composing host can read that fixed prefix from
+its retained `NativeRecoveryCensus`, use the native helper to validate and size
+the complete frame, then read exactly that frame through the same census before
+calling `inspect_recovery_extent_payload`. It need not infer native header or
+checksum offsets from payload length.
+
+The composing host must admit prefix inspection and any bounded native
+diagnostic allocation into its existing cumulative allowance, check its saved
+absolute expiry before and after the helper, and bound the returned size before
+the complete read. The census separately charges both actual reads. These are
+the original native constant and function, with unchanged acceptance; they do
+not acquire storage custody, establish body lineage or completeness, renew a
+budget or expiry, or confer permission to publish a leader term. Full native and
+composition qualification remains required.
