@@ -38,6 +38,11 @@ pub use owned_directory_handle::{
     NativeFileReplacementFailure, NativeFileReplacementLimits, NativeFileReplacementOutcome,
     NativeFileReplacementPhase, RetainedNativeFileReplacementError, native_file_replacement_cost,
 };
+#[cfg(unix)]
+pub use owned_directory_handle::{
+    OwnedShardDirectory, OwnedShardDirectoryCost, OwnedShardDirectoryFailure,
+    RetainedOwnedShardDirectoryError, owned_shard_directory_cost,
+};
 pub use sequencer::{
     Placement, Reservation, ReservationProposal, SequencerError, SequencerState, TopicSequencer,
 };

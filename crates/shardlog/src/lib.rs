@@ -49,6 +49,12 @@ pub use extent::{
 };
 #[cfg(unix)]
 pub use extent::{
+    PinnedShardDirectory, PinnedShardDirectoryCost, PinnedShardDirectoryError,
+    PinnedShardDirectoryFailure, PinnedShardDirectoryLimits, PinnedShardDirectoryObservation,
+    ShardDirectoryCheckFailure, ShardDirectoryChecks, pinned_shard_directory_cost,
+};
+#[cfg(unix)]
+pub use extent::{
     ShardGuardValidation, ShardGuardValidationCost, ShardGuardValidationError,
     ShardGuardValidationFailure, ShardGuardValidationLimits, shard_guard_validation_cost,
 };

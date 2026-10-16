@@ -26,6 +26,13 @@ pub use file_replacement::{
     NativeFileReplacementPhase, RetainedNativeFileReplacementError, native_file_replacement_cost,
 };
 
+#[path = "owned_shard_directory.rs"]
+mod shard_directory;
+pub use shard_directory::{
+    OwnedShardDirectory, OwnedShardDirectoryCost, OwnedShardDirectoryFailure,
+    RetainedOwnedShardDirectoryError, owned_shard_directory_cost,
+};
+
 /// Native file opening modes; none silently truncates an existing file.
 #[derive(Clone, Copy, Debug)]
 pub enum OwnedFileAccess {

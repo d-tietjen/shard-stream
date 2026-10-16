@@ -28,6 +28,15 @@ mod durability_tests;
 #[path = "extent_fetch.rs"]
 mod fetch;
 #[cfg(unix)]
+#[path = "pinned_directory.rs"]
+mod pinned_directory;
+#[cfg(unix)]
+pub use pinned_directory::{
+    PinnedShardDirectory, PinnedShardDirectoryCost, PinnedShardDirectoryError,
+    PinnedShardDirectoryFailure, PinnedShardDirectoryLimits, PinnedShardDirectoryObservation,
+    ShardDirectoryCheckFailure, ShardDirectoryChecks, pinned_shard_directory_cost,
+};
+#[cfg(unix)]
 #[path = "guard_acquire.rs"]
 mod guard_acquire;
 #[cfg(unix)]

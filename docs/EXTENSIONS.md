@@ -758,3 +758,36 @@ performance measurements remain required. Serialization, content validation,
 source census comparison and consuming HLC recovery remain separate required
 work under the original deadline. The nine genuine filesystem regression
 groups are uncompiled and unexecuted pending normal native validation.
+
+### Retained native shard-directory handoff
+
+`OwnedDirectoryHandle::pin_shard_directory_until` derives a descriptor clone
+from the actual retained Core directory and joins it to an already acquired
+`AcquiredShardRecoveryGuard`. Recursive Core validation and the native
+`PinnedShardDirectory` producer use the SAME cumulative directory budget and
+minimum original deadline. The native producer compares real directory
+metadata and the acquired lock's descriptor identity with the no-follow lock
+name observed relative to that actual directory FD. It enters at most four
+native metadata/stat calls. No arbitrary descriptor and claimed Core owner pair
+is accepted by the Core bridge.
+
+Each actual clone/metadata/stat result is saved before its post-call checkpoint.
+Early refusal retains the original input guard and Core parent without entered
+allocation or I/O. Late, identity, I/O and unwind refusals retain all actual
+partial results, descriptors, lock, original root and original panic payload;
+the Core bridge denies the same budget before returning cleanup custody. Neither
+success nor refusal exposes a raw descriptor or guard extraction API. Successful
+custody contains no Session or permanently retained startup work budget.
+
+The cost helpers describe fixed source values, configured native-call slots
+and pathname conversion ceilings. The Core bridge prepays its descriptor clone
+and native observation values, including an independent retained bridge panic
+slot alongside the native producer's panic slot. Recursive Core validations
+spend their own fees on that same budget. Allocator/kernel/RSS measurements remain
+separate gates.
+This handoff establishes physical directory custody only. Actual native store
+opening, repair, codec work, appending and garbage collection still require
+their bounded producers. Ten genuine filesystem regression groups are saved
+for identity substitution, exact and one-less fees, real native errors, tighter
+checkpoints, phase unwinds and final-owner cleanup; they remain uncompiled and
+unexecuted.
