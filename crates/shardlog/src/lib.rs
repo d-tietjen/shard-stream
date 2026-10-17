@@ -20,6 +20,11 @@ mod recovery_payload;
 #[allow(missing_docs)]
 mod tier;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use api::{
+    OpenedPinnedShardLog, PinnedShardLogOpenChecks, PinnedShardLogOpenError,
+    PinnedShardLogOpenFailure, PinnedShardLogOpenObservation, pinned_shard_log_open_cost,
+};
 pub use api::{
     ShardLog, ShardLogAppendReceipt, ShardLogCompactionReceipt, ShardLogConfig, ShardLogRecord,
     ShardLogResult,

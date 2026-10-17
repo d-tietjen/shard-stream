@@ -87,3 +87,39 @@ groups cover existing and newly installed topics, immutable generous policies,
 and labeled downward-only exact/one-less fee injection with actual written
 frames, partial index effects and same-FD settlement retained. All 21 groups
 remain source only, uncompiled and unexecuted.
+
+## Consuming canonical log inspection (source implementation)
+
+On Linux and Android, `OpenedPinnedShardStore::into_shard_log_until` consumes
+the actual opened native carrier. It returns an `OpenedPinnedShardLog` with the
+observed canonical half-open sequence range. A refused conversion retains the
+whole original store, validated sequence prefix, last reservation, actual
+allocation/canonical results and unwind payloads. Neither result exposes the
+original store, pin, raw parts or file descriptors. The caller keeps the genuine
+native pin and composing directory owner until all returned values are dropped.
+
+The composing owner prepays `pinned_shard_log_open_cost` before constructing the
+supplied cumulative `StorageFetchBudget`. The conversion pays the actual table
+capacity scan and selected sequence/sort work before traversal or allocation.
+Its canonical stream and contiguity rules are shared with ordinary `ShardLog`.
+Actual results are retained before postchecks; refusal denies the same native
+counters and mandatory composing checks before releasing the store. Budget and
+checkpoint callbacks are borrowed for this conversion and are not stored for
+later operations. Costs describe source-visible/requested storage and logical
+work, excluding allocator internals, kernel storage and RSS.
+
+Eleven genuine filesystem regression groups cover ordinary bounds/bytes parity,
+foreign and gapped history, exact and one-less cumulative fees, sparse table
+capacity, late completed bounds, unwind/denial and actual lease custody. They
+remain uncompiled and unexecuted. This constructor provides no bounded log
+read, append, seal, sync or compaction API, Core handoff, complete recovery or
+serving authority; those composed operations require separate implementation
+and validation.
+
+The fixed native debit separately names each retained typed result, sequence
+header, three panic payload headers, the diagnostic String header and its
+separate buffer entry. The plain composing cost and the same inner native
+counters use this coherent inventory. An actual sixteen-record history succeeds
+with a generous finite policy and refuses an independently configured 22-entry
+policy before catalog allocation or inspection. This is a small accounting
+regression fixture; it provides no whole-startup or production-cap qualification.

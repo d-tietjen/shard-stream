@@ -946,6 +946,24 @@ impl ShardStore {
         self.by_batch.len()
     }
 
+    /// Actual table shape and source-visible fee for one complete values scan.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn log_catalog_shape(&self) -> Option<(usize, usize, usize)> {
+        let width = size_of::<((TopicPartition, BatchId), ExtentLocation)>().max(1);
+        let scan = self
+            .by_batch
+            .capacity()
+            .checked_add(1)?
+            .checked_mul(width)?;
+        Some((self.by_batch.len(), self.by_batch.capacity(), scan))
+    }
+
+    /// Borrow actual reservations after the caller pays the complete table scan.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn log_catalog_reservations(&self) -> impl Iterator<Item = Reservation> + '_ {
+        self.by_batch.values().map(|location| location.reservation)
+    }
+
     #[must_use]
     pub fn catalog(&self) -> Vec<ExtentCatalogEntry> {
         let mut entries = self

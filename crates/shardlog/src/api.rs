@@ -7,6 +7,15 @@ use bytes::Bytes;
 #[path = "api_durability.rs"]
 mod durability;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[path = "api_pinned.rs"]
+mod pinned;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use pinned::{
+    OpenedPinnedShardLog, PinnedShardLogOpenChecks, PinnedShardLogOpenError,
+    PinnedShardLogOpenFailure, PinnedShardLogOpenObservation, pinned_shard_log_open_cost,
+};
+
 use crate::{
     BatchId, LeaderEpoch, LogicalOffset, LogicalPartitionId, Placement, PlacementSequence,
     Reservation, RingEpoch, ShardId, ShardStore, ShardStoreConfig, StorageError, TopicId,
@@ -16,6 +25,10 @@ use crate::{
 const SHARDLOG_TOPIC_ID: TopicId = TopicId::new(0x5348_4152_444c_4f47_5f56_3100);
 const SHARDLOG_PARTITION_ID: LogicalPartitionId = LogicalPartitionId::new(0);
 const SHARDLOG_SHARD_ID: ShardId = ShardId::new(0);
+const CANONICAL_STREAM_DIAGNOSTIC: &str =
+    "ShardLog directory contains records outside its canonical stream";
+const RETAINED_GAP_DIAGNOSTIC: &str = "ShardLog retained sequence contains a gap";
+const SEQUENCE_OVERFLOW_DIAGNOSTIC: &str = "ShardLog sequence or byte count overflow";
 
 /// Result type returned by ShardLog operations.
 pub type ShardLogResult<T> = Result<T, StorageError>;
@@ -111,22 +124,7 @@ impl ShardLog {
             .into_iter()
             .map(|entry| validate_catalog_entry(entry.reservation))
             .collect::<ShardLogResult<Vec<_>>>()?;
-        if sequences.is_empty() {
-            return Ok(None);
-        }
-        sequences.sort_unstable();
-        for pair in sequences.windows(2) {
-            if pair[1] != pair[0].checked_add(1).ok_or_else(sequence_overflow)? {
-                return Err(StorageError::InvalidInput(
-                    "ShardLog retained sequence contains a gap".to_string(),
-                ));
-            }
-        }
-        let first = sequences[0];
-        let next = sequences[sequences.len() - 1]
-            .checked_add(1)
-            .ok_or_else(sequence_overflow)?;
-        Ok(Some((first, next)))
+        retained_bounds(&mut sequences)
     }
 
     /// Appends a contiguous record group.
@@ -260,12 +258,32 @@ fn validate_catalog_entry(reservation: Reservation) -> ShardLogResult<u64> {
         || reservation.first_offset != reservation.last_offset
     {
         return Err(StorageError::InvalidInput(
-            "ShardLog directory contains records outside its canonical stream".to_string(),
+            CANONICAL_STREAM_DIAGNOSTIC.to_string(),
         ));
     }
     Ok(reservation.first_offset.get())
 }
 
 fn sequence_overflow() -> StorageError {
-    StorageError::LimitExceeded("ShardLog sequence or byte count overflow".to_string())
+    StorageError::LimitExceeded(SEQUENCE_OVERFLOW_DIAGNOSTIC.to_string())
+}
+
+/// Shared canonical sequence policy for ordinary and pinned log adoption.
+fn retained_bounds(sequences: &mut [u64]) -> ShardLogResult<Option<(u64, u64)>> {
+    if sequences.is_empty() {
+        return Ok(None);
+    }
+    sequences.sort_unstable();
+    for pair in sequences.windows(2) {
+        if pair[1] != pair[0].checked_add(1).ok_or_else(sequence_overflow)? {
+            return Err(StorageError::InvalidInput(
+                RETAINED_GAP_DIAGNOSTIC.to_string(),
+            ));
+        }
+    }
+    let first = sequences[0];
+    let next = sequences[sequences.len() - 1]
+        .checked_add(1)
+        .ok_or_else(sequence_overflow)?;
+    Ok(Some((first, next)))
 }
