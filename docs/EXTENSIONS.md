@@ -928,3 +928,56 @@ method constructs custody or serving permission, changes limits, refunds fees or
 renews the original/minimum deadline. Three additional genuine filesystem groups
 cover shared reservations, exact/one-over admission and denial/minimum-expiry
 refusal before native reentry; they remain uncompiled and unexecuted.
+
+### Consuming Core append and seal
+
+`OwnedPinnedShardStore::append_group_until` and `seal_active_until` consume the
+whole actual Core store and call the genuine pinned native append/rotation
+producer. `OwnedPinnedShardAppendLimits` bounds the original input Vec capacity
+separately from its length and carries the actual native configured maxima.
+The store and actual input Vec are retained before any cost, clock or unwind
+boundary. The Core bridge checks capacity in constant time, prepays the actual
+capacity times the input-slot size plus the full retained payload ceiling, and
+then checks each original payload length under that same prepaid work. Native
+header, receipt, container, error, physical-result and panic maxima are also
+prepaid. Hidden payload allocator/alias capacity and RSS are not claimed.
+
+One consuming call owns one genuine `PinnedShardAppendBudget`; every frame,
+segment, rotation, short/Interrupted write and paid settlement shares its
+counters and original/minimum E. Each later consuming call is a separate native
+operation, while any supplied `NativeDirectoryBudget` continues to spend its
+same cumulative counters and minimum deadline. No per-segment reset or refund
+exists. A caller composing several operations must prepay their total actual
+limits; the bridge does not revive an expired startup budget or Session.
+
+The actual private-pin try-lock result and native append Result remain outside
+the bridge catch boundary. The mandatory adapter denies the same directory
+budget first and invokes the actual composing work/captured-health denial
+before native rollback, file sync or directory settlement. Original native
+errors, successful-but-late reports and independent bridge/denial panics remain
+retained with the whole possibly uncertain store; refusal exposes no retry,
+bare store, pin, descriptor or raw-report extractor.
+
+`OwnedPinnedShardAppendComplete::into_store` drops the native report before
+returning the whole Core owner. `into_store_and_report` instead returns that
+whole owner plus an opaque `OwnedPinnedShardAppendReport` retaining the actual
+native report and the same directory/root last. Either drop order preserves
+physical lock custody. The optional Arc increment and output/observation carriers are
+prepaid. Public report access returns a private-field
+`OwnedPinnedShardAppendObservation` containing safe scalar/receipt and typed
+IO/metadata observations. It exposes no native report/error wrapper, created or
+retired File, descriptor, Deref or caller-claimed constructor. Error sources
+cannot downcast to the FD-bearing native report/error. The original native
+reports, partial errors, created/retired files and panic payloads stay privately
+retained through actual cleanup. Caller-supplied panic payloads remain original
+observations; this adds no new producer descriptor extractor. Existing ordinary writers and the Core GC return methods retain their
+current behavior.
+
+Twelve genuine filesystem source groups cover Core open, grouped append,
+rotation, seal and reopen, real leading-zero ACTIVE names, original Vec capacity
+greater than length, exact/one-less bridge and complete actual fees, raw writes
+followed by actual elapsed-E or native panic settlement, real named-file IO
+errors, typed private-pin refusals and both output drop orders. They remain
+uncompiled and unexecuted. Native algorithm, Core composition and source
+coverage do not establish configured C1/issuer health, serving authority,
+64 MiB/256 MiB startup fit, full host/runtime or performance qualification.

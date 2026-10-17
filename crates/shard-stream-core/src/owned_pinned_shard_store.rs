@@ -22,6 +22,14 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+#[path = "owned_pinned_shard_append.rs"]
+mod append;
+pub use append::{
+    OwnedPinnedShardAppendComplete, OwnedPinnedShardAppendCost, OwnedPinnedShardAppendFailure,
+    OwnedPinnedShardAppendLimits, OwnedPinnedShardAppendObservation, OwnedPinnedShardAppendReport,
+    RetainedOwnedPinnedShardAppendError, owned_pinned_shard_append_cost,
+};
+
 #[path = "owned_pinned_shard_gc.rs"]
 mod gc;
 pub use gc::{

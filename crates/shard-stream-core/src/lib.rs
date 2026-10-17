@@ -40,6 +40,12 @@ pub use owned_directory_handle::{
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use owned_directory_handle::{
+    OwnedPinnedShardAppendComplete, OwnedPinnedShardAppendCost, OwnedPinnedShardAppendFailure,
+    OwnedPinnedShardAppendLimits, OwnedPinnedShardAppendObservation, OwnedPinnedShardAppendReport,
+    RetainedOwnedPinnedShardAppendError, owned_pinned_shard_append_cost,
+};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use owned_directory_handle::{
     OwnedPinnedShardGcComplete, OwnedPinnedShardGcCost, OwnedPinnedShardGcFailure,
     OwnedPinnedShardGcReport, RetainedOwnedPinnedShardGcError, owned_pinned_shard_gc_cost,
 };

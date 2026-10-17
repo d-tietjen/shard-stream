@@ -30,6 +30,12 @@ pub use file_replacement::{
 mod shard_directory;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use shard_directory::{
+    OwnedPinnedShardAppendComplete, OwnedPinnedShardAppendCost, OwnedPinnedShardAppendFailure,
+    OwnedPinnedShardAppendLimits, OwnedPinnedShardAppendObservation, OwnedPinnedShardAppendReport,
+    RetainedOwnedPinnedShardAppendError, owned_pinned_shard_append_cost,
+};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use shard_directory::{
     OwnedPinnedShardGcComplete, OwnedPinnedShardGcCost, OwnedPinnedShardGcFailure,
     OwnedPinnedShardGcReport, RetainedOwnedPinnedShardGcError, owned_pinned_shard_gc_cost,
 };
