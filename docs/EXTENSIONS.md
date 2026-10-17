@@ -1051,3 +1051,43 @@ uncompiled and unexecuted at this boundary. This entry is a generic custody
 and observation producer. Core owning-log integration, native bounded read,
 configured 64 MiB/256 MiB aggregate startup, C1 and whole-host qualification
 remain open; no serving or source-completeness authority is created.
+
+### Core canonical-log conversion with retained validation
+
+`OwnedPinnedShardStore::into_shard_log_until` consumes the actual opened Core
+store and borrows one existing `StorageFetchBudget`, one cumulative
+`NativeDirectoryBudget`, and mandatory actual work/health checks. It creates no
+budget, Session, deadline, pin or replacement store. The existing shared
+physical directory moves last into success or refusal.
+
+Two independently prepaid parent-handle retains feed the genuine consuming
+checked validator before and after the real native canonical conversion. Each
+whole typed validation result remains retained; success does not consume either
+report through `into_handle`. The native result is installed outside the bridge
+unwind boundary before callbacks or postvalidation. A late or failing postcheck
+therefore keeps the actual successful native log together with both validation
+carriers and the original directory/root. No uncertain owner can be retried or
+extracted.
+
+`owned_pinned_shard_log_cost` reports independently named bridge values, two
+handle retains and two checked-validation framing differences. A composing
+caller prepays one Core global policy and one native constructor ceiling once,
+plus this per-conversion framing while its original Session is ACTIVE. Actual
+conversion spends the same remaining counters; three Core operations enter on
+a complete conversion, with no refund, renewal or per-log maximum reset. The
+native ceiling and Core traversal maxima are separate from the bridge getter.
+
+Producer-specific borrowing adapters enforce both budgets and actual captured
+health. The native converter has attempted native denial before its adapter;
+that adapter attempts Core denial before the shared outer-health attempt. The
+checked validator has attempted both budgets first. The outer attempt is saved
+before calling health and is never retried after unwind. Independent bridge,
+native and validation panic payloads stay privately owned by their real frames.
+
+Public Core views expose canonical scalars, actual sequence/result facts and
+safe validation observations. They expose no native owning log/error, file,
+descriptor, arbitrary panic payload, budget, owner factory or serving witness.
+This is conversion only: strict Core log reads/writes/sealing/compaction,
+Blossom recovery, actual C1/host startup and unchanged 64 MiB/256 MiB aggregate
+qualification require their remaining genuine integration and validation gates.
+The source regression bodies are uncompiled and unexecuted in this draft.

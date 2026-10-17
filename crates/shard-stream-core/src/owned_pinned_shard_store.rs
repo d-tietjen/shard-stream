@@ -22,6 +22,14 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+#[path = "owned_pinned_shard_log.rs"]
+mod canonical_log;
+pub use canonical_log::{
+    OwnedPinnedShardLog, OwnedPinnedShardLogCost, OwnedPinnedShardLogFailure,
+    OwnedPinnedShardLogObservation, OwnedPinnedShardLogValidation,
+    RetainedOwnedPinnedShardLogError, owned_pinned_shard_log_cost,
+};
+
 #[path = "owned_pinned_shard_append.rs"]
 mod append;
 pub use append::{

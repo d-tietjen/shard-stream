@@ -38,6 +38,13 @@ pub use store::{
     OwnedShardStoreDirectory, RetainedOwnedPinnedShardStoreError, owned_pinned_shard_store_cost,
 };
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use store::{
+    OwnedPinnedShardLog, OwnedPinnedShardLogCost, OwnedPinnedShardLogFailure,
+    OwnedPinnedShardLogObservation, OwnedPinnedShardLogValidation,
+    RetainedOwnedPinnedShardLogError, owned_pinned_shard_log_cost,
+};
+
 /// Plain source-visible bridge/native values before actual continuation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnedShardDirectoryCost {

@@ -58,6 +58,13 @@ pub use shard_directory::{
     RetainedOwnedShardDirectoryError, owned_shard_directory_cost,
 };
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use shard_directory::{
+    OwnedPinnedShardLog, OwnedPinnedShardLogCost, OwnedPinnedShardLogFailure,
+    OwnedPinnedShardLogObservation, OwnedPinnedShardLogValidation,
+    RetainedOwnedPinnedShardLogError, owned_pinned_shard_log_cost,
+};
+
 /// Native file opening modes; none silently truncates an existing file.
 #[derive(Clone, Copy, Debug)]
 pub enum OwnedFileAccess {

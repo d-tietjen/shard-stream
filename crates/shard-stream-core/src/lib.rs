@@ -58,6 +58,12 @@ pub use owned_directory_handle::{
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use owned_directory_handle::{
+    OwnedPinnedShardLog, OwnedPinnedShardLogCost, OwnedPinnedShardLogFailure,
+    OwnedPinnedShardLogObservation, OwnedPinnedShardLogValidation,
+    RetainedOwnedPinnedShardLogError, owned_pinned_shard_log_cost,
+};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use owned_directory_handle::{
     OwnedPinnedShardStore, OwnedPinnedShardStoreCost, OwnedPinnedShardStoreFailure,
     OwnedShardStoreDirectory, RetainedOwnedPinnedShardStoreError, owned_pinned_shard_store_cost,
 };
@@ -66,6 +72,7 @@ pub use owned_directory_handle::{
     OwnedShardDirectory, OwnedShardDirectoryCost, OwnedShardDirectoryFailure,
     RetainedOwnedShardDirectoryError, owned_shard_directory_cost,
 };
+
 pub use sequencer::{
     Placement, Reservation, ReservationProposal, SequencerError, SequencerState, TopicSequencer,
 };
