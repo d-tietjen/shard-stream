@@ -14,7 +14,14 @@ use shard_stream_core::{
 };
 use shard_stream_protocol::AtomicGroupIdentity;
 
-use crate::{AtomicGroupState, EngineError, EngineResult};
+use crate::{
+    AtomicGroupState, EngineError, EngineResult, NativeResumeCallbackError,
+    NativeResumeCallbackResult, NativeResumeWork,
+};
+
+#[path = "durable_sink_resume.rs"]
+mod bounded_resume;
+pub use bounded_resume::NativeResumeSinkOutcome;
 
 const RETRY_MIN: Duration = Duration::from_millis(10);
 const RETRY_MAX: Duration = Duration::from_secs(1);
@@ -154,6 +161,25 @@ pub trait DurableAppendSink: Send + Sync + fmt::Debug {
         appends: &[DurableAppend],
         next: DurableSinkCheckpoint,
     ) -> EngineResult<DurableSinkApply>;
+
+    /// Applies the same actual transaction using the supplied original-E work.
+    ///
+    /// Implementations charge before materialization, carry the SAME work into
+    /// entered workers, check between native phases and physically settle every
+    /// entered job before returning. Original typed partial outcomes belong in
+    /// the returned error. The default refuses without invoking the ordinary
+    /// callback; a legacy callback is not a bounded producer.
+    fn apply_until(
+        &self,
+        _expected: DurableSinkCheckpoint,
+        _appends: &[DurableAppend],
+        _next: DurableSinkCheckpoint,
+        _work: &NativeResumeWork,
+    ) -> NativeResumeCallbackResult<DurableSinkApply> {
+        Err(NativeResumeCallbackError::unsupported(
+            "durable sink has no bounded apply producer",
+        ))
+    }
 }
 
 /// Constructs shard-local sink handles backed by one cluster-shared sink.
@@ -183,6 +209,47 @@ pub trait DurableAppendSinkFactory: Send + Sync + fmt::Debug {
     /// Atomically publishes or discards a previously staged group.
     fn finalize_atomic_group(&self, _decision: DurableAtomicDecision) -> EngineResult<()> {
         Ok(())
+    }
+
+    /// Loads a real checkpoint with the same original-E cumulative work.
+    ///
+    /// Carry this work through actual lock/read/decoder/worker phases. An
+    /// expected absent checkpoint remains ordinary `None`; late/error results
+    /// must retain their actual native cause. No legacy callback is invoked by
+    /// the refusing default.
+    fn load_checkpoint_until(
+        &self,
+        _topic_partition: TopicPartition,
+        _work: &NativeResumeWork,
+    ) -> NativeResumeCallbackResult<Option<DurableSinkCheckpoint>> {
+        Err(NativeResumeCallbackError::unsupported(
+            "durable sink has no bounded checkpoint producer",
+        ))
+    }
+
+    /// Enumerates actual pending groups with pre-allocation native limits.
+    ///
+    /// The producer reserves each group and its source values in this SAME
+    /// work before copying/pushing. Clipping an ordinary allocated result is
+    /// not an implementation of this contract.
+    fn pending_atomic_groups_until(
+        &self,
+        _work: &NativeResumeWork,
+    ) -> NativeResumeCallbackResult<Vec<DurableAtomicGroup>> {
+        Err(NativeResumeCallbackError::unsupported(
+            "durable sink has no bounded pending-group producer",
+        ))
+    }
+
+    /// Physically settles a real atomic decision using the same original E.
+    fn finalize_atomic_group_until(
+        &self,
+        _decision: DurableAtomicDecision,
+        _work: &NativeResumeWork,
+    ) -> NativeResumeCallbackResult<()> {
+        Err(NativeResumeCallbackError::unsupported(
+            "durable sink has no bounded atomic-decision producer",
+        ))
     }
 }
 
@@ -445,6 +512,7 @@ impl QueuedDecision {
 }
 
 enum Command {
+    BoundedResume(bounded_resume::BoundedCommand),
     Append(QueuedAppend),
     Decision(QueuedDecision),
     LoadCheckpoint {
@@ -1110,6 +1178,7 @@ fn run_dispatcher(
             if !handle_command(
                 command,
                 &factory,
+                &sinks,
                 &mut partitions,
                 &mut decisions,
                 atomic_visibility,
@@ -1124,6 +1193,7 @@ fn run_dispatcher(
                         if !handle_command(
                             command,
                             &factory,
+                            &sinks,
                             &mut partitions,
                             &mut decisions,
                             atomic_visibility,
@@ -1164,6 +1234,7 @@ fn run_dispatcher(
 fn handle_command(
     command: Command,
     factory: &Arc<dyn DurableAppendSinkFactory>,
+    sinks: &HashMap<ShardId, Arc<dyn DurableAppendSink>>,
     partitions: &mut HashMap<TopicPartition, PartitionDelivery>,
     decisions: &mut VecDeque<QueuedDecision>,
     atomic_visibility: DurableSinkAtomicVisibility,
@@ -1171,6 +1242,10 @@ fn handle_command(
     schedule_flush: &mut bool,
 ) -> bool {
     match command {
+        Command::BoundedResume(command) => {
+            bounded_resume::execute(factory, sinks, partitions, shared, command);
+            true
+        }
         Command::Append(mut queued) => {
             *schedule_flush = true;
             if atomic_visibility == DurableSinkAtomicVisibility::CommittedOnly
@@ -1308,13 +1383,7 @@ fn process_ready(
                     processed += 1;
                 }
                 Ok(Ok(DurableSinkApply::CheckpointConflict(actual))) => {
-                    if validate_checkpoint(partition.checkpoint.topic_partition, actual).is_err()
-                        || actual.next_placement_sequence
-                            < partition.checkpoint.next_placement_sequence
-                        || actual.next_offset < partition.checkpoint.next_offset
-                        || (actual.next_placement_sequence < next.next_placement_sequence
-                            || actual.next_offset < next.next_offset)
-                    {
+                    if checkpoint_conflict_invalid(partition.checkpoint, next, actual) {
                         shared.stats.failed_attempts.fetch_add(1, Ordering::Relaxed);
                         partition.pending.insert(sequence, queued);
                         next_wake = earlier_deadline(
@@ -1356,6 +1425,20 @@ fn process_ready(
         }
     }
     next_wake
+}
+
+// The exact original native acceptance predicate, shared by ordinary and strict
+// callbacks. The strict caller prepays its bounded native identity diagnostic.
+fn checkpoint_conflict_invalid(
+    expected: DurableSinkCheckpoint,
+    next: DurableSinkCheckpoint,
+    actual: DurableSinkCheckpoint,
+) -> bool {
+    validate_checkpoint(expected.topic_partition, actual).is_err()
+        || actual.next_placement_sequence < expected.next_placement_sequence
+        || actual.next_offset < expected.next_offset
+        || (actual.next_placement_sequence < next.next_placement_sequence
+            || actual.next_offset < next.next_offset)
 }
 
 fn defer_partition_retry(

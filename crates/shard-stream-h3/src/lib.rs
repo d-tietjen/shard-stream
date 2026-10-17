@@ -522,6 +522,12 @@ impl From<EngineError> for RouteError {
                 message,
                 true,
             ),
+            EngineError::OperationBusy(_) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "OPERATION_BUSY",
+                message,
+                true,
+            ),
             EngineError::WorkerStopped(_)
             | EngineError::DurabilityUnavailable { .. }
             | EngineError::ObjectDurabilityUnavailable

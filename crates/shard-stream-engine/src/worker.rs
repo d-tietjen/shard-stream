@@ -21,6 +21,15 @@ use shardlog::{
 use crate::config::COMMAND_OVERHEAD_BYTES;
 use crate::{EngineConfig, EngineError, EngineResult};
 
+#[path = "worker_primary.rs"]
+mod primary;
+pub(crate) use primary::PrimaryStore;
+#[cfg(unix)]
+#[path = "worker_start.rs"]
+mod start;
+#[cfg(unix)]
+pub(crate) use start::RecoveredStartError;
+
 const MAX_APPEND_GROUP: usize = 128;
 const TARGET_APPEND_GROUP: usize = 8;
 const MIN_APPEND_GROUP_LINGER: Duration = Duration::from_micros(200);
@@ -47,6 +56,14 @@ pub(crate) fn recovery_worker_bytes(config: &EngineConfig) -> Option<usize> {
         .checked_add(std::mem::size_of::<ShardHandle>() + std::mem::size_of::<LaneStores>())
 }
 
+/// Actual extra input-slot, holder, readiness and fixed stack ceilings for the
+/// new owned route; ordinary recovered workers keep their existing path.
+#[cfg(unix)]
+pub(crate) fn recovery_owned_worker_extra_bytes() -> Option<usize> {
+    start::retained_start_bytes()?
+        .checked_add(2usize.checked_mul(std::mem::size_of::<primary::DirectoryRetention>())?)
+}
+
 /// Computes the declared command charge without claiming a process RAM bound.
 pub(crate) fn append_command_charge(payload_bytes: usize, guarded: bool) -> Option<usize> {
     payload_bytes
@@ -54,6 +71,9 @@ pub(crate) fn append_command_charge(payload_bytes: usize, guarded: bool) -> Opti
         .checked_add(if guarded { ADMISSION_METADATA_BYTES } else { 0 })
 }
 
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+#[path = "worker_owned_tests.rs"]
+mod owned_store_tests;
 #[cfg(test)]
 #[path = "worker_physical_admission_tests.rs"]
 mod physical_admission_tests;
@@ -66,6 +86,20 @@ pub(crate) use bounded_fetch::{
     BoundedFetchCompletion, DispatchError as BoundedFetchDispatchError,
     PlanInput as BoundedFetchPlanInput, bounded_fetch_command_bytes,
 };
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[path = "worker_gc.rs"]
+mod gc;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) use gc::COMMAND_DIAGNOSTIC_BYTES as OWNED_GC_COMMAND_DIAGNOSTIC_BYTES;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) use gc::COMMAND_ENTRIES as OWNED_GC_COMMAND_ENTRIES;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) use gc::GcTicket;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) use gc::command_cost as owned_gc_command_cost;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use gc::{NativeGcOutcome, NativeResumeGcPolicy};
 
 mod proposal;
 pub(crate) use proposal::{ProposedAppendOutcome, ProposedAppendTicket};
@@ -177,6 +211,8 @@ pub(crate) enum FetchCompletion {
 // batch; queue memory is already bounded by slots and charged bytes.
 #[allow(clippy::large_enum_variant)]
 enum ShardCommand {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    OwnedGc(gc::Command),
     BoundedFetch(bounded_fetch::Command),
     Append(AppendCommand),
     ProposedAppend(Box<proposal::ProposedAppendCommand>),
@@ -216,6 +252,8 @@ pub(crate) struct ShardHandle {
     thread: Option<JoinHandle<()>>,
     sync_sender: Option<SyncSender<SyncRequest>>,
     sync_thread: Option<JoinHandle<()>>,
+    #[cfg(unix)]
+    recovered_input: Option<start::InputSlot>,
 }
 
 impl ShardHandle {
@@ -258,7 +296,10 @@ impl ShardHandle {
                 entry.object_durable = durable_packs.contains(&entry.pack_sequence);
             }
         }
-        let stores = LaneStores { primary, tier };
+        let stores = LaneStores {
+            primary: PrimaryStore::Ordinary(primary),
+            tier,
+        };
         let (sync_sender, sync_receiver) = sync_channel(SYNC_QUEUE_SLOTS);
         let sync_ownership = directory_ownership.as_ref().map(Arc::clone);
         let sync_thread = thread::Builder::new()
@@ -300,6 +341,8 @@ impl ShardHandle {
                 thread: Some(thread),
                 sync_sender: Some(sync_sender),
                 sync_thread: Some(sync_thread),
+                #[cfg(unix)]
+                recovered_input: None,
             },
             catalog,
         ))
@@ -310,17 +353,24 @@ impl ShardHandle {
     pub(crate) fn spawn_recovered(
         config: &EngineConfig,
         shard_id: ShardId,
-        primary: ShardStore,
+        primary: PrimaryStore,
         mut tier: Option<LocalObjectTier>,
         directory_ownership: Arc<shard_stream_core::DirectoryOwnership>,
         expiry: Instant,
     ) -> EngineResult<(Self, Vec<ExtentCatalogEntry>)> {
         recovered_worker_clock(expiry)?;
         if let Some(tier) = &mut tier {
-            offload_sealed_packs_until(&primary, tier, expiry)?;
+            offload_sealed_packs_until(
+                primary.native().ok_or_else(primary::unavailable)?,
+                tier,
+                expiry,
+            )?;
         }
         recovered_worker_clock(expiry)?;
-        let mut catalog = primary.catalog_until(expiry)?;
+        let mut catalog = primary
+            .native()
+            .ok_or_else(primary::unavailable)?
+            .catalog_until(expiry)?;
         if let Some(tier) = &tier {
             let mut durable_packs = std::collections::HashSet::new();
             for object in &tier.manifest().objects {
@@ -333,6 +383,8 @@ impl ShardHandle {
             }
         }
         recovered_worker_clock(expiry)?;
+        let sync_directory = primary.retain_directory();
+        let lane_directory = primary.retain_directory();
         let stores = LaneStores { primary, tier };
         let (sync_sender, sync_receiver) = sync_channel(SYNC_QUEUE_SLOTS);
         // The incremental real handle joins any already-spawned worker on
@@ -343,6 +395,7 @@ impl ShardHandle {
             thread: None,
             sync_sender: Some(sync_sender),
             sync_thread: None,
+            recovered_input: None,
         };
         let sync_ownership = Arc::clone(&directory_ownership);
         recovered_worker_clock(expiry)?;
@@ -350,9 +403,11 @@ impl ShardHandle {
             thread::Builder::new()
                 .name(format!("shard-stream-sync-{shard_id}"))
                 .spawn(move || {
+                    let directory = sync_directory;
                     let ownership = sync_ownership;
                     run_sync_worker(sync_receiver);
                     drop(ownership);
+                    drop(directory);
                 })
                 .map_err(|e| {
                     EngineError::InvalidConfig(format!("failed to spawn sync worker: {e}"))
@@ -376,6 +431,7 @@ impl ShardHandle {
             thread::Builder::new()
                 .name(format!("shard-stream-lane-{shard_id}"))
                 .spawn(move || {
+                    let directory = lane_directory;
                     let ownership = directory_ownership;
                     run_worker(
                         stores,
@@ -385,6 +441,7 @@ impl ShardHandle {
                         append_sync_sender,
                     );
                     drop(ownership);
+                    drop(directory);
                 })
                 .map_err(|e| {
                     EngineError::InvalidConfig(format!("failed to spawn shard worker: {e}"))
@@ -592,6 +649,18 @@ impl Drop for ShardHandle {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        #[cfg(unix)]
+        if let Some(input) = self.recovered_input.take() {
+            // The lane has physically joined. If it never entered, dispose its
+            // actual retained inputs before disconnecting/joining sync; opaque
+            // directory clones in both physical closures still retain custody.
+            let actual = input
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            drop(actual);
+            drop(input);
+        }
         self.sync_sender.take();
         if let Some(thread) = self.sync_thread.take() {
             let _ = thread.join();
@@ -619,6 +688,8 @@ fn run_sync_worker(receiver: Receiver<SyncRequest>) {
         // synchronizes the previous active file before switching files, so a
         // sync of the newest descriptor covers every request in this batch
         // without sharing a lock or mutable ShardStore state.
+        #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+        owned_store_tests::before_sync(&requests.last().expect("actual nonempty sync batch").file);
         let result = requests
             .last()
             .expect("sync batch is nonempty")
@@ -667,6 +738,8 @@ fn run_worker(
             continue;
         };
         match command {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            ShardCommand::OwnedGc(command) => gc::execute(&mut stores, command),
             ShardCommand::BoundedFetch(command) => bounded_fetch::execute(&mut stores, command),
             ShardCommand::Append(first) => {
                 let started = Instant::now();
@@ -729,12 +802,18 @@ fn run_worker(
             } => {
                 let _ = completion.send(FetchCompletion::Plan {
                     lane,
-                    result: stores.primary.plan_fetch(
-                        topic_partition,
-                        start_offset,
-                        max_bytes,
-                        max_batches,
-                    ),
+                    result: stores
+                        .primary
+                        .native()
+                        .ok_or_else(primary::unavailable)
+                        .and_then(|primary| {
+                            primary.plan_fetch(
+                                topic_partition,
+                                start_offset,
+                                max_bytes,
+                                max_batches,
+                            )
+                        }),
                 });
             }
             ShardCommand::ReadFetch {
@@ -744,7 +823,11 @@ fn run_worker(
             } => {
                 let _ = completion.send(FetchCompletion::Read {
                     lane,
-                    result: stores.primary.read_fetch_plan(&planned),
+                    result: stores
+                        .primary
+                        .native()
+                        .ok_or_else(primary::unavailable)
+                        .and_then(|primary| primary.read_fetch_plan(&planned)),
                 });
             }
             ShardCommand::Sync { response } => {
@@ -765,7 +848,12 @@ fn run_worker(
                 response,
             } => {
                 #[cfg(test)]
-                recovered_gc_queued_test_step(stores.primary.active_path().parent());
+                recovered_gc_queued_test_step(
+                    stores
+                        .primary
+                        .native()
+                        .and_then(|primary| primary.active_path().parent()),
+                );
                 // Queue residence cannot create a new clock. No native work
                 // begins until the actual worker checks the original Instant.
                 let result = (|| {
@@ -777,7 +865,11 @@ fn run_worker(
                         .into());
                     }
                     let starts = HashMap::from([(topic_partition, log_start)]);
-                    stores.primary.garbage_collect_until(&starts, expiry)?;
+                    stores
+                        .primary
+                        .native_mut()
+                        .ok_or_else(primary::unavailable)?
+                        .garbage_collect_until(&starts, expiry)?;
                     Ok(())
                 })();
                 let _ = response.send(result);
@@ -790,6 +882,14 @@ fn run_worker(
 }
 
 fn retain_physical_charge(command: Budgeted<ShardCommand>) -> ShardCommand {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if matches!(&*command, ShardCommand::OwnedGc(_)) {
+        let (mut command, charge) = command.into_parts();
+        if let ShardCommand::OwnedGc(command) = &mut command {
+            gc::retain_charge(command, charge);
+        }
+        return command;
+    }
     if !matches!(&*command, ShardCommand::Append(append) if append.admission.is_some())
         && !matches!(&*command, ShardCommand::ProposedAppend(_))
         && !matches!(&*command, ShardCommand::BoundedFetch(_))
@@ -935,7 +1035,7 @@ fn shard_directory(data_dir: &std::path::Path, shard_id: ShardId) -> PathBuf {
 }
 
 struct LaneStores {
-    primary: ShardStore,
+    primary: PrimaryStore,
     tier: Option<LocalObjectTier>,
 }
 
@@ -946,6 +1046,46 @@ pub(crate) struct AppendDurability {
 }
 
 impl LaneStores {
+    fn borrowed(&mut self) -> StorageResult<BorrowedLaneStores<'_>> {
+        Ok(BorrowedLaneStores {
+            primary: self.primary.native_mut().ok_or_else(primary::unavailable)?,
+            tier: &mut self.tier,
+        })
+    }
+    fn seal_aged_pack(&mut self, age: Duration) -> StorageResult<()> {
+        // Owned idle work has no bounded seal/rotation producer here. Keep the
+        // ordinary algorithm exclusively on the ordinary variant.
+        if self.primary.is_owned() {
+            return Ok(());
+        }
+        self.borrowed()?.seal_aged_pack(age)
+    }
+    fn append_group(&mut self, appends: &[AppendCommand]) -> AppendGroupOutput {
+        match self.borrowed() {
+            Ok(mut stores) => stores.append_group(appends),
+            Err(error) => AppendGroupOutput {
+                outcomes: appends
+                    .iter()
+                    .map(|_| Err(clone_storage_error(&error)))
+                    .collect(),
+                sync_file: None,
+            },
+        }
+    }
+    fn sync(&mut self, sender: &SyncSender<SyncRequest>) -> StorageResult<()> {
+        self.borrowed()?.sync(sender)
+    }
+    fn garbage_collect(&mut self, tp: TopicPartition, start: LogicalOffset) -> StorageResult<()> {
+        self.borrowed()?.garbage_collect(tp, start)
+    }
+}
+
+struct BorrowedLaneStores<'a> {
+    primary: &'a mut ShardStore,
+    tier: &'a mut Option<LocalObjectTier>,
+}
+
+impl BorrowedLaneStores<'_> {
     fn seal_aged_pack(&mut self, max_pack_age: Duration) -> StorageResult<()> {
         if self.primary.seal_active_if_older(max_pack_age)?.is_some()
             && let Some(tier) = &mut self.tier

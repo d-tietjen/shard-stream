@@ -8,6 +8,15 @@ use std::time::Instant;
 struct Opening {
     engine: JoiningEngine,
     shards: Vec<ShardHandle>,
+    worker_start_error: Option<crate::worker::RecoveredStartError>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    gc_outcomes: Vec<crate::worker::NativeGcOutcome>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    gc_pending: Option<crate::worker::GcTicket>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    gc_allocation_error: Option<std::collections::TryReserveError>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    gc_receive_error: Option<std::sync::mpsc::RecvError>,
     journal: Option<ControlJournal>,
     sink: JoiningSink,
     write_fence: Option<Arc<dyn WriteFence>>,
@@ -69,6 +78,8 @@ impl Drop for JoiningSink {
 /// Only borrowing the engine is allowed: its workers cannot escape this owner.
 pub struct OwnedRecoveredEngine {
     engine: StreamEngine,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    _gc_outcomes: std::sync::Mutex<Vec<crate::worker::NativeGcOutcome>>,
     custody: OwnedEngineCustody,
 }
 impl OwnedRecoveredEngine {
@@ -127,6 +138,83 @@ impl OwnedEngineOpenError {
     pub fn error(&self) -> &EngineError {
         &self.error
     }
+    /// Actual retained worker-start error, independently of the public wrapper.
+    pub fn worker_start_error(&self) -> Option<&EngineError> {
+        match &self.custody {
+            FailedCustody::Opening(opening) => opening
+                .worker_start_error
+                .as_ref()
+                .map(|error| error.error()),
+            FailedCustody::Completed(_) => None,
+        }
+    }
+    /// Actual worker-start unwind, retained with its real partial workers/store.
+    pub fn worker_start_panic_payload(&self) -> Option<&(dyn std::any::Any + Send)> {
+        match &self.custody {
+            FailedCustody::Opening(opening) => opening
+                .worker_start_error
+                .as_ref()
+                .and_then(|error| error.panic_payload()),
+            FailedCustody::Completed(_) => None,
+        }
+    }
+    /// Actual SAME-directory-budget refusal retained at worker startup.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn worker_start_budget_error(&self) -> Option<&shard_stream_core::NativeDirectoryFailure> {
+        match &self.custody {
+            FailedCustody::Opening(opening) => opening
+                .worker_start_error
+                .as_ref()
+                .and_then(|error| error.budget_error()),
+            FailedCustody::Completed(_) => None,
+        }
+    }
+    /// Actual composing checkpoint refusal, separate from a later budget error.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn worker_start_checkpoint_error(&self) -> Option<shardlog::ShardDirectoryCheckFailure> {
+        match &self.custody {
+            FailedCustody::Opening(opening) => opening
+                .worker_start_error
+                .as_ref()
+                .and_then(|error| error.checkpoint_error()),
+            FailedCustody::Completed(_) => None,
+        }
+    }
+    /// Actual captured-health denial unwind, independently of startup unwinds.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn worker_start_deny_panic_payload(&self) -> Option<&(dyn std::any::Any + Send)> {
+        match &self.custody {
+            FailedCustody::Opening(opening) => opening
+                .worker_start_error
+                .as_ref()
+                .and_then(|error| error.deny_panic_payload()),
+            FailedCustody::Completed(_) => None,
+        }
+    }
+    /// Actual bootstrap collection completions/refusals retained before post-E.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn gc_outcomes(&self) -> &[crate::NativeGcOutcome] {
+        match &self.custody {
+            FailedCustody::Opening(opening) => &opening.gc_outcomes,
+            FailedCustody::Completed(_) => &[],
+        }
+    }
+    /// Actual complete-output reservation refusal before a GC command enters.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn gc_allocation_error(&self) -> Option<&std::collections::TryReserveError> {
+        match &self.custody {
+            FailedCustody::Opening(opening) => opening.gc_allocation_error.as_ref(),
+            FailedCustody::Completed(_) => None,
+        }
+    }
+    /// Actual completion-channel disconnection, never modeled as successful GC.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn gc_receive_error(&self) -> Option<&std::sync::mpsc::RecvError> {
+        match &self.custody {
+            FailedCustody::Opening(opening) => opening.gc_receive_error.as_ref(),
+            FailedCustody::Completed(_) => None,
+        }
+    }
     /// Work already admitted under the unchanged original clock.
     pub fn usage(&self) -> NativeRecoveryUsage {
         match &self.custody {
@@ -154,7 +242,17 @@ impl fmt::Debug for OwnedEngineOpenError {
             .finish_non_exhaustive()
     }
 }
-impl std::error::Error for OwnedEngineOpenError {}
+impl std::error::Error for OwnedEngineOpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.custody {
+            FailedCustody::Opening(opening) => opening
+                .worker_start_error
+                .as_ref()
+                .map(|error| error as &dyn std::error::Error),
+            FailedCustody::Completed(_) => None,
+        }
+    }
+}
 
 impl StreamEngine {
     /// Consumes genuine restored native stores without reopening/relocking them.
@@ -174,6 +272,15 @@ impl StreamEngine {
         let mut opening = Opening {
             engine: JoiningEngine(None),
             shards: Vec::new(),
+            worker_start_error: None,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            gc_outcomes: Vec::new(),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            gc_pending: None,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            gc_allocation_error: None,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            gc_receive_error: None,
             journal: None,
             sink: JoiningSink(None),
             write_fence,
@@ -184,6 +291,17 @@ impl StreamEngine {
         };
         let result = opening.construct();
         if let Err(error) = result {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if opening.worker_start_error.is_none()
+                && !opening
+                    .gc_outcomes
+                    .last()
+                    .is_some_and(|outcome| !outcome.accepted())
+            {
+                opening.storage.recovery_deny_primary();
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            opening.storage.recovery_deny_primary();
             return Err(OwnedEngineOpenError {
                 error,
                 custody: FailedCustody::Opening(Box::new(opening)),
@@ -211,6 +329,8 @@ impl Opening {
     fn finish(self, engine: StreamEngine) -> OwnedRecoveredEngine {
         OwnedRecoveredEngine {
             engine,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            _gc_outcomes: std::sync::Mutex::new(self.gc_outcomes),
             custody: self.storage.finish_engine_custody(),
         }
     }
@@ -288,15 +408,28 @@ impl Opening {
         for number in 0..config.shard_count {
             self.storage.recovery_clock()?;
             let shard = ShardId::new(number);
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let startup_policy = self.storage.recovery_gc_policy()?;
             let (primary, tier) = self.storage.recovery_take_shard(shard)?;
-            let (handle, entries) = ShardHandle::spawn_recovered(
+            let observed = ShardHandle::spawn_recovered_primary(
                 &config,
                 shard,
                 primary,
                 tier,
                 Arc::clone(self.storage.recovery_owner()),
                 self.storage.absolute_expiry(),
-            )?;
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                startup_policy,
+            );
+            let (handle, entries) = match observed {
+                Ok(value) => value,
+                Err(error) => {
+                    self.worker_start_error = Some(error);
+                    return Err(EngineError::InvalidConfig(
+                        "actual retained recovered worker start refused".into(),
+                    ));
+                }
+            };
             // Keep the live handle before fallible catalog duplicate checking.
             self.shards.push(handle);
             for entry in entries {
@@ -418,6 +551,8 @@ impl Opening {
             durable_sink: self.sink.take(),
             directory_ownership: Some(Arc::clone(self.storage.recovery_owner())),
         });
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let owned_gc = self.storage.recovery_gc_policy()?;
         for (tp, start) in retained_log_starts {
             self.storage.recovery_clock()?;
             if start.get() > 0 {
@@ -433,6 +568,71 @@ impl Opening {
                 }
                 for shard in &engine.shards {
                     self.storage.recovery_clock()?;
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    if let Some(policy) = &owned_gc {
+                        let fixed = crate::worker::owned_gc_command_cost()
+                            .and_then(|n| {
+                                n.checked_add(std::mem::size_of::<crate::NativeGcOutcome>())
+                            })
+                            .ok_or_else(|| {
+                                EngineError::InvalidConfig(
+                                    "native GC output sizing overflow".into(),
+                                )
+                            })?;
+                        self.storage.recovery_charge(
+                            fixed,
+                            u64::try_from(fixed).map_err(|_| {
+                                EngineError::InvalidConfig(
+                                    "native GC output sizing overflow".into(),
+                                )
+                            })?,
+                        )?;
+                        self.gc_allocation_error = self.gc_outcomes.try_reserve_exact(1).err();
+                        self.storage.recovery_clock()?;
+                        if self.gc_allocation_error.is_some() {
+                            return Err(EngineError::InvalidConfig(
+                                "native GC output reservation refused".into(),
+                            ));
+                        }
+                        match shard.begin_owned_gc(
+                            tp,
+                            log_start,
+                            policy,
+                            self.storage.absolute_expiry(),
+                        ) {
+                            Ok(ticket) => self.gc_pending = Some(ticket),
+                            Err(outcome) => {
+                                self.gc_outcomes.push(outcome);
+                                return Err(EngineError::InvalidConfig(
+                                    "actual native GC command refused before entry".into(),
+                                ));
+                            }
+                        }
+                        let observed = self
+                            .gc_pending
+                            .as_mut()
+                            .ok_or(EngineError::WorkerStopped(shard.shard_id))?
+                            .settle();
+                        self.gc_pending.take();
+                        match observed {
+                            Ok(outcome) => self.gc_outcomes.push(outcome),
+                            Err(error) => {
+                                self.gc_receive_error = Some(error);
+                                return Err(EngineError::WorkerStopped(shard.shard_id));
+                            }
+                        }
+                        self.storage.recovery_clock()?;
+                        if !self
+                            .gc_outcomes
+                            .last()
+                            .is_some_and(|outcome| outcome.accepted())
+                        {
+                            return Err(EngineError::InvalidConfig(
+                                "actual consuming Core GC refused".into(),
+                            ));
+                        }
+                        continue;
+                    }
                     shard.garbage_collect_until(tp, log_start, self.storage.absolute_expiry())?;
                     self.storage.recovery_clock()?;
                 }

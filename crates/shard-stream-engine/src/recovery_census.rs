@@ -25,7 +25,22 @@ use shardlog::{
     inspect_recovery_journal, recovery_extent_frame_bytes, recovery_journal_frame_bytes,
 };
 
+use crate::worker::PrimaryStore;
 use crate::{EngineConfig, EngineError};
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[path = "recovery_primary.rs"]
+mod primary;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use primary::{NativePrimaryOutcomes, NativePrimaryRecovery};
+
+#[derive(Default)]
+enum PrimarySetup {
+    #[default]
+    Ordinary,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    Owned(primary::PrimaryRecovery),
+}
 
 #[path = "recovery_restore.rs"]
 mod restore;
@@ -159,7 +174,8 @@ struct Attempt {
     directories: Vec<OwnedDirectoryHandle>,
     shards: Vec<(ShardId, ShardRecoveryGuard)>,
     tiers: Vec<(ShardId, TierRecoveryGuard)>,
-    opened: Vec<(ShardId, ShardStore, Option<LocalObjectTier>)>,
+    opened: Vec<(ShardId, PrimaryStore, Option<LocalObjectTier>)>,
+    primary_setup: PrimarySetup,
     root: Option<OwnedDirectoryHandle>,
     tier_root: Option<OwnedDirectoryHandle>,
     // Last: every opened file/guard/value settles before original OS custody.
@@ -192,6 +208,14 @@ impl NativeRecoveryError {
     /// Actual refusal; this cannot recycle any process-start grant.
     pub fn error(&self) -> &EngineError {
         &self.error
+    }
+    /// Actual additive primary-route results retained in this refusal.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn primary_outcomes(&self) -> Option<&NativePrimaryOutcomes> {
+        match &self.attempt.primary_setup {
+            PrimarySetup::Owned(primary) => Some(&primary.outcomes),
+            PrimarySetup::Ordinary => None,
+        }
     }
     /// Reservations already consumed before refusal.
     pub fn usage(&self) -> NativeRecoveryUsage {
@@ -250,7 +274,7 @@ impl OwnedRecoveryStorage {
             .opened
             .iter_mut()
             .find(|(id, _, _)| *id == shard)
-            .map(|(_, store, _)| store)
+            .and_then(|(_, store, _)| store.native_mut())
     }
     /// Real object tier, retaining the transferred native copy/publication lease.
     pub fn tier(&mut self, shard: ShardId) -> Option<&mut LocalObjectTier> {
@@ -304,6 +328,50 @@ impl NativeRecoveryCensus {
         expiry: Instant,
         writable_journal: bool,
     ) -> std::result::Result<Self, NativeRecoveryError> {
+        Self::read_mode(
+            config,
+            owner,
+            tier_root,
+            limits,
+            expiry,
+            writable_journal,
+            PrimarySetup::Ordinary,
+        )
+    }
+
+    /// Read native evidence while acquiring primary leases through genuine
+    /// original-E guard/Core producers. This does not qualify the remaining
+    /// source readers, tier restore, catalog or serving/currentness joins.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn read_for_engine_with_primary(
+        config: EngineConfig,
+        owner: Arc<DirectoryOwnership>,
+        tier_root: Option<OwnedDirectoryHandle>,
+        limits: NativeRecoveryLimits,
+        expiry: Instant,
+        primary: NativePrimaryRecovery,
+    ) -> std::result::Result<Self, NativeRecoveryError> {
+        let expiry = expiry.min(primary.budget.absolute_expiry());
+        Self::read_mode(
+            config,
+            owner,
+            tier_root,
+            limits,
+            expiry,
+            true,
+            PrimarySetup::Owned(primary::PrimaryRecovery::new(primary)),
+        )
+    }
+
+    fn read_mode(
+        config: EngineConfig,
+        owner: Arc<DirectoryOwnership>,
+        tier_root: Option<OwnedDirectoryHandle>,
+        limits: NativeRecoveryLimits,
+        expiry: Instant,
+        writable_journal: bool,
+        primary_setup: PrimarySetup,
+    ) -> std::result::Result<Self, NativeRecoveryError> {
         let mut attempt = Attempt {
             config,
             limits,
@@ -328,11 +396,16 @@ impl NativeRecoveryCensus {
             shards: Vec::new(),
             tiers: Vec::new(),
             opened: Vec::new(),
+            primary_setup,
             root: None,
             tier_root,
             owner,
         };
-        let result = (|| {
+        let run = |attempt: &mut Attempt| {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if let PrimarySetup::Owned(primary) = &mut attempt.primary_setup {
+                primary.enter(expiry)?;
+            }
             if writable_journal {
                 attempt.clock()?;
                 let held = attempt
@@ -352,7 +425,28 @@ impl NativeRecoveryCensus {
                 attempt.charge(0, 1, held, 0, held as u64)?;
             }
             attempt.read()
-        })();
+        };
+        let result = match &attempt.primary_setup {
+            PrimarySetup::Ordinary => run(&mut attempt),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            PrimarySetup::Owned(_) => {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&mut attempt))) {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        if let PrimarySetup::Owned(primary) = &mut attempt.primary_setup {
+                            primary.unwind(payload);
+                        }
+                        Err(identity("actual primary census producer unwound"))
+                    }
+                }
+            }
+        };
+        if result.is_err() {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if let PrimarySetup::Owned(primary) = &mut attempt.primary_setup {
+                primary.deny();
+            }
+        }
         match result {
             Ok(()) => Ok(Self { attempt }),
             Err(error) => Err(NativeRecoveryError {
@@ -413,6 +507,12 @@ impl NativeRecoveryCensus {
     /// elapsed cap remains elapsed; the next existing phase check refuses it.
     pub fn cap_expiry(&mut self, earlier: Instant) {
         self.attempt.expiry = self.attempt.expiry.min(earlier);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let PrimarySetup::Owned(primary) = &mut self.attempt.primary_setup {
+            if let Err(error) = primary.context.budget.cap_expiry(self.attempt.expiry) {
+                primary.outcomes.record_budget_error(error);
+            }
+        }
     }
     /// Copies bounded original bytes from a retained source before mutable open.
     ///
@@ -528,6 +628,13 @@ impl NativeRecoveryCensus {
     pub fn restore_storage(
         mut self,
     ) -> std::result::Result<OwnedRecoveryStorage, NativeRecoveryError> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let result = self.attempt.primary_operation(|attempt| {
+            attempt
+                .restore_objects()
+                .and_then(|()| attempt.open_storage_inner(true))
+        });
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let result = self
             .attempt
             .restore_objects()
@@ -551,6 +658,9 @@ impl NativeRecoveryCensus {
     pub fn open_storage(
         mut self,
     ) -> std::result::Result<OwnedRecoveryStorage, NativeRecoveryError> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let result = self.attempt.primary_operation(Attempt::open_storage);
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let result = self.attempt.open_storage();
         match result {
             Ok(()) => Ok(OwnedRecoveryStorage {
@@ -594,7 +704,7 @@ impl Attempt {
             add(
                 ShardStore::recovery_open_fixed_bytes(),
                 mul(
-                    size_of::<(ShardId, ShardStore, Option<LocalObjectTier>)>(),
+                    size_of::<(ShardId, PrimaryStore, Option<LocalObjectTier>)>(),
                     2,
                 )?,
             )?,
@@ -694,6 +804,35 @@ impl Attempt {
         })
     }
 
+    fn open_primary_store(
+        &mut self,
+        shard: ShardId,
+        config: ShardStoreConfig,
+        retained: bool,
+    ) -> Result<PrimaryStore> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let PrimarySetup::Owned(primary) = &mut self.primary_setup {
+            return primary.open(shard, config, self.expiry);
+        }
+        let store = if let Some(index) = self.shards.iter().position(|(id, _)| *id == shard) {
+            if retained {
+                ShardStore::open_under_census_until(config, &self.shards[index].1, self.expiry)?
+            } else {
+                let (_, guard) = self.shards.swap_remove(index);
+                ShardStore::open_after_census(config, guard)?
+            }
+        } else {
+            // No pre-open shard existed. A native new store acquires its
+            // own concrete lease; absence never supplied a permission.
+            if retained {
+                ShardStore::open_until(config, self.expiry)?
+            } else {
+                ShardStore::open(config)?
+            }
+        };
+        Ok(PrimaryStore::Ordinary(store))
+    }
+
     fn open_storage(&mut self) -> Result<()> {
         self.open_storage_inner(false)
     }
@@ -762,22 +901,7 @@ impl Attempt {
                 target_pack_bytes: self.config.target_pack_bytes,
                 max_batch_bytes: self.config.max_batch_bytes,
             };
-            let store = if let Some(index) = self.shards.iter().position(|(id, _)| *id == shard) {
-                if retained {
-                    ShardStore::open_under_census_until(config, &self.shards[index].1, self.expiry)?
-                } else {
-                    let (_, guard) = self.shards.swap_remove(index);
-                    ShardStore::open_after_census(config, guard)?
-                }
-            } else {
-                // No pre-open shard existed. A native new store acquires its
-                // own concrete lease; absence never supplied a permission.
-                if retained {
-                    ShardStore::open_until(config, self.expiry)?
-                } else {
-                    ShardStore::open(config)?
-                }
-            };
+            let store = self.open_primary_store(shard, config, retained)?;
             self.opened.push((shard, store, None));
             if retained {
                 self.clock()?;
@@ -826,11 +950,29 @@ impl Attempt {
         {
             return Err(limited());
         }
-        self.owner
-            .validate_directory(&self.config.data_dir)
-            .map_err(identity)?;
+        if matches!(self.primary_setup, PrimarySetup::Ordinary) {
+            self.owner
+                .validate_directory(&self.config.data_dir)
+                .map_err(identity)?;
+        }
         self.charge(1, 1, size_of::<Self>() + 65_536, 0, 0)?;
-        self.root = Some(self.owner.root_handle().map_err(identity)?);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let PrimarySetup::Owned(primary) = &mut self.primary_setup {
+            primary.check(self.expiry)?;
+            let observed = self.owner.root_handle_until(&primary.context.budget);
+            self.root = Some(primary.directory_result(observed)?);
+            primary.check(self.expiry)?;
+            if self.root.as_ref().ok_or_else(limited)?.path().as_os_str()
+                != self.config.data_dir.as_os_str()
+            {
+                return Err(identity(
+                    "owned primary requires exact retained canonical configured root",
+                ));
+            }
+        }
+        if matches!(self.primary_setup, PrimarySetup::Ordinary) {
+            self.root = Some(self.owner.root_handle().map_err(identity)?);
+        }
         let root = self.root.as_ref().ok_or_else(limited)?.retain();
         if self.writable_journal {
             let bytes = root.path().as_os_str().len();
@@ -863,6 +1005,12 @@ impl Attempt {
                     OsStr::new(".shard-store.lock"),
                     OwnedFileAccess::ReadWriteCreate,
                 )?;
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                if let PrimarySetup::Owned(primary) = &mut self.primary_setup {
+                    primary.acquire(shard, &directory, lease_file, self.expiry)?;
+                    self.scan_primary(&directory, shard)?;
+                    continue;
+                }
                 self.charge(1, 1, 256, 0, 256)?;
                 let lease = ShardRecoveryGuard::try_acquire(
                     lease_file.file().try_clone().map_err(StorageError::from)?,
@@ -934,6 +1082,17 @@ impl Attempt {
         } else {
             OwnedFileAccess::ReadOnly
         };
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let PrimarySetup::Owned(primary) = &mut self.primary_setup {
+            primary.check(self.expiry)?;
+            let observed = root.open_optional_file_until(name, access, &primary.context.budget);
+            let file = primary.directory_result(observed)?;
+            // Save a real opened handle in the caller before its next check.
+            if file.is_none() {
+                self.missing(root, name)?;
+            }
+            return Ok(file);
+        }
         match root.open_file(name, access) {
             Ok(file) => {
                 self.clock()?;
@@ -954,6 +1113,26 @@ impl Attempt {
     ) -> Result<Option<OwnedDirectoryHandle>> {
         self.path(root, name)?;
         self.charge(1, 1, size_of::<OwnedDirectoryHandle>() + 256, 0, 256)?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let PrimarySetup::Owned(primary) = &mut self.primary_setup {
+            primary.check(self.expiry)?;
+            let budget = Arc::clone(&primary.context.budget);
+            self.charge(0, 1, size_of::<OwnedDirectoryHandle>() * 2, 0, 0)?;
+            self.directories
+                .try_reserve_exact(1)
+                .map_err(|_| limited())?;
+            let observed = root.open_optional_directory_until(name, &budget);
+            let PrimarySetup::Owned(primary) = &mut self.primary_setup else {
+                return Err(limited());
+            };
+            let directory = primary.directory_result(observed)?;
+            if let Some(directory) = &directory {
+                self.directories.push(directory.retain());
+            } else {
+                self.missing(root, name)?;
+            }
+            return Ok(directory);
+        }
         match root.open_directory(name, false) {
             Ok(directory) => {
                 self.clock()?;
@@ -1718,6 +1897,12 @@ impl Attempt {
     ) -> Result<OwnedFileHandle> {
         self.path(directory, name)?;
         self.charge(1, 1, size_of::<OwnedFileHandle>() + 256, 0, 256)?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let PrimarySetup::Owned(primary) = &mut self.primary_setup {
+            primary.check(self.expiry)?;
+            let observed = directory.open_file_until(name, access, &primary.context.budget);
+            return primary.directory_result(observed);
+        }
         let file = directory.open_file(name, access).map_err(identity)?;
         self.clock()?;
         Ok(file)

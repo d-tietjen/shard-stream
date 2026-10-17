@@ -6,6 +6,7 @@ use std::num::NonZeroU32;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{Receiver, channel, sync_channel};
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 use bytes::Bytes;
 use shard_stream_core::{
@@ -46,6 +47,15 @@ mod bounded_fetch;
 pub use bounded_fetch::{
     NativeFetchCost, NativeFetchFailure, NativeFetchLimits, NativeFetchResult,
     RetainedNativeFetchError, native_fetch_cost,
+};
+
+#[path = "native_resume.rs"]
+pub(crate) mod native_resume;
+pub use native_resume::{
+    NativeResumeCallbackError, NativeResumeCallbackResult, NativeResumeCoordinatorOutcome,
+    NativeResumeCost, NativeResumeFailure, NativeResumeLimits, NativeResumeObservation,
+    NativeResumeOutcome, NativeResumeRefusal, NativeResumeReport, NativeResumeUsage,
+    NativeResumeWork, RetainedNativeResumeError, native_resume_cost,
 };
 
 const MAX_FETCH_PLAN_BATCHES_PER_SHARD: usize = 4_096;
@@ -223,6 +233,25 @@ pub trait ReplicationTransport: Send + Sync + std::fmt::Debug {
     ) -> EngineResult<ReplicationTicket> {
         Ok(ReplicationTicket::completed(
             self.replicate(batch, required_followers),
+        ))
+    }
+
+    /// Starts actual bounded recovered replication with one original deadline.
+    ///
+    /// Any entered pending job MUST return its real ticket, including when E
+    /// elapsed during entry. `Err` means no job entered or all entered work has
+    /// already physically settled. Ticket completion follows every actual
+    /// target/socket/TLS/append job and its cleanup, including followers beyond
+    /// an early quorum. An enqueue or zero-follower acknowledgement is not
+    /// completion. The native caller retains the ticket before observing E and
+    /// drains it on errors and unwind. The default enters no ordinary work.
+    fn begin_recovered_replicate_until(
+        &self,
+        _batch: ReplicaAppend,
+        _original_expiry: Instant,
+    ) -> EngineResult<ReplicationTicket> {
+        Err(EngineError::UnsupportedDurability(
+            "transport has no bounded recovered-replication producer",
         ))
     }
 
@@ -1516,117 +1545,7 @@ impl StreamEngine {
     /// calls this method with its new leader assignments so any event missed by
     /// the previous leader is recovered through the cluster-shared checkpoint.
     pub fn resume_durable_sink(&self, partitions: &[TopicPartition]) -> EngineResult<()> {
-        let Some(durable_sink) = &self.durable_sink else {
-            return Ok(());
-        };
-        let max_bytes = u32::try_from(self.config.max_fetch_bytes).map_err(|_| {
-            EngineError::InvalidConfig("max_fetch_bytes exceeds the sink recovery limit".into())
-        })?;
-        for &topic_partition in partitions {
-            let mut checkpoint = durable_sink.checkpoint(topic_partition)?;
-            let mut recovered_decisions = HashMap::new();
-            let watermarks = self.watermarks(topic_partition)?;
-            if checkpoint.next_offset < watermarks.log_start {
-                return Err(EngineError::DurableSinkCheckpoint(format!(
-                    "checkpoint offset {} for {}/{} is behind retained log start {}",
-                    checkpoint.next_offset,
-                    topic_partition.topic_id,
-                    topic_partition.partition_id,
-                    watermarks.log_start
-                )));
-            }
-            if checkpoint.next_offset > watermarks.contiguous_log_end {
-                return Err(EngineError::DurableSinkCheckpoint(format!(
-                    "checkpoint offset {} for {}/{} is ahead of durable log end {}",
-                    checkpoint.next_offset,
-                    topic_partition.topic_id,
-                    topic_partition.partition_id,
-                    watermarks.contiguous_log_end
-                )));
-            }
-            let target_end = watermarks.contiguous_log_end;
-            while checkpoint.next_offset < target_end {
-                let batches = self.fetch_stored_internal(
-                    FetchRequest {
-                        request_id: 0,
-                        topic_id: topic_partition.topic_id,
-                        partition_id: topic_partition.partition_id,
-                        start_offset: checkpoint.next_offset,
-                        max_bytes,
-                        mode: FetchMode::Ordered,
-                    },
-                    true,
-                )?;
-                if batches.is_empty() {
-                    return Err(EngineError::CorruptState(format!(
-                        "durable sink recovery found no batch at offset {} for {}/{}",
-                        checkpoint.next_offset,
-                        topic_partition.topic_id,
-                        topic_partition.partition_id
-                    )));
-                }
-                for batch in batches {
-                    if batch.reservation.first_offset >= target_end {
-                        break;
-                    }
-                    let next = checkpoint.after(batch.reservation)?;
-                    let recovered_group = batch.atomic_group.map(|group| DurableAtomicGroup {
-                        topic_partition,
-                        transaction_id: group.transaction_id,
-                    });
-                    durable_sink.enqueue_replay(durable_append_from_stored(&self.config, batch))?;
-                    if let Some(group) = recovered_group {
-                        let inspection =
-                            self.inspect_atomic_group(topic_partition, group.transaction_id)?;
-                        if inspection.state != AtomicGroupState::Unresolved {
-                            recovered_decisions.insert(
-                                group,
-                                DurableAtomicDecision {
-                                    group,
-                                    outcome: inspection.state,
-                                },
-                            );
-                        }
-                    }
-                    checkpoint = next;
-                }
-            }
-            for decision in recovered_decisions.values().copied() {
-                durable_sink.enqueue_replay_decision(decision)?;
-            }
-            durable_sink.clear_dirty(topic_partition);
-            if durable_sink.recovery_mode() == DurableSinkRecoveryMode::Blocking {
-                durable_sink.wait_for(checkpoint)?;
-                for group in recovered_decisions.keys().copied() {
-                    durable_sink.wait_for_decision(group)?;
-                }
-            }
-            let log_start = self.watermarks(topic_partition)?.log_start;
-            self.collect_garbage(topic_partition, log_start)?;
-        }
-
-        let mut pending_decisions = Vec::new();
-        for group in durable_sink.pending_atomic_groups()? {
-            if !partitions.contains(&group.topic_partition) {
-                continue;
-            }
-            let inspection =
-                self.inspect_atomic_group(group.topic_partition, group.transaction_id)?;
-            if inspection.state != AtomicGroupState::Unresolved {
-                let decision = DurableAtomicDecision {
-                    group,
-                    outcome: inspection.state,
-                };
-                durable_sink.enqueue_replay_decision(decision)?;
-                pending_decisions.push(group);
-            }
-        }
-        if durable_sink.recovery_mode() == DurableSinkRecoveryMode::Blocking {
-            for group in pending_decisions {
-                durable_sink.wait_for_decision(group)?;
-            }
-        }
-        Ok(())
+        native_resume::ordinary_durable_sink(self, partitions)
     }
 
     /// Replays recovered local WAL batches through the asynchronous replication
@@ -1635,76 +1554,7 @@ impl StreamEngine {
     /// normal idempotent follower append and contiguous progress path then
     /// rebuild remote durability.
     pub fn resume_recovered_replication(&self, partitions: &[TopicPartition]) -> EngineResult<()> {
-        let Some(replication) = &self.replication else {
-            return Ok(());
-        };
-        let max_bytes = u32::try_from(self.config.max_fetch_bytes).map_err(|_| {
-            EngineError::InvalidConfig("max_fetch_bytes exceeds the recovery fetch limit".into())
-        })?;
-        for &topic_partition in partitions {
-            let watermarks = self.watermarks(topic_partition)?;
-            let mut offset = watermarks.log_start;
-            let end = watermarks.contiguous_log_end;
-            while offset < end {
-                let batches = self.fetch_stored_internal(
-                    FetchRequest {
-                        request_id: 0,
-                        topic_id: topic_partition.topic_id,
-                        partition_id: topic_partition.partition_id,
-                        start_offset: offset,
-                        max_bytes,
-                        mode: FetchMode::Ordered,
-                    },
-                    true,
-                )?;
-                if batches.is_empty() {
-                    return Err(EngineError::CorruptState(format!(
-                        "recovery replication found no batch at offset {} for {}/{}",
-                        offset.get(),
-                        topic_partition.topic_id,
-                        topic_partition.partition_id
-                    )));
-                }
-                for batch in batches {
-                    let producer = batch.producer.map(|producer| ProducerIdentity {
-                        producer_id: producer.producer_id,
-                        epoch: producer.epoch,
-                        first_sequence: producer.first_sequence,
-                        event_id: producer.event_id,
-                    });
-                    let payload_digest = batch
-                        .producer
-                        .map_or([0; 16], |producer| producer.payload_digest);
-                    offset = LogicalOffset::new(
-                        batch
-                            .reservation
-                            .last_offset
-                            .get()
-                            .checked_add(1)
-                            .ok_or_else(|| {
-                                EngineError::CorruptState(
-                                    "recovery replication offset space exhausted".into(),
-                                )
-                            })?,
-                    );
-                    replication.replicate(
-                        ReplicaAppend {
-                            reservation: batch.reservation,
-                            producer,
-                            atomic_group: batch.atomic_group.map(|group| AtomicGroupIdentity {
-                                transaction_id: group.transaction_id,
-                                chunk_sequence: group.chunk_sequence,
-                            }),
-                            extension_context: None,
-                            payload_digest,
-                            payload: batch.payload,
-                        },
-                        0,
-                    )?;
-                }
-            }
-        }
-        Ok(())
+        native_resume::ordinary_recovered_replication(self, partitions)
     }
 
     pub fn watermarks(&self, topic_partition: TopicPartition) -> EngineResult<PartitionWatermarks> {

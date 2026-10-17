@@ -1274,7 +1274,8 @@ fn engine_error(error: EngineError) -> ResponseError {
         EngineError::UnknownPartition { .. } | EngineError::UnknownShard(_) => {
             ResponseError::UnknownTopicOrPartition
         }
-        EngineError::AdmissionLimited { .. }
+        EngineError::OperationBusy(_)
+        | EngineError::AdmissionLimited { .. }
         | EngineError::ReplicaReorderLimited { .. }
         | EngineError::ReplicaBufferLimited { .. }
         | EngineError::ReplicaInFlight(_) => ResponseError::ThrottlingQuotaExceeded,

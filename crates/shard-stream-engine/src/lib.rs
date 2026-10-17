@@ -15,6 +15,9 @@ mod recovery_census;
 mod recovery_json;
 mod worker;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use recovery_census::{NativePrimaryOutcomes, NativePrimaryRecovery};
+
 #[cfg(unix)]
 pub use recovery_census::{
     NativeRecoveryCatalog, NativeRecoveryCensus, NativeRecoveryError, NativeRecoveryLimits,
@@ -29,20 +32,26 @@ pub use durable_sink::{
     DurableAppend, DurableAppendDelivery, DurableAppendSink, DurableAppendSinkFactory,
     DurableAtomicDecision, DurableAtomicGroup, DurableSinkApply, DurableSinkAtomicVisibility,
     DurableSinkCheckpoint, DurableSinkConfig, DurableSinkLagPolicy, DurableSinkOptions,
-    DurableSinkRecoveryMode, DurableSinkStats,
+    DurableSinkRecoveryMode, DurableSinkStats, NativeResumeSinkOutcome,
 };
 #[cfg(unix)]
 pub use engine::{OwnedEngineOpenError, OwnedRecoveredEngine};
 
 pub use engine::{
     AtomicGroupInspection, AtomicGroupState, FetchedBatch, NativeFetchCost, NativeFetchFailure,
-    NativeFetchLimits, NativeFetchResult, PartitionEpochs, PartitionWatermarks, ProducerProgress,
+    NativeFetchLimits, NativeFetchResult, NativeResumeCallbackError, NativeResumeCallbackResult,
+    NativeResumeCoordinatorOutcome, NativeResumeCost, NativeResumeFailure, NativeResumeLimits,
+    NativeResumeObservation, NativeResumeOutcome, NativeResumeRefusal, NativeResumeReport,
+    NativeResumeUsage, NativeResumeWork, PartitionEpochs, PartitionWatermarks, ProducerProgress,
     ReplicationProgress, ReplicationStats, ReplicationTicket, ReplicationTransport,
-    RetainedNativeFetchError, RetentionGuard, StreamEngine, native_fetch_cost,
+    RetainedNativeFetchError, RetainedNativeResumeError, RetentionGuard, StreamEngine,
+    native_fetch_cost, native_resume_cost,
 };
 pub use engine_handle::{EngineHandle, WeakEngineHandle};
 pub use error::{EngineError, EngineResult};
 pub use shard_stream_protocol::ReplicaAppend;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use worker::{NativeGcOutcome, NativeResumeGcPolicy};
 // The original native enum, also borrowed by the pre-open census.
 pub use shardlog::{
     JournalEvent, RecoveryExtentHeader, RecoveryExtentTail, RecoveryExtentTailUnknown,

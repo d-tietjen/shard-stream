@@ -259,8 +259,17 @@ mod recovered {
     }
 
     #[derive(Debug, Default)]
-    struct Recording(Mutex<Vec<ReplicaAppend>>);
+    struct Recording(
+        Mutex<Vec<ReplicaAppend>>,
+        Mutex<Option<crate::ReplicationProgress>>,
+    );
     impl ReplicationTransport for Recording {
+        fn install_progress(&self, progress: crate::ReplicationProgress) -> EngineResult<()> {
+            let mut installed = self.1.lock().expect("actual installed native progress");
+            assert!(installed.is_none(), "native progress installs exactly once");
+            *installed = Some(progress);
+            Ok(())
+        }
         fn replicate(&self, batch: ReplicaAppend, required_followers: u32) -> EngineResult<u32> {
             assert_eq!(
                 required_followers, 0,
@@ -284,6 +293,13 @@ mod recovered {
             Some(recording.clone()),
         )
         .expect("actual RF1 native source transport");
+        assert!(
+            recording
+                .1
+                .lock()
+                .expect("actual progress installation")
+                .is_some()
+        );
         topic(&source);
         source
             .append(append(1, b"original native object body"))

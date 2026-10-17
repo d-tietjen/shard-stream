@@ -85,7 +85,7 @@ impl Fixture {
         let worker = thread::spawn(move || {
             run_worker(
                 LaneStores {
-                    primary,
+                    primary: PrimaryStore::Ordinary(primary),
                     tier: None,
                 },
                 receiver,

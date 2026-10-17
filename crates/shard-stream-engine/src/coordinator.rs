@@ -26,6 +26,9 @@ use crate::{
 mod bounded_fetch;
 pub(crate) use bounded_fetch::Failure as BoundedFetchCoordinatorFailure;
 
+#[path = "coordinator_resume.rs"]
+mod bounded_resume;
+
 mod catalog;
 pub(crate) use catalog::apply_recovered_catalog_event;
 
@@ -516,6 +519,7 @@ impl Drop for ControlJournal {
 
 enum CoordinatorCommand {
     BoundedFetch(bounded_fetch::Command),
+    BoundedResume(bounded_resume::Command),
     Create {
         topic_partition: TopicPartition,
         shards: Vec<ShardId>,
@@ -1360,6 +1364,7 @@ fn run_coordinator(
     while let Ok(command) = receiver.recv() {
         match command {
             CoordinatorCommand::BoundedFetch(command) => bounded_fetch::execute(&states, command),
+            CoordinatorCommand::BoundedResume(command) => bounded_resume::execute(&states, command),
             CoordinatorCommand::Create {
                 topic_partition,
                 shards,

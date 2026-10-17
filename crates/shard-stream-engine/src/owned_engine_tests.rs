@@ -1070,7 +1070,7 @@ fn actual_recovered_worker_checks_original_gc_expiry_after_real_queue_residence(
     let (handle, _) = crate::worker::ShardHandle::spawn_recovered(
         &config(&temp.0),
         ShardId::new(0),
-        store,
+        crate::worker::PrimaryStore::Ordinary(store),
         None,
         owner.clone(),
         Instant::now() + Duration::from_secs(30),

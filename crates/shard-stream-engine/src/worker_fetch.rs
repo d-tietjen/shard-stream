@@ -284,29 +284,33 @@ pub(super) fn execute(stores: &mut LaneStores, mut command: Command) {
     }
     let lane = command.reply.lane;
     let operation = std::mem::replace(&mut command.operation, Operation::Taken);
-    let result = match operation {
-        Operation::Plan {
-            topic_partition,
-            start_offset,
-            max_bytes,
-            max_batches,
-        } => BoundedFetchCompletion::Plan {
-            lane,
-            result: stores.primary.plan_fetch_until(
+    let result = match stores.primary.native() {
+        Some(primary) => match operation {
+            Operation::Plan {
                 topic_partition,
                 start_offset,
                 max_bytes,
                 max_batches,
-                &command.budget,
-            ),
+            } => BoundedFetchCompletion::Plan {
+                lane,
+                result: primary.plan_fetch_until(
+                    topic_partition,
+                    start_offset,
+                    max_bytes,
+                    max_batches,
+                    &command.budget,
+                ),
+            },
+            Operation::Read(planned) => BoundedFetchCompletion::Read {
+                lane,
+                result: primary.read_fetch_plan_until(&planned, &command.budget),
+            },
+            Operation::Taken => BoundedFetchCompletion::Stopped {
+                lane,
+                shard: command.reply.shard,
+            },
         },
-        Operation::Read(planned) => BoundedFetchCompletion::Read {
-            lane,
-            result: stores
-                .primary
-                .read_fetch_plan_until(&planned, &command.budget),
-        },
-        Operation::Taken => BoundedFetchCompletion::Stopped {
+        None => BoundedFetchCompletion::Stopped {
             lane,
             shard: command.reply.shard,
         },

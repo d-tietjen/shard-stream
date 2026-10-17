@@ -385,7 +385,8 @@ fn engine_status(error: EngineError) -> Status {
         EngineError::UnknownPartition { .. }
         | EngineError::UnknownShard(_)
         | EngineError::UnknownAtomicGroup(_) => Status::not_found(error.to_string()),
-        EngineError::AdmissionLimited { .. }
+        EngineError::OperationBusy(_)
+        | EngineError::AdmissionLimited { .. }
         | EngineError::ReplicaReorderLimited { .. }
         | EngineError::ReplicaBufferLimited { .. }
         | EngineError::ReplicaInFlight(_)

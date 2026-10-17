@@ -15,6 +15,14 @@ struct CopyPlan {
 }
 
 impl Attempt {
+    fn has_primary_guard(&self, shard: ShardId) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let PrimarySetup::Owned(primary) = &self.primary_setup {
+            return primary.has_guard(shard);
+        }
+        self.shards.iter().any(|(id, _)| *id == shard)
+    }
+
     fn restore_objects(&mut self) -> Result<()> {
         self.clock()?;
         let headers = self
@@ -321,7 +329,7 @@ impl Attempt {
             self.clock()?;
             shards.sync().map_err(identity)?;
             self.clock()?;
-            if !self.shards.iter().any(|(id, _)| *id == shard) {
+            if !self.has_primary_guard(shard) {
                 let lock = directory
                     .open_file(
                         OsStr::new(".shard-store.lock"),
@@ -333,6 +341,11 @@ impl Attempt {
                 self.clock()?;
                 directory.sync().map_err(identity)?;
                 self.clock()?;
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                if let PrimarySetup::Owned(primary) = &mut self.primary_setup {
+                    primary.acquire(shard, &directory, lock, self.expiry)?;
+                    continue;
+                }
                 let guard = ShardRecoveryGuard::try_acquire(
                     lock.file().try_clone().map_err(StorageError::from)?,
                     directory.path().to_owned(),
@@ -447,6 +460,31 @@ impl Attempt {
 }
 
 impl OwnedRecoveryStorage {
+    pub(crate) fn recovery_deny_primary(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let PrimarySetup::Owned(primary) = &mut self.attempt.primary_setup {
+            primary.deny();
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn recovery_gc_policy(
+        &mut self,
+    ) -> Result<Option<crate::worker::NativeResumeGcPolicy>> {
+        if matches!(self.attempt.primary_setup, PrimarySetup::Ordinary) {
+            return Ok(None);
+        }
+        let fixed = size_of::<crate::worker::NativeResumeGcPolicy>();
+        self.recovery_charge(fixed, u64::try_from(fixed).map_err(|_| limited())?)?;
+        let PrimarySetup::Owned(primary) = &self.attempt.primary_setup else {
+            return Err(limited());
+        };
+        Ok(Some(crate::worker::NativeResumeGcPolicy {
+            budget: Arc::clone(&primary.context.budget),
+            limits: primary.context.gc_limits,
+            checks: Arc::clone(&primary.context.gc_checks),
+        }))
+    }
     pub(crate) fn recovery_clock(&self) -> Result<()> {
         self.attempt.clock()
     }
@@ -462,7 +500,7 @@ impl OwnedRecoveryStorage {
     pub(crate) fn recovery_take_shard(
         &mut self,
         shard: ShardId,
-    ) -> Result<(ShardStore, Option<LocalObjectTier>)> {
+    ) -> Result<(PrimaryStore, Option<LocalObjectTier>)> {
         self.attempt.clock()?;
         let index = self
             .attempt
@@ -488,11 +526,11 @@ impl OwnedRecoveryStorage {
         a.charge(
             0,
             sizing_visits,
-            mul(add(a.opened.len(), 1)?, size_of::<ShardStore>())?,
+            mul(add(a.opened.len(), 1)?, size_of::<PrimaryStore>())?,
             0,
             u64::try_from(mul(
                 sizing_visits,
-                size_of::<ShardStore>() + size_of::<Source>(),
+                size_of::<PrimaryStore>() + size_of::<Source>(),
             )?)
             .map_err(|_| limited())?,
         )?;
@@ -510,7 +548,10 @@ impl OwnedRecoveryStorage {
             .try_reserve_exact(a.sources.len())
             .map_err(|_| limited())?;
         let entries = a.opened.iter().try_fold(0usize, |sum, (_, store, _)| {
-            add(sum, store.recovery_catalog_len())
+            add(
+                sum,
+                store.native().ok_or_else(limited)?.recovery_catalog_len(),
+            )
         })?;
         let sources = add(a.sources.len(), entries)?;
         let source_bytes = a.sources.iter().try_fold(0u64, |sum, s| {
@@ -525,6 +566,14 @@ impl OwnedRecoveryStorage {
             mul(add(entries, 1)?, size_of::<TierExtent>() * 4 + 1024)?,
         )?;
         let worker = crate::worker::recovery_worker_bytes(&a.config).ok_or_else(limited)?;
+        let worker = if matches!(a.primary_setup, PrimarySetup::Ordinary) {
+            worker
+        } else {
+            add(
+                worker,
+                crate::worker::recovery_owned_worker_extra_bytes().ok_or_else(limited)?,
+            )?
+        };
         let fixed = mul(
             configured,
             add(
@@ -654,6 +703,8 @@ pub(crate) struct OwnedEngineCustody {
     _journal: Vec<JournalEvent>,
     _missing_paths: Vec<PathBuf>,
     _shards: Vec<(ShardId, ShardRecoveryGuard)>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    _primary: Option<std::sync::Mutex<primary::PrimaryCustody>>,
     _tiers: Vec<(ShardId, TierRecoveryGuard)>,
     _root: Option<OwnedDirectoryHandle>,
     _tier_root: Option<OwnedDirectoryHandle>,
@@ -697,6 +748,11 @@ impl OwnedRecoveryStorage {
             _journal: a.journal,
             _missing_paths: a.missing_paths,
             _shards: a.shards,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            _primary: match a.primary_setup {
+                PrimarySetup::Ordinary => None,
+                PrimarySetup::Owned(primary) => Some(std::sync::Mutex::new(primary.finish())),
+            },
             _tiers: a.tiers,
             _root: a.root,
             _tier_root: a.tier_root,

@@ -40,7 +40,7 @@ pub struct NativeFetchLimits {
     pub max_work_bytes: usize,
 }
 impl NativeFetchLimits {
-    fn storage(self) -> StorageFetchLimits {
+    pub(super) fn storage(self) -> StorageFetchLimits {
         StorageFetchLimits {
             max_plan_batches: self.max_plan_batches_per_shard,
             max_entries: self.max_entries,
@@ -497,6 +497,35 @@ impl EngineHandle {
         let batches = std::mem::take(&mut scope.converted);
         Ok(NativeFetchResult { batches, usage })
     }
+}
+
+// Native replay uses the SAME source algorithm, original E and cumulative
+// storage budget across every pass. This adds no public fetch entry or policy.
+pub(super) fn stored_with_budget(
+    owner: &EngineHandle,
+    request: FetchRequest,
+    limits: NativeFetchLimits,
+    budget: &StorageFetchBudget,
+) -> Result<VecDeque<StoredBatch>, RetainedNativeFetchError> {
+    let early = |failure| RetainedNativeFetchError::early(owner, failure);
+    budget.check().map_err(|error| early(error.into()))?;
+    let bytes = size_of::<Scope>() + size_of::<RetainedNativeFetchError>();
+    budget
+        .charge_values(bytes, 2, bytes)
+        .map_err(|error| early(error.into()))?;
+    budget.check().map_err(|error| early(error.into()))?;
+    let mut scope = Box::new(Scope::retained(owner.clone()));
+    scope.budget = Some(budget.clone());
+    if let Err(error) = budget.check() {
+        return Err(scope.fail(error.into()));
+    }
+    if let Err(error) = run(owner, request, true, limits, budget, &mut scope) {
+        return Err(scope.fail(error));
+    }
+    if let Err(error) = budget.check() {
+        return Err(scope.fail(error.into()));
+    }
+    Ok(std::mem::take(&mut scope.materialized))
 }
 
 fn run(

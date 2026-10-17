@@ -1329,6 +1329,12 @@ impl From<EngineError> for AppError {
             EngineError::TopicAlreadyExists(_) => {
                 Self::new(StatusCode::CONFLICT, "TOPIC_EXISTS", message, false)
             }
+            EngineError::OperationBusy(_) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "OPERATION_BUSY",
+                message,
+                true,
+            ),
             EngineError::AdmissionLimited { .. }
             | EngineError::WorkerStopped(_)
             | EngineError::DurabilityUnavailable { .. }
