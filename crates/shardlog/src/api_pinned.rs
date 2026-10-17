@@ -10,6 +10,7 @@ use super::{
     CANONICAL_STREAM_DIAGNOSTIC, RETAINED_GAP_DIAGNOSTIC, SEQUENCE_OVERFLOW_DIAGNOSTIC,
     ShardLogResult, retained_bounds, validate_catalog_entry,
 };
+use crate::PinnedShardFetchChecks;
 use crate::{
     OpenedPinnedShardStore, Reservation, ShardDirectoryCheckFailure, ShardDirectoryChecks,
     StorageError, StorageFetchBudget, StorageFetchCost, StorageFetchFailure, StorageFetchLimits,
@@ -478,3 +479,468 @@ impl OpenedPinnedShardStore {
 #[cfg(test)]
 #[path = "api_pinned_tests.rs"]
 mod tests;
+
+/// Terminal consuming-read refusal; original typed native results stay retained.
+#[derive(Debug)]
+pub enum PinnedShardLogReadFailure {
+    /// Actual shared native deadline/counters/sticky denial.
+    Native(StorageFetchFailure),
+    /// Actual SAME composing checkpoint refusal.
+    Checkpoint {
+        result: ShardDirectoryCheckFailure,
+        native_postcheck: Option<StorageFetchFailure>,
+    },
+    /// Native metadata planning refused; actual plan error remains retained.
+    Plan,
+    /// Native physical reading refused; actual read error remains retained.
+    Read,
+    /// Shared canonical record validation refused.
+    Canonical,
+    /// Actual requested record allocation refused.
+    Allocation,
+    /// Actual bridge phase/checkpoint unwound.
+    Unwind,
+}
+
+/// Actual completed canonical read checkpoints; no completion/serving witness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinnedShardLogReadPhase {
+    /// Actual native metadata planning returned and is retained.
+    Planned,
+    /// Actual physical read returned and is retained.
+    Read,
+    /// Actual canonical output vector reservation returned and is retained.
+    Allocated,
+    /// Actual shared canonical mapping returned and is retained.
+    Mapped,
+}
+fn read_completed(phase: PinnedShardLogReadPhase) {
+    #[cfg(test)]
+    tests::read_completed(phase);
+    #[cfg(not(test))]
+    let _ = phase;
+}
+struct ReadChecks<'a> {
+    outer: &'a dyn crate::PinnedShardFetchChecks,
+    denial_attempted: std::cell::Cell<bool>,
+    denial_completed: std::cell::Cell<bool>,
+}
+impl ShardDirectoryChecks for ReadChecks<'_> {
+    fn check(&self) -> Result<(), ShardDirectoryCheckFailure> {
+        self.outer.check()
+    }
+}
+impl crate::PinnedShardFetchChecks for ReadChecks<'_> {
+    fn deny(&self) {
+        if !self.denial_attempted.replace(true) {
+            self.outer.deny();
+            self.denial_completed.set(true);
+        }
+    }
+}
+struct LogReadScope {
+    records: Vec<super::ShardLogRecord>,
+    plan: Option<Result<crate::PinnedShardFetchPlan, crate::PinnedShardFetchPlanError>>,
+    read: Option<Result<crate::PinnedShardFetchComplete, crate::PinnedShardFetchReadError>>,
+    mapped: Option<ShardLogResult<super::ShardLogRecord>>,
+    allocation: Option<Result<(), TryReserveError>>,
+    failure: Option<PinnedShardLogReadFailure>,
+    panic_payload: Option<Box<dyn Any + Send>>,
+    budget_deny_panic: Option<Box<dyn Any + Send>>,
+    composing_deny_panic: Option<Box<dyn Any + Send>>,
+    denial_completed: bool,
+    // Last: every actual native result/partial buffer/record precedes whole log.
+    log: OpenedPinnedShardLog,
+}
+/// Real canonical records and native results with the whole actual log LAST.
+pub struct PinnedShardLogReadComplete {
+    scope: LogReadScope,
+}
+impl PinnedShardLogReadComplete {
+    /// Actual shared canonical mapping output, in native selection order.
+    pub fn records(&self) -> &[super::ShardLogRecord] {
+        &self.scope.records
+    }
+    /// Safe original native physical observations retained before postchecks.
+    pub fn observation(&self) -> Option<&crate::PinnedShardFetchObservation> {
+        self.scope.read_observation()
+    }
+    /// Borrow the same actual canonical log, without extracting native storage.
+    pub fn log(&self) -> &OpenedPinnedShardLog {
+        &self.scope.log
+    }
+    /// Destroy read results first and return the WHOLE same log for next pass.
+    pub fn into_log(self) -> OpenedPinnedShardLog {
+        let LogReadScope {
+            records,
+            plan,
+            read,
+            mapped,
+            allocation,
+            failure,
+            panic_payload,
+            budget_deny_panic,
+            composing_deny_panic,
+            denial_completed: _,
+            log,
+        } = self.scope;
+        drop((
+            records,
+            plan,
+            read,
+            mapped,
+            allocation,
+            failure,
+            panic_payload,
+            budget_deny_panic,
+            composing_deny_panic,
+        ));
+        log
+    }
+}
+/// Refusal retains every actual native result and the original whole log LAST.
+pub struct PinnedShardLogReadError {
+    scope: LogReadScope,
+}
+impl PinnedShardLogReadError {
+    /// Actual complete canonical prefix before refusal.
+    pub fn records(&self) -> &[super::ShardLogRecord] {
+        &self.scope.records
+    }
+    /// Actual safe physical observations, including partial buffers and raw IO.
+    pub fn observation(&self) -> Option<&crate::PinnedShardFetchObservation> {
+        self.scope.read_observation()
+    }
+    /// Actual native plan-stage facts when no physical read entered.
+    pub fn plan_observation(&self) -> Option<&crate::PinnedShardFetchObservation> {
+        match self.scope.plan.as_ref()? {
+            Ok(p) => Some(p.observation()),
+            Err(e) => Some(e.observation()),
+        }
+    }
+    /// Original pure canonical mapping error, when one was returned.
+    pub fn canonical_error(&self) -> Option<&StorageError> {
+        self.scope.mapped.as_ref()?.as_ref().err()
+    }
+    /// Actual retained requested output-allocation refusal.
+    pub fn allocation_error(&self) -> Option<&TryReserveError> {
+        self.scope.allocation.as_ref()?.as_ref().err()
+    }
+    /// Actual terminal bridge category; detailed typed native facts stay retained.
+    pub fn failure(&self) -> Option<&PinnedShardLogReadFailure> {
+        self.scope.failure.as_ref()
+    }
+    /// Independent bridge/denial panic payloads; native ones remain in observation.
+    pub fn panic_payloads(&self) -> [Option<&(dyn Any + Send)>; 3] {
+        [
+            self.scope.panic_payload.as_deref(),
+            self.scope.budget_deny_panic.as_deref(),
+            self.scope.composing_deny_panic.as_deref(),
+        ]
+    }
+    /// Whether actual mandatory outer denial returned without unwinding.
+    pub fn denial_completed(&self) -> bool {
+        self.scope.denial_completed
+    }
+}
+impl fmt::Debug for PinnedShardLogReadComplete {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PinnedShardLogReadComplete")
+            .field("records", &self.records().len())
+            .finish_non_exhaustive()
+    }
+}
+impl fmt::Debug for PinnedShardLogReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PinnedShardLogReadError")
+            .field("failure", &self.failure())
+            .field("records", &self.records().len())
+            .finish_non_exhaustive()
+    }
+}
+impl fmt::Display for PinnedShardLogReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "pinned canonical read refused: {:?}", self.failure())
+    }
+}
+impl Error for PinnedShardLogReadError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        if let Some(error) = self.canonical_error() {
+            return Some(error);
+        }
+        if let Some(error) = self.allocation_error() {
+            return Some(error);
+        }
+        if let Some(observation) = self.observation() {
+            if let Some(error) = observation.io_error() {
+                return Some(error);
+            }
+            if let Some(error) = observation.native_error() {
+                return Some(error);
+            }
+        }
+        match self.failure() {
+            Some(PinnedShardLogReadFailure::Native(error)) => Some(error),
+            _ => None,
+        }
+    }
+}
+fn log_read_fixed_fee() -> Result<(usize, usize, usize), StorageFetchFailure> {
+    let values = [
+        size_of::<LogReadScope>(),
+        size_of::<PinnedShardLogReadComplete>(),
+        size_of::<PinnedShardLogReadError>(),
+        size_of::<ReadChecks<'static>>(),
+        size_of::<Vec<super::ShardLogRecord>>(),
+        size_of::<StorageFetchCost>(),
+        size_of::<Option<Result<crate::PinnedShardFetchPlan, crate::PinnedShardFetchPlanError>>>(),
+        size_of::<Option<Result<crate::PinnedShardFetchComplete, crate::PinnedShardFetchReadError>>>(
+        ),
+        size_of::<Option<ShardLogResult<super::ShardLogRecord>>>(),
+        size_of::<Option<Result<(), TryReserveError>>>(),
+        size_of::<Option<PinnedShardLogReadFailure>>(),
+        size_of::<String>(),
+        size_of::<crate::StoredBatch>(),
+        size_of::<bytes::Bytes>(),
+        size_of::<[usize; 2]>(),
+        size_of::<Box<dyn Any + Send>>(),
+        size_of::<Box<dyn Any + Send>>(),
+        size_of::<Box<dyn Any + Send>>(),
+        size_of::<Result<Result<(), PinnedShardLogReadFailure>, Box<dyn Any + Send>>>(),
+    ];
+    let strings = CANONICAL_STREAM_DIAGNOSTIC.len();
+    let bytes = values
+        .into_iter()
+        .try_fold(strings, |sum, n| sum.checked_add(n))
+        .ok_or(StorageFetchFailure::Capacity)?;
+    Ok((
+        bytes,
+        values
+            .len()
+            .checked_add(1)
+            .ok_or(StorageFetchFailure::Capacity)?,
+        strings,
+    ))
+}
+/// Plain read/canonical bridge ceiling, paid before the SAME global budget.
+/// Never create a fresh budget per canonical record/log or recovery page.
+pub fn pinned_shard_log_read_cost(
+    limits: StorageFetchLimits,
+) -> Result<StorageFetchCost, StorageFetchFailure> {
+    // One global budget ceiling, plus separately named constructor and read
+    // headers. Never sum two complete configured ceilings or reset counters.
+    let native = crate::pinned_shard_fetch_cost(limits)?;
+    let (read_bytes, read_entries, read_strings) = log_read_fixed_fee()?;
+    let (open_bytes, open_entries, open_strings) = fixed_fee()?;
+    let fixed = read_bytes
+        .checked_add(open_bytes)
+        .ok_or(StorageFetchFailure::Capacity)?;
+    let entries = read_entries
+        .checked_add(open_entries)
+        .ok_or(StorageFetchFailure::Capacity)?;
+    let strings = read_strings
+        .checked_add(open_strings)
+        .ok_or(StorageFetchFailure::Capacity)?;
+    Ok(StorageFetchCost {
+        declared_bytes: native
+            .declared_bytes
+            .checked_add(fixed)
+            .ok_or(StorageFetchFailure::Capacity)?,
+        entries: native
+            .entries
+            .checked_add(entries)
+            .ok_or(StorageFetchFailure::Capacity)?,
+        string_bytes: native
+            .string_bytes
+            .checked_add(strings)
+            .ok_or(StorageFetchFailure::Capacity)?,
+        work_bytes: native
+            .work_bytes
+            .checked_add(fixed)
+            .and_then(|n| n.checked_add(entries))
+            .ok_or(StorageFetchFailure::Capacity)?,
+    })
+}
+impl LogReadScope {
+    fn read_observation(&self) -> Option<&crate::PinnedShardFetchObservation> {
+        match self.read.as_ref()? {
+            Ok(read) => Some(read.observation()),
+            Err(error) => Some(error.observation()),
+        }
+    }
+    fn run(
+        &mut self,
+        pin: &crate::PinnedShardDirectory,
+        start: u64,
+        max_bytes: usize,
+        max_records: usize,
+        budget: &StorageFetchBudget,
+        checks: &ReadChecks<'_>,
+    ) -> Result<(), PinnedShardLogReadFailure> {
+        let (fixed, entries, _) =
+            log_read_fixed_fee().map_err(PinnedShardLogReadFailure::Native)?;
+        budget
+            .charge_values(fixed, entries, fixed)
+            .map_err(PinnedShardLogReadFailure::Native)?;
+        checkpoint_read(budget, checks)?;
+        self.plan = Some(self.log.scope.opened.plan_fetch_pinned_until(
+            super::topic_partition(),
+            crate::LogicalOffset::new(start),
+            max_bytes,
+            max_records,
+            budget,
+            checks,
+        ));
+        read_completed(PinnedShardLogReadPhase::Planned);
+        checkpoint_read(budget, checks)?;
+        let plan = match self.plan.take() {
+            Some(Ok(plan)) => plan,
+            actual => {
+                self.plan = actual;
+                return Err(PinnedShardLogReadFailure::Plan);
+            }
+        };
+        self.read = Some(
+            self.log
+                .scope
+                .opened
+                .read_fetch_plan_pinned_until(pin, plan, budget, checks),
+        );
+        read_completed(PinnedShardLogReadPhase::Read);
+        checkpoint_read(budget, checks)?;
+        let read = match self.read.as_ref() {
+            Some(Ok(read)) => read,
+            _ => return Err(PinnedShardLogReadFailure::Read),
+        };
+        let n = read.batches().len();
+        let bytes = n.checked_mul(size_of::<super::ShardLogRecord>()).ok_or(
+            PinnedShardLogReadFailure::Native(StorageFetchFailure::Capacity),
+        )?;
+        budget
+            .charge_values(bytes, n, bytes)
+            .map_err(PinnedShardLogReadFailure::Native)?;
+        checkpoint_read(budget, checks)?;
+        self.allocation = Some(self.records.try_reserve_exact(n));
+        read_completed(PinnedShardLogReadPhase::Allocated);
+        checkpoint_read(budget, checks)?;
+        if matches!(self.allocation, Some(Err(_))) {
+            return Err(PinnedShardLogReadFailure::Allocation);
+        }
+        let capacity = self.records.capacity();
+        if capacity > budget.limits().max_plan_batches {
+            return Err(PinnedShardLogReadFailure::Native(
+                StorageFetchFailure::Capacity,
+            ));
+        }
+        let excess = capacity.saturating_sub(n);
+        let extra = excess
+            .checked_mul(size_of::<super::ShardLogRecord>())
+            .ok_or(PinnedShardLogReadFailure::Native(
+                StorageFetchFailure::Capacity,
+            ))?;
+        budget
+            .charge_values(extra, excess, extra)
+            .map_err(PinnedShardLogReadFailure::Native)?;
+        for batch in read.batches() {
+            budget
+                .charge_values(
+                    size_of::<crate::StoredBatch>(),
+                    1,
+                    size_of::<crate::StoredBatch>() + 1,
+                )
+                .map_err(PinnedShardLogReadFailure::Native)?;
+            checkpoint_read(budget, checks)?;
+            self.mapped = Some(super::record_from_batch(batch.clone()));
+            read_completed(PinnedShardLogReadPhase::Mapped);
+            checkpoint_read(budget, checks)?;
+            match self.mapped.take() {
+                Some(Ok(record)) => self.records.push(record),
+                actual => {
+                    self.mapped = actual;
+                    return Err(PinnedShardLogReadFailure::Canonical);
+                }
+            }
+        }
+        checkpoint_read(budget, checks)
+    }
+}
+fn checkpoint_read(
+    budget: &StorageFetchBudget,
+    checks: &ReadChecks<'_>,
+) -> Result<(), PinnedShardLogReadFailure> {
+    budget.check().map_err(PinnedShardLogReadFailure::Native)?;
+    let actual = checks.check();
+    let post = budget.check();
+    match (actual, post) {
+        (Err(result), post) => Err(PinnedShardLogReadFailure::Checkpoint {
+            result,
+            native_postcheck: post.err(),
+        }),
+        (Ok(()), Err(error)) => Err(PinnedShardLogReadFailure::Native(error)),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+impl OpenedPinnedShardLog {
+    /// Consume this actual log through a bounded pinned physical canonical read.
+    ///
+    /// Caller retains the SAME actual pin/Core parent through success/error Drop.
+    /// Every plan, physical range and record uses the supplied cumulative native
+    /// budget/original E and SAME mandatory composing checks. No reopen, copied
+    /// parser, standalone-store factory or operational mutation fallback exists.
+    ///
+    /// # Errors
+    /// Retains actual plan/read/allocation/mapping Results, partial buffers and
+    /// canonical prefix before whole log LAST. Denies SAME counters and attempts
+    /// composing health denial once, preserving independent panic payloads.
+    pub fn read_from_until(
+        self,
+        pin: &crate::PinnedShardDirectory,
+        start_sequence: u64,
+        max_bytes: usize,
+        max_records: usize,
+        budget: &StorageFetchBudget,
+        outer: &dyn crate::PinnedShardFetchChecks,
+    ) -> Result<PinnedShardLogReadComplete, PinnedShardLogReadError> {
+        let mut scope = LogReadScope {
+            records: Vec::new(),
+            plan: None,
+            read: None,
+            mapped: None,
+            allocation: None,
+            failure: None,
+            panic_payload: None,
+            budget_deny_panic: None,
+            composing_deny_panic: None,
+            denial_completed: false,
+            log: self,
+        };
+        let checks = ReadChecks {
+            outer,
+            denial_attempted: std::cell::Cell::new(false),
+            denial_completed: std::cell::Cell::new(false),
+        };
+        let actual = catch_unwind(AssertUnwindSafe(|| {
+            scope.run(pin, start_sequence, max_bytes, max_records, budget, &checks)
+        }));
+        let failure = match actual {
+            Ok(Ok(())) => None,
+            Ok(Err(f)) => Some(f),
+            Err(payload) => {
+                scope.panic_payload = Some(payload);
+                Some(PinnedShardLogReadFailure::Unwind)
+            }
+        };
+        if let Some(failure) = failure {
+            scope.failure = Some(failure);
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| budget.deny())) {
+                scope.budget_deny_panic = Some(payload);
+            }
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| checks.deny())) {
+                scope.composing_deny_panic = Some(payload);
+            }
+            scope.denial_completed = checks.denial_completed.get();
+            return Err(PinnedShardLogReadError { scope });
+        }
+        Ok(PinnedShardLogReadComplete { scope })
+    }
+}

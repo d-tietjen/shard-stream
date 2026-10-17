@@ -32,9 +32,13 @@ mod fetch;
 mod pinned_directory;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use pinned_directory::{
-    OpenedPinnedShardStore, PinnedStoreDirectoryEntry, PinnedStoreOpenChecks, PinnedStoreOpenCost,
-    PinnedStoreOpenError, PinnedStoreOpenFailure, PinnedStoreOpenLimits, PinnedStoreOpenOutcome,
-    PinnedStoreOpenPhase, PinnedStoreOpenUsage, pinned_store_open_cost,
+    OpenedPinnedShardStore, PinnedShardFetchChecks, PinnedShardFetchComplete, PinnedShardFetchCost,
+    PinnedShardFetchFailure, PinnedShardFetchObservation, PinnedShardFetchOutcome,
+    PinnedShardFetchPhase, PinnedShardFetchPlan, PinnedShardFetchPlanError,
+    PinnedShardFetchReadError, PinnedStoreDirectoryEntry, PinnedStoreOpenChecks,
+    PinnedStoreOpenCost, PinnedStoreOpenError, PinnedStoreOpenFailure, PinnedStoreOpenLimits,
+    PinnedStoreOpenOutcome, PinnedStoreOpenPhase, PinnedStoreOpenUsage, pinned_shard_fetch_cost,
+    pinned_store_open_cost,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use pinned_directory::{

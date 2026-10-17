@@ -115,12 +115,15 @@ impl ShardStore {
                         size_of::<ExtentLocation>() + size_of::<StoredBatchMetadata>(),
                     )?;
                 }
-                let next = used.checked_add(location.payload_len).ok_or_else(|| {
-                    StorageError::LimitExceeded("fetch byte count overflow".into())
-                })?;
-                if !result.is_empty() && next > max_bytes {
+                let Some(next) = selected_fetch_bytes(
+                    used,
+                    location.payload_len,
+                    !result.is_empty(),
+                    max_bytes,
+                )?
+                else {
                     break;
-                }
+                };
                 fetch_check(budget)?;
                 result.push(self.metadata_for(location));
                 used = next;
@@ -213,10 +216,7 @@ impl ShardStore {
                         budget.charge(0, 0, 0, 0, size_of::<StoredBatchMetadata>())?;
                     }
                     let next = planned[end];
-                    if next.pack_sequence != planned[first].pack_sequence
-                        || next.payload_offset < range_end
-                        || next.payload_offset - range_end > MAX_COALESCED_READ_GAP
-                    {
+                    if !coalesces(&planned[first], &next, range_end) {
                         break;
                     }
                     range_end = payload_end(&next)?;
@@ -324,7 +324,7 @@ impl ShardStore {
     }
 }
 
-fn payload_end(metadata: &StoredBatchMetadata) -> StorageResult<u64> {
+pub(super) fn payload_end(metadata: &StoredBatchMetadata) -> StorageResult<u64> {
     metadata
         .payload_offset
         .checked_add(
@@ -412,4 +412,29 @@ fn read_exact_at_inner(
         fetch_check(budget)?;
     }
     Ok(())
+}
+
+// Shared selection and coalescing policy; the caller owns all charging and IO.
+pub(super) fn selected_fetch_bytes(
+    used: usize,
+    payload_len: usize,
+    has_batches: bool,
+    max_bytes: usize,
+) -> StorageResult<Option<usize>> {
+    let next = used
+        .checked_add(payload_len)
+        .ok_or_else(|| StorageError::LimitExceeded("fetch byte count overflow".into()))?;
+    if has_batches && next > max_bytes {
+        return Ok(None);
+    }
+    Ok(Some(next))
+}
+pub(super) fn coalesces(
+    first: &StoredBatchMetadata,
+    next: &StoredBatchMetadata,
+    range_end: u64,
+) -> bool {
+    !(next.pack_sequence != first.pack_sequence
+        || next.payload_offset < range_end
+        || next.payload_offset - range_end > MAX_COALESCED_READ_GAP)
 }

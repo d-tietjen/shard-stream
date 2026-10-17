@@ -320,9 +320,26 @@ pub enum PinnedStoreOpenOutcome {
     },
 }
 
+#[path = "pinned_fetch.rs"]
+mod fetch;
+pub use fetch::{
+    PinnedShardFetchChecks, PinnedShardFetchComplete, PinnedShardFetchCost,
+    PinnedShardFetchFailure, PinnedShardFetchObservation, PinnedShardFetchOutcome,
+    PinnedShardFetchPhase, PinnedShardFetchPlan, PinnedShardFetchPlanError,
+    PinnedShardFetchReadError, pinned_shard_fetch_cost,
+};
+
+#[derive(Clone, Copy, Debug)]
+struct ScannedPack {
+    sequence: u64,
+    slot: usize,
+    identity: (u64, u64),
+}
+
 #[derive(Debug)]
 struct FileSlot {
     phase: PinnedStoreOpenPhase,
+    validated_identity: Option<(u64, u64)>,
     // None only after this exact actual FD moved into the completed store.
     result: Option<io::Result<File>>,
 }
@@ -436,6 +453,10 @@ struct Scope {
     work: Work,
     outcomes: Vec<PinnedStoreOpenOutcome>,
     files: Vec<FileSlot>,
+    // Genuine sequence-to-scanned-FD association; active FD later moves into store.
+    scanned: Vec<ScannedPack>,
+    scanned_allocation: Option<Result<(), TryReserveError>>,
+    scanned_capacity: usize,
     directory_buffer: Vec<MaybeUninit<u8>>,
     // Transient owned names/paths remain outside the unwind closure as well.
     current_name: Option<OsString>,
@@ -511,6 +532,32 @@ fn prepare_name(
     }
 }
 
+// Independent requests for the retained identity association. Requested and
+// actual-capacity ceilings are both paid before its allocation; no larger
+// Scope/FileSlot is treated as an implicit identity/result/header entry fee.
+fn scanned_setup_fee(packs: usize, files: usize) -> Option<(usize, usize)> {
+    let values = [
+        size_of::<Vec<ScannedPack>>(),
+        size_of::<ScannedPack>(),
+        size_of::<(u64, u64)>(),
+        size_of::<Option<(u64, u64)>>(),
+        size_of::<Option<Result<(), TryReserveError>>>(),
+        size_of::<usize>(),
+    ];
+    let fixed = values.into_iter().try_fold(0usize, usize::checked_add)?;
+    let pack_slots =
+        packs.checked_mul(size_of::<ScannedPack>().checked_add(size_of::<(u64, u64)>())?)?;
+    let identities = files.checked_mul(size_of::<Option<(u64, u64)>>())?;
+    let bytes = fixed
+        .checked_add(pack_slots.checked_mul(2)?)?
+        .checked_add(identities)?;
+    let entries = values
+        .len()
+        .checked_add(packs.checked_mul(4)?)?
+        .checked_add(files)?;
+    Some((bytes, entries))
+}
+
 /// Plain actual setup/dynamic costs before calling the bounded open producer.
 ///
 /// The same composing owner must prepay this finite logical domain. It includes
@@ -571,6 +618,7 @@ pub fn pinned_store_open_cost(
         .max_outcomes
         .checked_mul(size_of::<PinnedStoreOpenOutcome>())?;
     let file_bytes = files.checked_mul(size_of::<FileSlot>())?;
+    let scanned_fee = scanned_setup_fee(limits.max_packs, files)?;
     // Actual empty native read pool allocates available slots and a bounded
     // recycled-message channel, both with the configured native slot count.
     let pool_entries = READ_BUFFER_POOL_SLOTS.checked_mul(2)?;
@@ -578,12 +626,14 @@ pub fn pinned_store_open_cost(
     let setup = fixed_bytes
         .checked_add(outcome_bytes)?
         .checked_add(file_bytes)?
+        .checked_add(scanned_fee.0)?
         .checked_add(limits.directory_buffer_bytes)?
         .checked_add(pool_bytes)?;
     let entries = fixed
         .len()
         .checked_add(limits.max_outcomes)?
         .checked_add(files)?
+        .checked_add(scanned_fee.1)?
         .checked_add(pool_entries)?
         .checked_add(1)?
         .checked_add(limits.max_entries)?;
@@ -617,6 +667,9 @@ impl Scope {
             },
             outcomes: Vec::new(),
             files: Vec::new(),
+            scanned: Vec::new(),
+            scanned_allocation: None,
+            scanned_capacity: 0,
             directory_buffer: Vec::new(),
             current_name: None,
             current_path: None,
@@ -674,6 +727,27 @@ impl Scope {
         self.work.check(checks)?;
         if self.allocation_error.is_some() {
             return Err(PinnedStoreOpenFailure::Allocation);
+        }
+        // SAME cumulative work also charges these separate actual requests.
+        let (bytes, entries) = scanned_setup_fee(self.work.limits.max_packs, files)
+            .ok_or(PinnedStoreOpenFailure::Capacity)?;
+        self.work.charge(
+            Debit {
+                declared: bytes,
+                entries,
+                work: bytes,
+                ..Debit::default()
+            },
+            checks,
+        )?;
+        self.scanned_allocation = Some(self.scanned.try_reserve_exact(self.work.limits.max_packs));
+        self.scanned_capacity = self.scanned.capacity();
+        self.work.check(checks)?;
+        if matches!(self.scanned_allocation, Some(Err(_))) {
+            return Err(PinnedStoreOpenFailure::Allocation);
+        }
+        if self.scanned_capacity > self.work.limits.max_packs {
+            return Err(PinnedStoreOpenFailure::Capacity);
         }
         self.allocation_error = self
             .directory_buffer
@@ -1047,6 +1121,7 @@ impl Scope {
         let slot = self.files.len();
         self.files.push(FileSlot {
             phase,
+            validated_identity: None,
             result: Some(observed),
         });
         self.after(
@@ -1593,6 +1668,17 @@ impl Scope {
         if actual != named || actual.2 != 1 || actual.3 != FileType::RegularFile {
             return Err(PinnedStoreOpenFailure::Identity);
         }
+        self.work.charge(
+            Debit {
+                work: size_of::<FileSlot>() + size_of::<Option<(u64, u64)>>(),
+                ..Debit::default()
+            },
+            checks,
+        )?;
+        self.files
+            .get_mut(slot)
+            .ok_or(PinnedStoreOpenFailure::Invariant)?
+            .validated_identity = Some((actual.0, actual.1));
         Ok(())
     }
 }
@@ -1704,6 +1790,7 @@ impl Scope {
         let slot = self.files.len();
         self.files.push(FileSlot {
             phase: PinnedStoreOpenPhase::LeaseCloned,
+            validated_identity: None,
             result: Some(observed),
         });
         self.lease_slot = Some(slot);
@@ -2014,6 +2101,7 @@ impl Scope {
         let slot = self.files.len();
         self.files.push(FileSlot {
             phase: PinnedStoreOpenPhase::InitialPackCreated,
+            validated_identity: None,
             result: Some(observed),
         });
         self.after(
@@ -2102,6 +2190,27 @@ impl Scope {
         self.prepare_current_name(checks)?;
         self.validate_prepared_file(pin, slot, checks, completed)?;
         let file_len = self.metadata(slot, checks, completed)?;
+        if self.scanned.len() == self.work.limits.max_packs {
+            return Err(PinnedStoreOpenFailure::Capacity);
+        }
+        self.work.charge(
+            Debit {
+                work: size_of::<ScannedPack>(),
+                ..Debit::default()
+            },
+            checks,
+        )?;
+        let identity = self
+            .files
+            .get(slot)
+            .and_then(|file| file.validated_identity)
+            .ok_or(PinnedStoreOpenFailure::Invariant)?;
+        self.scanned.push(ScannedPack {
+            sequence,
+            slot,
+            identity,
+        });
+        self.work.check(checks)?;
         let mut offset = 0u64;
         while offset < file_len {
             self.work.check(checks)?;
@@ -2490,6 +2599,9 @@ impl fmt::Display for PinnedStoreOpenError {
 }
 impl Error for PinnedStoreOpenError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
+        if let Some(Err(error)) = &self.scope.scanned_allocation {
+            return Some(error);
+        }
         if let Some(error) = &self.scope.native_error {
             return Some(error);
         }
@@ -2706,3 +2818,14 @@ impl ShardStore {
 #[cfg(test)]
 #[path = "pinned_store_open_tests.rs"]
 mod tests;
+
+impl PinnedStoreOpenError {
+    /// Actual new identity-vector reservation error, without carrier extraction.
+    pub fn scanned_allocation_error(&self) -> Option<&TryReserveError> {
+        self.scope.scanned_allocation.as_ref()?.as_ref().err()
+    }
+    /// Actual identity-vector capacity retained before its postcheck.
+    pub fn scanned_pack_capacity(&self) -> usize {
+        self.scope.scanned_capacity
+    }
+}

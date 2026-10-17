@@ -23,7 +23,9 @@ mod tier;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use api::{
     OpenedPinnedShardLog, PinnedShardLogOpenChecks, PinnedShardLogOpenError,
-    PinnedShardLogOpenFailure, PinnedShardLogOpenObservation, pinned_shard_log_open_cost,
+    PinnedShardLogOpenFailure, PinnedShardLogOpenObservation, PinnedShardLogReadComplete,
+    PinnedShardLogReadError, PinnedShardLogReadFailure, PinnedShardLogReadPhase,
+    pinned_shard_log_open_cost, pinned_shard_log_read_cost,
 };
 pub use api::{
     ShardLog, ShardLogAppendReceipt, ShardLogCompactionReceipt, ShardLogConfig, ShardLogRecord,
@@ -54,9 +56,13 @@ pub use extent::{
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use extent::{
-    OpenedPinnedShardStore, PinnedStoreDirectoryEntry, PinnedStoreOpenChecks, PinnedStoreOpenCost,
-    PinnedStoreOpenError, PinnedStoreOpenFailure, PinnedStoreOpenLimits, PinnedStoreOpenOutcome,
-    PinnedStoreOpenPhase, PinnedStoreOpenUsage, pinned_store_open_cost,
+    OpenedPinnedShardStore, PinnedShardFetchChecks, PinnedShardFetchComplete, PinnedShardFetchCost,
+    PinnedShardFetchFailure, PinnedShardFetchObservation, PinnedShardFetchOutcome,
+    PinnedShardFetchPhase, PinnedShardFetchPlan, PinnedShardFetchPlanError,
+    PinnedShardFetchReadError, PinnedStoreDirectoryEntry, PinnedStoreOpenChecks,
+    PinnedStoreOpenCost, PinnedStoreOpenError, PinnedStoreOpenFailure, PinnedStoreOpenLimits,
+    PinnedStoreOpenOutcome, PinnedStoreOpenPhase, PinnedStoreOpenUsage, pinned_shard_fetch_cost,
+    pinned_store_open_cost,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use extent::{

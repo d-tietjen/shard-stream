@@ -38,9 +38,13 @@ pub use gc::{
 mod store_open;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use store_open::{
-    OpenedPinnedShardStore, PinnedStoreDirectoryEntry, PinnedStoreOpenChecks, PinnedStoreOpenCost,
-    PinnedStoreOpenError, PinnedStoreOpenFailure, PinnedStoreOpenLimits, PinnedStoreOpenOutcome,
-    PinnedStoreOpenPhase, PinnedStoreOpenUsage, pinned_store_open_cost,
+    OpenedPinnedShardStore, PinnedShardFetchChecks, PinnedShardFetchComplete, PinnedShardFetchCost,
+    PinnedShardFetchFailure, PinnedShardFetchObservation, PinnedShardFetchOutcome,
+    PinnedShardFetchPhase, PinnedShardFetchPlan, PinnedShardFetchPlanError,
+    PinnedShardFetchReadError, PinnedStoreDirectoryEntry, PinnedStoreOpenChecks,
+    PinnedStoreOpenCost, PinnedStoreOpenError, PinnedStoreOpenFailure, PinnedStoreOpenLimits,
+    PinnedStoreOpenOutcome, PinnedStoreOpenPhase, PinnedStoreOpenUsage, pinned_shard_fetch_cost,
+    pinned_store_open_cost,
 };
 
 /// Finite source allowances for one real directory/lease identity observation.

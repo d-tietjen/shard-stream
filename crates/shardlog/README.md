@@ -123,3 +123,64 @@ counters use this coherent inventory. An actual sixteen-record history succeeds
 with a generous finite policy and refuses an independently configured 22-entry
 policy before catalog allocation or inspection. This is a small accounting
 regression fixture; it provides no whole-startup or production-cap qualification.
+
+## Pinned descriptor reads
+
+On Linux and Android, `OpenedPinnedShardStore::plan_fetch_pinned_until` and
+`read_fetch_plan_pinned_until` select the ordinary metadata policy and read the
+actual descriptors retained by bounded open. Open records each scanned pack's
+sequence, file slot and validated identity in a separately prepaid bounded
+vector. The active descriptor is the exact file moved into the ordinary store;
+sealed descriptors remain in their original successful file slots. No pack is
+reopened or reconstructed from a pathname or a claimed owner.
+
+The read validates the supplied pin against the actual retained directory and
+lease, then checks each retained pack name and held descriptor before direct
+`pread` attempts. Original leading-zero filenames remain unchanged. Hardlinks,
+symlinks and regular inode replacements refuse. A native plan retains its real
+store token and epoch. Untracked ordinary active appends or rotations refuse;
+this read producer does not qualify ordinary mutation, GC or later operational
+distribution. The composing Core owner must retain its same parent and check
+that parent's recursive identity through the borrowed checkpoints.
+
+Each plan, range, stat, allocation, short/EOF/error/EINTR read and record mapping
+uses the SAME supplied `StorageFetchBudget` and original deadline. The seven
+existing limit axes remain unchanged. Every physical attempt consumes finite
+cumulative entries; each `pread` additionally consumes requested read bytes and
+a read-attempt slot. Hash-table capacity and conservative complete BTree entry
+traversals are charged before actual probes. Full pathname scans and bounded
+native name conversion are prepaid before parsing or syscalls. The logical
+cost helper counts source-visible values, requested buffers, actual metadata
+capacities and independent result/panic/header slots; it makes no allocator,
+private library-layout, kernel or whole-process RSS/performance claim.
+
+Retained results precede postchecks and completion observers. Refusal first
+latches the same native counters and attempts the actual composing health
+callback before partial buffers or physical owners can drop. No new sync or
+write settlement is invented for reads. Partial bytes, native errors, actual
+allocation results and independent unwind payloads remain observable without
+exposing files, raw descriptors, parts constructors or storage factories.
+
+`OpenedPinnedShardLog::read_from_until` consumes the whole canonical log and
+keeps it last in both success and refusal. It shares ordinary canonical record
+mapping and the same native budget across planning, physical reading, mapping
+and later pages; `into_log` destroys read results before returning that whole
+same log. Plain costs must be prepaid once before the shared budget is created,
+with each actual composing bridge's additional costs paid separately. Success
+stores no startup budget, Session or borrowed callback.
+
+The new regression source exercises real ordinary-written histories, empty and
+zero-payload reads, multiple packs, leading-zero names, sparse native indexes,
+real namespace/identity changes, actual partial reads and EOF, original-E and
+unwind boundaries, immutable low-entry policies, cumulative remaining budgets
+and real lease drop order. These groups remain uncompiled and unexecuted at
+this source checkpoint. Existing native open and canonical-constructor groups
+remain preserved. Core owning-log adoption, bounded writes/seal/compaction,
+Blossom recovery, C1/census integration, configured 64/256 MiB positives and full
+host/currentness/serving qualification remain separate required gates.
+
+Future write integration must retain real append reports and explicitly extend
+this tracked identity set. Retired active file descriptors in those reports
+and the exact new active store file must stay with their physical owners;
+safe canonical reports must not expose those raw file-bearing wrappers. This
+initial-history read unit provides no such write or rotation handoff.

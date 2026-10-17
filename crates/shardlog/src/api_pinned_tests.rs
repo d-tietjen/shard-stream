@@ -619,3 +619,312 @@ fn retained_result_panic_and_diagnostic_slots_are_paid_before_real_catalog_work(
     assert_eq!(f.root.snapshot(), before);
     f.root.contended();
 }
+
+// Genuine consuming canonical-read groups; all original constructor groups and
+// helpers above remain byte-for-byte preserved. These are not host/C1 tests.
+type ReadObserver = Box<dyn FnMut(PinnedShardLogReadPhase)>;
+thread_local! {static READ_OBSERVER:RefCell<Option<ReadObserver>>=RefCell::new(None);}
+pub(super) fn read_completed(phase: PinnedShardLogReadPhase) {
+    READ_OBSERVER.with(|slot| {
+        if let Some(callback) = &mut *slot.borrow_mut() {
+            callback(phase);
+        }
+    });
+}
+struct ObserveRead;
+impl Drop for ObserveRead {
+    fn drop(&mut self) {
+        READ_OBSERVER.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+fn observe_read(callback: impl FnMut(PinnedShardLogReadPhase) + 'static) -> ObserveRead {
+    READ_OBSERVER.with(|slot| {
+        assert!(slot.borrow().is_none());
+        *slot.borrow_mut() = Some(Box::new(callback));
+    });
+    ObserveRead
+}
+impl crate::PinnedShardFetchChecks for Checks {
+    fn deny(&self) {
+        self.denied.set(true);
+        if self.panic_deny.get() {
+            std::panic::panic_any("actual canonical read denial unwind");
+        }
+    }
+}
+struct ReadChecksCount {
+    denied: Cell<bool>,
+    calls: Cell<usize>,
+    panic_deny: bool,
+}
+impl ShardDirectoryChecks for ReadChecksCount {
+    fn check(&self) -> Result<(), ShardDirectoryCheckFailure> {
+        if self.denied.get() {
+            Err(ShardDirectoryCheckFailure::Refused)
+        } else {
+            Ok(())
+        }
+    }
+}
+impl crate::PinnedShardFetchChecks for ReadChecksCount {
+    fn deny(&self) {
+        self.denied.set(true);
+        self.calls.set(self.calls.get() + 1);
+        if self.panic_deny {
+            std::panic::panic_any("actual canonical composing denial panic");
+        }
+    }
+}
+#[test]
+fn consuming_real_canonical_read_matches_ordinary_records_and_keeps_whole_log() {
+    for sequences in [vec![], vec![7], vec![7, 8, 9]] {
+        let fixture = Fixture::new(&sequences, 1);
+        let before = fixture.root.snapshot();
+        let budget =
+            StorageFetchBudget::new(limits(), expiry()).expect("one original shared budget");
+        let log = fixture
+            .opened()
+            .into_shard_log_until(&budget, &Checks::new())
+            .expect("actual canonical index");
+        let complete = log
+            .read_from_until(&fixture.pin, 0, 8192, 16, &budget, &Checks::new())
+            .expect("genuine consuming physical canonical read");
+        assert_eq!(
+            complete
+                .records()
+                .iter()
+                .map(|r| r.sequence)
+                .collect::<Vec<_>>(),
+            sequences
+        );
+        assert!(
+            complete
+                .records()
+                .iter()
+                .all(|r| r.payload.as_ref() == b"real canonical record")
+        );
+        assert_eq!(fixture.root.snapshot(), before);
+        fixture.root.contended();
+        let log = complete.into_log();
+        assert_eq!(
+            log.bounds().map(|b| b.1 - b.0).unwrap_or(0),
+            sequences.len() as u64
+        );
+        fixture.root.contended();
+    }
+}
+#[test]
+fn consuming_canonical_success_and_failure_keep_native_lease_through_actual_last_drop() {
+    for success in [false, true] {
+        let fixture = Fixture::new(&[3], 1);
+        let mut policy = limits();
+        if !success {
+            policy.max_read_attempts = 0;
+        }
+        let budget =
+            StorageFetchBudget::new(policy, expiry()).expect("immutable real finite policy");
+        let log = fixture
+            .opened()
+            .into_shard_log_until(&budget, &Checks::new())
+            .expect("genuine conversion performs no read");
+        let result = log.read_from_until(&fixture.pin, 3, 8192, 16, &budget, &Checks::new());
+        assert_eq!(result.is_ok(), success);
+        let Fixture {
+            pin,
+            root,
+            config: _,
+        } = fixture;
+        drop(pin);
+        root.contended();
+        match result {
+            Ok(complete) => {
+                let log = complete.into_log();
+                root.contended();
+                drop(log);
+            }
+            Err(error) => drop(error),
+        }
+        let contender = root.lock();
+        fs2::FileExt::try_lock_exclusive(&contender).expect("actual final native owner released");
+    }
+}
+#[test]
+fn consuming_canonical_pages_use_remaining_original_budget_without_per_log_reset() {
+    let fixture = Fixture::new(&[2, 3], 1 << 20);
+    let mut policy = limits();
+    policy.max_read_attempts = 1;
+    let budget =
+        StorageFetchBudget::new(policy, expiry()).expect("one original immutable read attempt");
+    let log = fixture
+        .opened()
+        .into_shard_log_until(&budget, &Checks::new())
+        .expect("real canonical adoption");
+    let first = log
+        .read_from_until(&fixture.pin, 2, 8192, 1, &budget, &Checks::new())
+        .expect("first real page");
+    assert_eq!(first.records()[0].sequence, 2);
+    let log = first.into_log();
+    let checks = Checks::new();
+    let error = log
+        .read_from_until(&fixture.pin, 3, 8192, 1, &budget, &checks)
+        .expect_err("second page cannot reset shared allowance");
+    assert_eq!(
+        budget
+            .usage()
+            .expect("actual cumulative usage")
+            .read_attempts,
+        1
+    );
+    assert!(checks.denied.get());
+    assert!(error.observation().is_some());
+    fixture.root.contended();
+}
+#[test]
+fn actual_completed_canonical_result_survives_late_and_unwind_before_prefix_publication() {
+    for phase in [
+        PinnedShardLogReadPhase::Planned,
+        PinnedShardLogReadPhase::Read,
+        PinnedShardLogReadPhase::Allocated,
+        PinnedShardLogReadPhase::Mapped,
+    ] {
+        for unwind in [false, true] {
+            let fixture = Fixture::new(&[4, 5], 1 << 20);
+            let opened = fixture.opened();
+            let e = Instant::now() + Duration::from_secs(2);
+            let budget = StorageFetchBudget::new(limits(), e).expect("actual original E");
+            let log = opened
+                .into_shard_log_until(&budget, &Checks::new())
+                .expect("actual conversion fits before completed read hook");
+            let mut once = false;
+            let _observer = observe_read(move |actual| {
+                if actual == phase && !once {
+                    once = true;
+                    if unwind {
+                        std::panic::panic_any(std::io::Error::other(
+                            "actual canonical mapping completion unwind",
+                        ));
+                    }
+                    while Instant::now() < e {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            });
+            let checks = Checks::new();
+            let error = log
+                .read_from_until(&fixture.pin, 4, 8192, 16, &budget, &checks)
+                .expect_err("actual completed result late/unwind");
+            assert!(checks.denied.get());
+            assert!(budget.check().is_err());
+            match phase {
+                PinnedShardLogReadPhase::Planned => {
+                    assert!(matches!(error.scope.plan, Some(Ok(_))))
+                }
+                PinnedShardLogReadPhase::Read
+                | PinnedShardLogReadPhase::Allocated
+                | PinnedShardLogReadPhase::Mapped => {
+                    assert!(matches!(error.scope.read, Some(Ok(_))))
+                }
+            }
+            if phase == PinnedShardLogReadPhase::Mapped {
+                assert!(matches!(error.scope.mapped, Some(Ok(_))));
+            }
+            if unwind {
+                assert!(error.panic_payloads()[0].is_some());
+            }
+            fixture.root.contended();
+        }
+    }
+}
+#[test]
+fn same_composing_refusal_after_completed_native_read_keeps_typed_success_and_whole_log() {
+    let fixture = Fixture::new(&[8], 1 << 20);
+    let budget = StorageFetchBudget::new(limits(), expiry()).expect("actual counters");
+    let log = fixture
+        .opened()
+        .into_shard_log_until(&budget, &Checks::new())
+        .expect("actual log");
+    let checks = Checks::new();
+    let armed = Rc::clone(&checks.armed);
+    let _observer = observe_read(move |phase| {
+        if phase == PinnedShardLogReadPhase::Read {
+            armed.set(true);
+        }
+    });
+    let error = log
+        .read_from_until(&fixture.pin, 8, 8192, 16, &budget, &checks)
+        .expect_err("same captured work refuses after actual read");
+    assert!(matches!(error.scope.read, Some(Ok(_))));
+    assert!(
+        error
+            .observation()
+            .expect("retained real IO")
+            .outcomes()
+            .iter()
+            .any(|o| matches!(
+                o,
+                crate::PinnedShardFetchOutcome::Read { result: Ok(_), .. }
+            ))
+    );
+    assert!(checks.denied.get());
+    fixture.root.contended();
+}
+#[test]
+fn native_read_denial_panic_is_not_retried_by_consuming_canonical_bridge() {
+    let fixture = Fixture::new(&[6], 1 << 20);
+    let mut policy = limits();
+    policy.max_read_attempts = 0;
+    let budget =
+        StorageFetchBudget::new(policy, expiry()).expect("actual immutable zero read attempts");
+    let log = fixture
+        .opened()
+        .into_shard_log_until(&budget, &Checks::new())
+        .expect("actual canonical history");
+    let checks = ReadChecksCount {
+        denied: Cell::new(false),
+        calls: Cell::new(0),
+        panic_deny: true,
+    };
+    let error = log
+        .read_from_until(&fixture.pin, 6, 8192, 16, &budget, &checks)
+        .expect_err("actual native read denial unwinds");
+    assert_eq!(checks.calls.get(), 1);
+    assert!(!error.denial_completed());
+    assert!(
+        error
+            .observation()
+            .expect("retained native failure")
+            .panic_payloads()[2]
+            .is_some()
+    );
+    fixture.root.contended();
+}
+
+#[test]
+fn actual_canonical_read_bridge_fixed_slots_refuse_one_less_before_native_plan_entry() {
+    let fixture = Fixture::new(&[11], 1 << 20);
+    // The genuine one-record constructor spends23 fixed slots plus one actual
+    // sequence. Nineteen read values and one diagnostic buffer then need20.
+    // Neither allowance is refreshed; the next native planner needs its own44.
+    for fits in [false, true] {
+        let opened = fixture.opened();
+        let mut policy = limits();
+        policy.max_entries = if fits { 44 } else { 43 };
+        let budget = StorageFetchBudget::new(policy, expiry())
+            .expect("actual unchanged immutable entry policy");
+        let log = opened
+            .into_shard_log_until(&budget, &Checks::new())
+            .expect("actual24-entry canonical construction");
+        let checks = Checks::new();
+        let error = log
+            .read_from_until(&fixture.pin, 11, 8192, 1, &budget, &checks)
+            .expect_err("later native plan still needs independent entries");
+        assert_eq!(error.scope.plan.is_some(), fits);
+        assert_eq!(
+            budget.usage().expect("same cumulative counters").entries,
+            if fits { 44 } else { 24 }
+        );
+        assert!(error.observation().is_none());
+        assert!(checks.denied.get());
+        fixture.root.contended();
+    }
+}

@@ -13,7 +13,9 @@ mod pinned;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use pinned::{
     OpenedPinnedShardLog, PinnedShardLogOpenChecks, PinnedShardLogOpenError,
-    PinnedShardLogOpenFailure, PinnedShardLogOpenObservation, pinned_shard_log_open_cost,
+    PinnedShardLogOpenFailure, PinnedShardLogOpenObservation, PinnedShardLogReadComplete,
+    PinnedShardLogReadError, PinnedShardLogReadFailure, PinnedShardLogReadPhase,
+    pinned_shard_log_open_cost, pinned_shard_log_read_cost,
 };
 
 use crate::{
@@ -186,13 +188,7 @@ impl ShardLog {
         self.inner
             .read_fetch_plan(&plan)?
             .into_iter()
-            .map(|batch| {
-                let sequence = validate_catalog_entry(batch.reservation)?;
-                Ok(ShardLogRecord {
-                    sequence,
-                    payload: batch.payload,
-                })
-            })
+            .map(record_from_batch)
             .collect()
     }
 
@@ -286,4 +282,13 @@ fn retained_bounds(sequences: &mut [u64]) -> ShardLogResult<Option<(u64, u64)>> 
         .checked_add(1)
         .ok_or_else(sequence_overflow)?;
     Ok(Some((first, next)))
+}
+
+// Shared whole ordinary batch-to-canonical-record mapping.
+fn record_from_batch(batch: crate::StoredBatch) -> ShardLogResult<ShardLogRecord> {
+    let sequence = validate_catalog_entry(batch.reservation)?;
+    Ok(ShardLogRecord {
+        sequence,
+        payload: batch.payload,
+    })
 }
