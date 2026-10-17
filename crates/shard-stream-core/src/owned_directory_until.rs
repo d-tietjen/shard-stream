@@ -268,11 +268,7 @@ fn validate_directory(
     budget: &NativeDirectoryBudget,
     depth: usize,
 ) -> Bounded<()> {
-    budget.check()?;
-    if depth > budget.limits().max_depth {
-        return Err(NativeDirectoryFailure::Capacity);
-    }
-    path(budget, &handle.inner.path)?;
+    checked_depth_path(handle, budget, depth)?;
     let frame = size_of::<(&OwnedDirectoryHandle, usize, Option<&OwnedDirectoryHandle>)>();
     budget.charge(0, 0, frame, 0, 3, frame)?;
     if let Some((parent, name)) = &handle.inner.parent {
@@ -317,13 +313,7 @@ fn validate_directory(
             .metadata()
             .map_err(DirectoryOwnershipError::from)
     })?;
-    if !observed.is_dir()
-        || observed.file_type().is_symlink()
-        || observed.dev() != actual.dev()
-        || observed.ino() != actual.ino()
-    {
-        return Err(DirectoryOwnershipError::IdentityMismatch.into());
-    }
+    validate_root_handle_identity(&observed, &actual)?;
     budget.check()
 }
 fn validate_entry_until(
@@ -817,4 +807,16 @@ mod tests;
 #[cfg(test)]
 pub(crate) fn completed_native_root_phase(phase: &str) {
     tests::completed(phase);
+}
+
+pub(super) fn checked_depth_path(
+    handle: &OwnedDirectoryHandle,
+    budget: &NativeDirectoryBudget,
+    depth: usize,
+) -> Bounded<()> {
+    budget.check()?;
+    if depth > budget.limits().max_depth {
+        return Err(NativeDirectoryFailure::Capacity);
+    }
+    path(budget, &handle.inner.path)
 }

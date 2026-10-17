@@ -18,6 +18,15 @@ type Result<T> = std::result::Result<T, DirectoryOwnershipError>;
 pub(crate) mod operation_until;
 pub use operation_until::{NativeDirectoryProgress, OwnedEntryKind, RetainedDirectoryError};
 
+#[path = "owned_directory_validation_checked.rs"]
+pub(crate) mod checked_validation;
+pub use checked_validation::{
+    CheckedDirectoryValidationChecks, CheckedDirectoryValidationCost,
+    CheckedDirectoryValidationFailure, CheckedDirectoryValidationObservation,
+    CheckedDirectoryValidationPhase, RetainedCheckedDirectoryValidation,
+    RetainedCheckedDirectoryValidationError, checked_directory_validation_cost,
+};
+
 #[path = "owned_file_replacement.rs"]
 mod file_replacement;
 pub use file_replacement::{
@@ -139,14 +148,7 @@ impl OwnedDirectoryHandle {
         self.inner.owner.validate_retained_root()?;
         let observed = std::fs::symlink_metadata(&self.inner.path)?;
         let actual = self.inner.file.metadata()?;
-        if !observed.is_dir()
-            || observed.file_type().is_symlink()
-            || observed.dev() != actual.dev()
-            || observed.ino() != actual.ino()
-        {
-            return Err(DirectoryOwnershipError::IdentityMismatch);
-        }
-        Ok(())
+        validate_root_handle_identity(&observed, &actual)
     }
 
     /// Opens one literal child directory without following a symlink.
@@ -595,4 +597,18 @@ mod tests {
             .expect("real final handle drop releases original custody");
         std::fs::remove_dir_all(path).expect("fixture cleanup");
     }
+}
+
+fn validate_root_handle_identity(
+    observed: &std::fs::Metadata,
+    actual: &std::fs::Metadata,
+) -> Result<()> {
+    if !observed.is_dir()
+        || observed.file_type().is_symlink()
+        || observed.dev() != actual.dev()
+        || observed.ino() != actual.ino()
+    {
+        return Err(DirectoryOwnershipError::IdentityMismatch);
+    }
+    Ok(())
 }

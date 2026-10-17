@@ -228,11 +228,7 @@ impl DirectoryOwnership {
         }
         #[cfg(unix)]
         {
-            if !directory.is_absolute()
-                || directory.as_os_str() != self.canonical_directory.as_os_str()
-            {
-                return Err(DirectoryOwnershipError::IdentityMismatch.into());
-            }
+            validate_root_spelling(directory, &self.canonical_directory)?;
             let path = directory.as_os_str().as_encoded_bytes().len();
             let canonical = self
                 .canonical_directory
@@ -368,18 +364,11 @@ impl DirectoryOwnership {
                     Some(value) => value,
                     None => continue,
                 };
-                if !observed.is_dir() || observed.file_type().is_symlink() {
-                    return Err(DirectoryOwnershipError::IdentityMismatch.into());
-                }
+                validate_ancestor_identity(&observed)?;
             }
             completed!(self, AncestorsValidated);
             check.check()?;
-            if !metadata.is_dir()
-                || metadata.file_type().is_symlink()
-                || FileIdentity::of(&metadata) != self.directory_identity
-            {
-                return Err(DirectoryOwnershipError::IdentityMismatch.into());
-            }
+            validate_root_named_identity(&metadata, self.directory_identity)?;
             check.check()?;
             let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
             let root = openat(CWD, "/", flags, Mode::empty());
@@ -409,12 +398,7 @@ impl DirectoryOwnership {
             completed!(self, RetainedDirectoryMetadata);
             let retained = check.completed(retained.map_err(native_ownership_error))?;
             // Both values use the SAME native stat types on every Unix target.
-            if FileType::from_raw_mode(opened.st_mode) != FileType::Directory
-                || opened.st_dev != retained.st_dev
-                || opened.st_ino != retained.st_ino
-            {
-                return Err(DirectoryOwnershipError::IdentityMismatch.into());
-            }
+            validate_root_stat_identity(&opened, &retained)?;
             check.check()?;
             let named = statat(&resolved, LOCK_NAME, AtFlags::SYMLINK_NOFOLLOW);
             completed!(self, LockMetadata);
@@ -423,14 +407,7 @@ impl DirectoryOwnership {
             let retained = fstat(&self._lock);
             completed!(self, RetainedLockMetadata);
             let retained = check.completed(retained.map_err(native_ownership_error))?;
-            if FileType::from_raw_mode(named.st_mode) != FileType::RegularFile
-                || named.st_nlink != 1
-                || retained.st_nlink != 1
-                || named.st_dev != retained.st_dev
-                || named.st_ino != retained.st_ino
-            {
-                return Err(DirectoryOwnershipError::IdentityMismatch.into());
-            }
+            validate_lock_stat_identity(&named, &retained)?;
             check.check()
         }
     }
@@ -444,3 +421,64 @@ fn native_ownership_error(error: rustix::io::Errno) -> DirectoryOwnershipError {
 #[cfg(all(test, unix))]
 #[path = "directory_validation_until_tests.rs"]
 mod tests;
+
+#[cfg(unix)]
+pub(super) fn validate_root_spelling(
+    directory: &Path,
+    canonical: &Path,
+) -> Result<(), DirectoryOwnershipError> {
+    if !directory.is_absolute() || directory.as_os_str() != canonical.as_os_str() {
+        return Err(DirectoryOwnershipError::IdentityMismatch);
+    }
+    Ok(())
+}
+#[cfg(unix)]
+pub(super) fn validate_ancestor_identity(
+    observed: &fs::Metadata,
+) -> Result<(), DirectoryOwnershipError> {
+    if !observed.is_dir() || observed.file_type().is_symlink() {
+        return Err(DirectoryOwnershipError::IdentityMismatch);
+    }
+    Ok(())
+}
+#[cfg(unix)]
+pub(super) fn validate_root_named_identity(
+    metadata: &fs::Metadata,
+    identity: FileIdentity,
+) -> Result<(), DirectoryOwnershipError> {
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || FileIdentity::of(metadata) != identity
+    {
+        return Err(DirectoryOwnershipError::IdentityMismatch);
+    }
+    Ok(())
+}
+#[cfg(unix)]
+pub(super) fn validate_root_stat_identity(
+    opened: &Stat,
+    retained: &Stat,
+) -> Result<(), DirectoryOwnershipError> {
+    if FileType::from_raw_mode(opened.st_mode) != FileType::Directory
+        || opened.st_dev != retained.st_dev
+        || opened.st_ino != retained.st_ino
+    {
+        return Err(DirectoryOwnershipError::IdentityMismatch);
+    }
+    Ok(())
+}
+#[cfg(unix)]
+pub(super) fn validate_lock_stat_identity(
+    named: &Stat,
+    retained: &Stat,
+) -> Result<(), DirectoryOwnershipError> {
+    if FileType::from_raw_mode(named.st_mode) != FileType::RegularFile
+        || named.st_nlink != 1
+        || retained.st_nlink != 1
+        || named.st_dev != retained.st_dev
+        || named.st_ino != retained.st_ino
+    {
+        return Err(DirectoryOwnershipError::IdentityMismatch);
+    }
+    Ok(())
+}

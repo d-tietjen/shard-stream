@@ -4,6 +4,9 @@
 #[path = "directory_root_until.rs"]
 mod root_until;
 
+#[cfg(unix)]
+#[path = "directory_validation_checked.rs"]
+mod validation_checked;
 #[path = "directory_validation_until.rs"]
 mod validation_until;
 pub use validation_until::{DirectoryOwnershipUntilError, DirectoryValidationCost};

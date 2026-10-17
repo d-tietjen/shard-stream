@@ -981,3 +981,73 @@ errors, typed private-pin refusals and both output drop orders. They remain
 uncompiled and unexecuted. Native algorithm, Core composition and source
 coverage do not establish configured C1/issuer health, serving authority,
 64 MiB/256 MiB startup fit, full host/runtime or performance qualification.
+
+## Consuming retained directory validation with shared fetch work
+
+On Unix, `OwnedDirectoryHandle::validate_for_storage_fetch_until` consumes a
+whole actual handle and borrows its existing `NativeDirectoryBudget`, the
+caller's existing shared `StorageFetchBudget`, and mandatory
+`CheckedDirectoryValidationChecks`. It tightens the Core minimum to the
+native budget's original absolute deadline once, then checks both shared
+states and the captured composing work before and after every explicit
+allocation, conversion, identity, metadata, open and stat phase. A sibling
+refusal or a later Core minimum applies to the next real phase. Neither
+counter is reconstructed or reset, and no startup budget is stored in the
+returned owner.
+
+The additive producer walks the actual private root descriptors and the
+original retained parent chain. It shares the existing pure spelling,
+ancestor, root, lock and child identity predicates. The ordinary `validate`,
+`validate_until`, `root_handle` and native budget behavior keep their original
+physical/check order; their old result-consumption behavior is not advertised
+as this retained contract. The new entry performs no canonicalize, alias
+resolution, owner reconstruction, lock-descriptor clone or public FD export.
+
+The outside-catch carrier owns every actual entered Metadata, Stat, native
+open Result and transient OwnedFd, CString/NulError, allocation Result,
+checkpoint refusal and independent unwind payload. An actual result is stored
+before a callback or post-call deadline check. Native pathname metadata pays
+its bounded path-conversion ceiling and four paid buffer passes before entry; explicit open/stat names
+use retained C strings. Result-buffer growth prepays the requested delta and
+movement of its existing capacity, retains the real allocation Result, and
+charges any actual excess capacity before another physical producer. No
+source-visible request substitutes vector length for capacity. The consumed
+whole input is the last field, so its actual parent/root remains through all
+raw result, transient descriptor and panic cleanup.
+
+Every refusal denies the same Core counters, then the same native counters,
+then attempts the captured composing denial exactly once for that validation.
+Those independent panic payloads remain retained. An adapter used across
+several validations must itself record the actual outer work/health denial
+attempt before calling that health, so the composing operation also denies
+once if that callback unwinds. This trait carries no permission or witness.
+A successful `RetainedCheckedDirectoryValidation` exposes safe observations
+and can return only the whole original handle through `into_handle`. The
+retained error exposes actual safe errors and scalar observations, with no
+handle, native owning Result, File, FD, panic downcast or retry extraction.
+
+`checked_directory_validation_cost` is a plain checked setup/cumulative Core
+ceiling. The caller prepays that ceiling and its existing native fetch setup
+once before constructing counters, and prepays an actual `retain` before
+passing a second whole handle. Each validation then spends its own fixed
+retention values and the incremental real work from the same finite Core
+policy. The fixed inventory names separate cap/fee/rule and checkpoint
+results, four independent panic slots, allocation/result headers and ordinary
+bookkeeping. Per-result admission separately includes its actual value,
+error, Result header, enum/record and actual vector capacity. These are
+source-visible logical costs; allocator/kernel internals and process RSS
+remain separate gates. No credits, refunds, deadline renewal or larger cap
+are introduced.
+
+Twelve new genuine filesystem regression groups cover root/deep-child
+acceptance and ordinary identity parity; every real completion and allocation
+boundary under sibling native denial, health refusal and unwind; shared
+minimum deadlines; an actual missing lock with retained late errno; independent
+panic payloads; true last-owner contention; immutable fixed-slot exact and
+one-less admission; actual deep-walk capacity; shared remaining counters and
+zero-new-Arc/heap pre-entry refusal; real child replacement; and safe Send
+carriers without an artificial Sync upgrade. These groups are source only,
+uncompiled and unexecuted at this boundary. This entry is a generic custody
+and observation producer. Core owning-log integration, native bounded read,
+configured 64 MiB/256 MiB aggregate startup, C1 and whole-host qualification
+remain open; no serving or source-completeness authority is created.

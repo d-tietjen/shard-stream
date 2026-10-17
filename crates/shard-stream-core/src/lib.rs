@@ -29,6 +29,13 @@ pub use ids::{
 };
 #[cfg(unix)]
 pub use owned_directory_handle::{
+    CheckedDirectoryValidationChecks, CheckedDirectoryValidationCost,
+    CheckedDirectoryValidationFailure, CheckedDirectoryValidationObservation,
+    CheckedDirectoryValidationPhase, RetainedCheckedDirectoryValidation,
+    RetainedCheckedDirectoryValidationError, checked_directory_validation_cost,
+};
+#[cfg(unix)]
+pub use owned_directory_handle::{
     NativeDirectoryProgress, OwnedDirectoryEntries, OwnedDirectoryHandle, OwnedEntryKind,
     OwnedFileAccess, OwnedFileHandle, RetainedDirectoryError,
 };
