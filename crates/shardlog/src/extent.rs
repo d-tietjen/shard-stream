@@ -36,6 +36,13 @@ pub use pinned_directory::{
     PinnedStoreOpenError, PinnedStoreOpenFailure, PinnedStoreOpenLimits, PinnedStoreOpenOutcome,
     PinnedStoreOpenPhase, PinnedStoreOpenUsage, pinned_store_open_cost,
 };
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use pinned_directory::{
+    PinnedShardAppendBudget, PinnedShardAppendChecks, PinnedShardAppendCost,
+    PinnedShardAppendError, PinnedShardAppendFailure, PinnedShardAppendInput,
+    PinnedShardAppendLimits, PinnedShardAppendPhase, PinnedShardAppendReport,
+    PinnedShardAppendUsage, pinned_shard_append_cost,
+};
 #[cfg(unix)]
 pub use pinned_directory::{
     PinnedShardDirectory, PinnedShardDirectoryCost, PinnedShardDirectoryError,
@@ -725,16 +732,7 @@ impl ShardStore {
         let mut group_keys = HashSet::with_capacity(prepared.len());
         for extent in prepared {
             self.validate_append(extent.reservation, &extent.payload)?;
-            let key = (
-                TopicPartition::new(extent.reservation.topic_id, extent.reservation.partition_id),
-                extent.reservation.batch_id,
-            );
-            if !group_keys.insert(key) {
-                return Err(StorageError::InvalidInput(format!(
-                    "batch {} appears more than once in an append group",
-                    extent.reservation.batch_id
-                )));
-            }
+            validate_prepared_group_key(&mut group_keys, extent.reservation)?;
         }
 
         let mut first = 0usize;
@@ -751,20 +749,13 @@ impl ShardStore {
                 self.rotate()?;
             }
 
-            let mut end = first;
-            let mut pack_bytes = self.active.bytes;
-            while end < prepared.len() && end - first < MAX_EXTENTS_PER_WRITE {
-                let frame_len = u64::try_from(prepared[end].encoded.frame_len)
-                    .map_err(|_| StorageError::LimitExceeded("extent frame exceeds u64".into()))?;
-                let next = pack_bytes
-                    .checked_add(frame_len)
-                    .ok_or_else(|| StorageError::LimitExceeded("pack length overflow".into()))?;
-                if pack_bytes > 0 && next > self.config.target_pack_bytes {
-                    break;
-                }
-                pack_bytes = next;
-                end += 1;
-            }
+            let end = prepared_segment_end(
+                first,
+                prepared.len(),
+                self.active.bytes,
+                self.config.target_pack_bytes,
+                |index| prepared[index].encoded.frame_len,
+            )?;
             debug_assert!(end > first);
             self.append_prepared_segment(&prepared[first..end])?;
             first = end;
@@ -881,14 +872,8 @@ impl ShardStore {
 
         let mut next_frame_offset = frame_offset;
         for extent in prepared {
-            let location = ExtentLocation {
-                reservation: extent.reservation,
-                producer: extent.producer,
-                atomic_group: extent.atomic_group,
-                pack_sequence: self.active.sequence,
-                payload_offset: next_frame_offset + HEADER_LEN as u64,
-                payload_len: extent.payload.len(),
-            };
+            let location =
+                prepared_extent_location(extent, self.active.sequence, next_frame_offset);
             self.install_location(location);
             next_frame_offset = next_frame_offset
                 .checked_add(extent.encoded.frame_len as u64)
@@ -1270,31 +1255,115 @@ fn encode_extent(
     atomic_group: Option<AtomicGroupSequence>,
     payload: &[u8],
 ) -> StorageResult<EncodedExtent> {
+    let (frame_len, frame_len_u64, payload_len_u64) = extent_frame_lengths(payload.len())?;
+    let mut header = Vec::with_capacity(HEADER_LEN);
+    encode_extent_header(
+        &mut header,
+        reservation,
+        producer,
+        atomic_group,
+        frame_len_u64,
+        payload_len_u64,
+    )?;
+    Ok(EncodedExtent {
+        checksum: extent_checksum(&header, payload).to_le_bytes(),
+        header,
+        frame_len,
+    })
+}
+
+fn prepared_extent_location(
+    extent: &PreparedExtent,
+    pack_sequence: u64,
+    frame_offset: u64,
+) -> ExtentLocation {
+    ExtentLocation {
+        reservation: extent.reservation,
+        producer: extent.producer,
+        atomic_group: extent.atomic_group,
+        pack_sequence,
+        payload_offset: frame_offset + HEADER_LEN as u64,
+        payload_len: extent.payload.len(),
+    }
+}
+
+fn validate_prepared_group_key(
+    group_keys: &mut HashSet<(TopicPartition, BatchId)>,
+    reservation: Reservation,
+) -> StorageResult<()> {
+    let key = (
+        TopicPartition::new(reservation.topic_id, reservation.partition_id),
+        reservation.batch_id,
+    );
+    if !group_keys.insert(key) {
+        return Err(StorageError::InvalidInput(format!(
+            "batch {} appears more than once in an append group",
+            reservation.batch_id
+        )));
+    }
+    Ok(())
+}
+
+fn prepared_segment_end(
+    first: usize,
+    total: usize,
+    active_bytes: u64,
+    target_pack_bytes: u64,
+    mut frame_len: impl FnMut(usize) -> usize,
+) -> StorageResult<usize> {
+    let mut end = first;
+    let mut pack_bytes = active_bytes;
+    while end < total && end - first < MAX_EXTENTS_PER_WRITE {
+        let frame_len = u64::try_from(frame_len(end))
+            .map_err(|_| StorageError::LimitExceeded("extent frame exceeds u64".into()))?;
+        let next = pack_bytes
+            .checked_add(frame_len)
+            .ok_or_else(|| StorageError::LimitExceeded("pack length overflow".into()))?;
+        if pack_bytes > 0 && next > target_pack_bytes {
+            break;
+        }
+        pack_bytes = next;
+        end += 1;
+    }
+    Ok(end)
+}
+
+fn extent_frame_lengths(payload_len: usize) -> StorageResult<(usize, u64, u64)> {
     let frame_len = HEADER_LEN
-        .checked_add(payload.len())
+        .checked_add(payload_len)
         .and_then(|value| value.checked_add(CHECKSUM_LEN))
         .ok_or_else(|| StorageError::LimitExceeded("extent frame length overflow".into()))?;
     let frame_len_u64 = u64::try_from(frame_len)
         .map_err(|_| StorageError::LimitExceeded("extent frame exceeds u64".into()))?;
-    let payload_len_u64 = u64::try_from(payload.len())
+    let payload_len_u64 = u64::try_from(payload_len)
         .map_err(|_| StorageError::LimitExceeded("payload exceeds u64".into()))?;
 
-    let mut header = Vec::with_capacity(HEADER_LEN);
+    Ok((frame_len, frame_len_u64, payload_len_u64))
+}
+
+fn encode_extent_header(
+    header: &mut Vec<u8>,
+    reservation: Reservation,
+    producer: Option<ProducerSequence>,
+    atomic_group: Option<AtomicGroupSequence>,
+    frame_len_u64: u64,
+    payload_len_u64: u64,
+) -> StorageResult<()> {
     header.extend_from_slice(EXTENT_MAGIC);
     header.push(EXTENT_VERSION);
     header.push(EXTENT_FLAGS);
     header.extend_from_slice(&(HEADER_LEN as u16).to_le_bytes());
-    push_u64(&mut header, frame_len_u64);
-    push_u128(&mut header, reservation.topic_id.get());
-    push_u32(&mut header, reservation.partition_id.get());
-    push_u128(&mut header, reservation.batch_id.get());
-    push_u64(&mut header, reservation.first_offset.get());
-    push_u64(&mut header, reservation.last_offset.get());
-    push_u32(&mut header, reservation.record_count.get());
-    push_u32(&mut header, reservation.placement.virtual_lane_id.get());
-    push_u64(&mut header, reservation.placement.ring_epoch.get());
-    push_u64(&mut header, reservation.placement.leader_epoch.get());
-    push_u64(&mut header, reservation.placement.sequence.get());
+    push_u64(header, frame_len_u64);
+    push_u128(header, reservation.topic_id.get());
+    push_u32(header, reservation.partition_id.get());
+    push_u128(header, reservation.batch_id.get());
+    push_u64(header, reservation.first_offset.get());
+    push_u64(header, reservation.last_offset.get());
+    push_u32(header, reservation.record_count.get());
+    push_u32(header, reservation.placement.virtual_lane_id.get());
+    push_u64(header, reservation.placement.ring_epoch.get());
+    push_u64(header, reservation.placement.leader_epoch.get());
+    push_u64(header, reservation.placement.sequence.get());
     match producer {
         Some(producer) => {
             if producer.digest_algorithm != DIGEST_XXH3_128 {
@@ -1304,9 +1373,9 @@ fn encode_extent(
             }
             header.push(1);
             header.extend_from_slice(&[0; 3]);
-            push_u128(&mut header, producer.producer_id);
-            push_u32(&mut header, producer.epoch);
-            push_u64(&mut header, producer.first_sequence);
+            push_u128(header, producer.producer_id);
+            push_u32(header, producer.epoch);
+            push_u64(header, producer.first_sequence);
             header.push(producer.digest_algorithm);
             header.extend_from_slice(&[0; 3]);
             header.extend_from_slice(&producer.payload_digest);
@@ -1314,7 +1383,7 @@ fn encode_extent(
                 Some(event_id) => {
                     header.push(1);
                     header.extend_from_slice(&[0; 3]);
-                    push_u128(&mut header, event_id.get());
+                    push_u128(header, event_id.get());
                 }
                 None => header.extend_from_slice(&[0; 20]),
             }
@@ -1325,19 +1394,15 @@ fn encode_extent(
         Some(group) => {
             header.push(1);
             header.extend_from_slice(&[0; 3]);
-            push_u128(&mut header, group.transaction_id);
-            push_u64(&mut header, group.chunk_sequence);
+            push_u128(header, group.transaction_id);
+            push_u64(header, group.chunk_sequence);
             header.extend_from_slice(&group.payload_digest);
         }
         None => header.extend_from_slice(&[0; GROUP_FIXED_LEN]),
     }
-    push_u64(&mut header, payload_len_u64);
+    push_u64(header, payload_len_u64);
     debug_assert_eq!(header.len(), HEADER_LEN);
-    Ok(EncodedExtent {
-        checksum: extent_checksum(&header, payload).to_le_bytes(),
-        header,
-        frame_len,
-    })
+    Ok(())
 }
 
 fn extent_checksum(header: &[u8], payload: &[u8]) -> u64 {
@@ -1777,7 +1842,11 @@ fn discover_packs(directory: &Path) -> StorageResult<BTreeMap<u64, PathBuf>> {
 }
 
 fn pack_path(directory: &Path, sequence: u64) -> PathBuf {
-    directory.join(format!("pack-{sequence:020}.sse"))
+    directory.join(native_pack_name(sequence))
+}
+
+fn native_pack_name(sequence: u64) -> String {
+    format!("pack-{sequence:020}.sse")
 }
 
 #[cfg(unix)]

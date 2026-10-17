@@ -53,6 +53,13 @@ pub use extent::{
     PinnedStoreOpenError, PinnedStoreOpenFailure, PinnedStoreOpenLimits, PinnedStoreOpenOutcome,
     PinnedStoreOpenPhase, PinnedStoreOpenUsage, pinned_store_open_cost,
 };
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use extent::{
+    PinnedShardAppendBudget, PinnedShardAppendChecks, PinnedShardAppendCost,
+    PinnedShardAppendError, PinnedShardAppendFailure, PinnedShardAppendInput,
+    PinnedShardAppendLimits, PinnedShardAppendPhase, PinnedShardAppendReport,
+    PinnedShardAppendUsage, pinned_shard_append_cost,
+};
 #[cfg(unix)]
 pub use extent::{
     PinnedShardDirectory, PinnedShardDirectoryCost, PinnedShardDirectoryError,

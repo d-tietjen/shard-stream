@@ -14,6 +14,17 @@ use std::os::unix::fs::MetadataExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
+#[path = "pinned_append.rs"]
+mod append;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use append::{
+    PinnedShardAppendBudget, PinnedShardAppendChecks, PinnedShardAppendCost,
+    PinnedShardAppendError, PinnedShardAppendFailure, PinnedShardAppendInput,
+    PinnedShardAppendLimits, PinnedShardAppendPhase, PinnedShardAppendReport,
+    PinnedShardAppendUsage, pinned_shard_append_cost,
+};
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[path = "pinned_gc.rs"]
 mod gc;
 #[cfg(any(target_os = "linux", target_os = "android"))]
