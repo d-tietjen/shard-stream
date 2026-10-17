@@ -905,3 +905,26 @@ establish allocator/kernel/RSS or performance bounds. Seven genuine Core/native
 filesystem regression groups are saved and remain uncompiled and unexecuted.
 Actual consuming engine/census/worker adoption, bounded later producers and full
 host/resource/authority qualification remain required.
+
+A worker that must restore its whole store and retain the actual native report
+uses `OwnedPinnedShardGcComplete::into_store_and_report`. It returns the whole
+`OwnedPinnedShardStore` plus `OwnedPinnedShardGcReport`; the latter retains the
+original report followed by a clone of the same opaque directory custody. Either
+value can drop first while the other retains the original pin and Core parent.
+The report exposes only a borrow of the actual native results and the original
+owner; it has no bare-report, descriptor or permission extractor. The GC cost
+prepays the fixed carrier, local directory value and one Arc increment before
+entry. No callback, Session or startup budget persists in the returned report.
+One additional genuine filesystem group covers both drop orders and actual lock
+custody, for eight Core GC groups in total, all uncompiled and unexecuted.
+
+Composing workers prepay their actual local values, clones, queues and explicit
+calls with `NativeDirectoryBudget::reserve`. This delegates to the same counters
+used by Core's native operations; entry fees also add to work, string bytes stay
+within declared bytes, and checked capacity refusal remains sticky across every
+clone. `deny` exposes the existing irreversible refusal so a worker can deny the
+same budget before its captured-health callback and physical settlement. Neither
+method constructs custody or serving permission, changes limits, refunds fees or
+renews the original/minimum deadline. Three additional genuine filesystem groups
+cover shared reservations, exact/one-over admission and denial/minimum-expiry
+refusal before native reentry; they remain uncompiled and unexecuted.

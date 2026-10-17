@@ -1,6 +1,6 @@
 //! Consume the actual Core store through native GC and all retained outcomes.
 
-use super::OwnedPinnedShardStore;
+use super::{OwnedPinnedShardStore, OwnedShardStoreDirectory};
 use crate::{
     DirectoryOwnership, LogicalOffset, NativeDirectoryBudget, NativeDirectoryFailure,
     OwnedDirectoryHandle, OwnedShardDirectory, RetainedDirectoryError, TopicPartition,
@@ -159,6 +159,33 @@ pub struct OwnedPinnedShardGcComplete {
     report: PinnedShardGcReport,
     store: OwnedPinnedShardStore,
 }
+/// Actual native report retaining its SAME physical directory and Core parent.
+///
+/// A worker can restore its whole store while returning this actual report.
+/// Every original native outcome drops before the shared pin and parent; no
+/// native report, descriptor or permission can be extracted from this carrier.
+pub struct OwnedPinnedShardGcReport {
+    report: PinnedShardGcReport,
+    directory: OwnedShardStoreDirectory,
+}
+impl OwnedPinnedShardGcReport {
+    /// Borrow the original native report, without copying its typed outcomes.
+    pub fn report(&self) -> &PinnedShardGcReport {
+        &self.report
+    }
+    /// SAME original Core root allocation retained through this report's drop.
+    pub fn owner(&self) -> &Arc<DirectoryOwnership> {
+        self.directory.owner()
+    }
+}
+impl fmt::Debug for OwnedPinnedShardGcReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedPinnedShardGcReport")
+            .field("report", &self.report)
+            .field("directory", &self.directory)
+            .finish_non_exhaustive()
+    }
+}
 impl OwnedPinnedShardGcComplete {
     /// Actual native collection/index/physical outcomes, without copying them.
     pub fn report(&self) -> &PinnedShardGcReport {
@@ -175,6 +202,17 @@ impl OwnedPinnedShardGcComplete {
         let Self { report, store } = self;
         drop(report);
         store
+    }
+    /// Return the whole store and its actual ownership-retaining native report.
+    ///
+    /// This performs one Arc increment prepaid by the original GC cost. It
+    /// creates no bare store/pin/report extractor or new physical operation.
+    /// Dropping either returned value first still keeps the original parent
+    /// until all native outcomes belonging to the other value are destroyed.
+    pub fn into_store_and_report(self) -> (OwnedPinnedShardStore, OwnedPinnedShardGcReport) {
+        let Self { report, store } = self;
+        let directory = store.retain_directory();
+        (store, OwnedPinnedShardGcReport { report, directory })
     }
 }
 impl fmt::Debug for OwnedPinnedShardGcComplete {
@@ -283,13 +321,16 @@ impl Error for RetainedOwnedPinnedShardGcError {
 ///
 /// Existing store/pin/floor allocations are retained actual inputs, not copied.
 /// Recursive Core validation charges its own phases on the SAME budget. This
-/// includes the actual typed pin-borrow slot and independent bridge panic slots;
+/// includes the actual typed pin-borrow slot, independent bridge panic slots
+/// and one optional report transfer retaining the same physical directory;
 /// allocator/library/kernel/RSS and performance remain separate measured gates.
 pub fn owned_pinned_shard_gc_cost(limits: PinnedShardGcLimits) -> Option<OwnedPinnedShardGcCost> {
     let native = pinned_shard_gc_cost(limits)?;
     let values = [
         size_of::<Effects>(),
         size_of::<OwnedPinnedShardGcComplete>(),
+        size_of::<OwnedPinnedShardGcReport>(),
+        size_of::<OwnedShardStoreDirectory>(),
         size_of::<RetainedOwnedPinnedShardGcError>(),
         size_of::<OwnedPinnedShardGcCost>(),
         size_of::<Checks<'static>>(),
@@ -306,7 +347,8 @@ pub fn owned_pinned_shard_gc_cost(limits: PinnedShardGcLimits) -> Option<OwnedPi
         work_bytes: native
             .work_bytes
             .checked_add(fixed)?
-            .checked_add(values.len())?,
+            .checked_add(values.len())?
+            .checked_add(1)?, // One optional SAME-directory Arc increment.
         native_call_slots: native.native_call_slots,
     })
 }

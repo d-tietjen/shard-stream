@@ -720,3 +720,139 @@ fn actual_missing_retained_root_keeps_native_notfound_before_and_after_shared_mi
             .expect("last actual refused owner physically released");
     }
 }
+
+#[test]
+fn public_reservations_share_all_counters_with_actual_native_file_work() {
+    let path = Temporary::new();
+    let owner = DirectoryOwnership::acquire(&path.0).expect("actual root owner");
+    let paid = budget();
+    let root = owner
+        .root_handle_until(&paid)
+        .expect("actual retained root");
+    let sibling = paid.clone();
+    let before = paid.usage().expect("actual native setup fees");
+    sibling
+        .reserve(2, 3, 11, 5, 7, 13)
+        .expect("composing producer prepayment");
+    let after = paid.usage().expect("same actual shared counters");
+    assert_eq!(after.operations, before.operations + 2);
+    assert_eq!(after.calls, before.calls + 3);
+    assert_eq!(after.declared_bytes, before.declared_bytes + 11);
+    assert_eq!(after.string_bytes, before.string_bytes + 5);
+    assert_eq!(after.entries, before.entries + 7);
+    assert_eq!(after.work_bytes, before.work_bytes + 13 + 7);
+    let file = root
+        .open_file_until(
+            OsStr::new("same-budget.ssm"),
+            OwnedFileAccess::ReadWriteCreate,
+            &paid,
+        )
+        .expect("actual file work spends the already reserved budget");
+    assert!(Arc::ptr_eq(file.owner(), &owner));
+    assert!(path.0.join("same-budget.ssm").is_file());
+    assert!(sibling.usage().expect("later native fees").operations > after.operations);
+    contended(&path.0);
+}
+
+#[test]
+fn public_reservation_exact_and_one_over_refuse_native_creation_on_the_same_root() {
+    for one_over in [false, true] {
+        let path = Temporary::new();
+        let owner = DirectoryOwnership::acquire(&path.0).expect("actual root owner");
+        let paid = budget();
+        let root = owner
+            .root_handle_until(&paid)
+            .expect("actual retained root");
+        let sibling = paid.clone();
+        let before = paid.usage().expect("actual root fees");
+        let remaining = paid.limits().max_operations - before.operations;
+        let result = sibling.reserve(remaining + usize::from(one_over), 0, 0, 0, 0, 0);
+        if one_over {
+            assert!(matches!(result, Err(NativeDirectoryFailure::Capacity)));
+            assert_eq!(
+                paid.usage()
+                    .expect("failed reservation adds no partial fees"),
+                before
+            );
+        } else {
+            result.expect("exact cumulative reservation fits");
+            assert_eq!(
+                paid.usage().expect("exact actual fees").operations,
+                paid.limits().max_operations
+            );
+        }
+        let error = match root.open_file_until(
+            OsStr::new("never-created.ssm"),
+            OwnedFileAccess::ReadWriteCreate,
+            &paid,
+        ) {
+            Ok(_) => panic!("same exhausted or denied counters cannot create a file"),
+            Err(error) => error,
+        };
+        assert!(!error.progress().open_attempted);
+        assert!(Arc::ptr_eq(error.owner(), &owner));
+        assert!(!path.0.join("never-created.ssm").exists());
+        assert!(matches!(
+            sibling.check(),
+            Err(NativeDirectoryFailure::Denied)
+        ));
+        assert!(matches!(
+            sibling.reserve(0, 0, 0, 0, 0, 0),
+            Err(NativeDirectoryFailure::Denied)
+        ));
+        contended(&path.0);
+    }
+}
+
+#[test]
+fn public_denial_and_minimum_expiry_keep_fees_and_real_owner_without_native_reentry() {
+    for expire in [false, true] {
+        let path = Temporary::new();
+        fs::write(path.0.join("existing.ssm"), b"actual original bytes").expect("real input");
+        let owner = DirectoryOwnership::acquire(&path.0).expect("actual root owner");
+        let paid = budget();
+        let root = owner
+            .root_handle_until(&paid)
+            .expect("actual retained root");
+        let sibling = paid.clone();
+        sibling
+            .reserve(1, 2, 9, 3, 4, 5)
+            .expect("actual composing prepayment");
+        let before = paid.usage().expect("actual prepaid fees");
+        let original = paid.absolute_expiry();
+        if expire {
+            assert!(matches!(
+                sibling.cap_expiry(Instant::now()),
+                Err(NativeDirectoryFailure::Expired(_))
+            ));
+            assert!(matches!(
+                paid.cap_expiry(original),
+                Err(NativeDirectoryFailure::Expired(_))
+            ));
+            assert!(paid.absolute_expiry() < original);
+        } else {
+            sibling.deny();
+            assert!(matches!(paid.check(), Err(NativeDirectoryFailure::Denied)));
+            assert_eq!(paid.absolute_expiry(), original);
+        }
+        let error = match root.open_file_until(
+            OsStr::new("existing.ssm"),
+            OwnedFileAccess::ReadWriteCreate,
+            &paid,
+        ) {
+            Ok(_) => panic!("shared refusal cannot reenter the native producer"),
+            Err(error) => error,
+        };
+        assert!(!error.progress().open_attempted);
+        assert!(Arc::ptr_eq(error.owner(), &owner));
+        assert_eq!(
+            paid.usage().expect("refusal preserves every paid fee"),
+            before
+        );
+        assert_eq!(
+            fs::read(path.0.join("existing.ssm")).expect("same real file"),
+            b"actual original bytes"
+        );
+        contended(&path.0);
+    }
+}

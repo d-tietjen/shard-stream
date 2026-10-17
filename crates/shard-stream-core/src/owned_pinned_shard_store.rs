@@ -26,7 +26,7 @@ use std::time::Instant;
 mod gc;
 pub use gc::{
     OwnedPinnedShardGcComplete, OwnedPinnedShardGcCost, OwnedPinnedShardGcFailure,
-    RetainedOwnedPinnedShardGcError, owned_pinned_shard_gc_cost,
+    OwnedPinnedShardGcReport, RetainedOwnedPinnedShardGcError, owned_pinned_shard_gc_cost,
 };
 
 /// Plain logical bridge and native open ceilings; no admission or RSS claim.

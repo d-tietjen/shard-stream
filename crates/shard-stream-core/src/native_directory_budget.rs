@@ -254,7 +254,30 @@ impl NativeDirectoryBudget {
     pub fn check(&self) -> Result<(), NativeDirectoryFailure> {
         self.charge(0, 0, 0, 0, 0, 0)
     }
-    pub(crate) fn deny(&self) {
+    /// Prepay a composing producer's actual costs against these SAME counters.
+    ///
+    /// String bytes are a subset of declared bytes. Each entry also adds one
+    /// work-byte fee, in addition to `work`. Reservations are cumulative and
+    /// cannot be refunded; capacity or arithmetic refusal denies later phases.
+    /// This checks the original/minimum deadline and grants no native custody
+    /// or serving permission. The caller retains its real inputs and outcomes.
+    pub fn reserve(
+        &self,
+        operations: usize,
+        calls: usize,
+        declared: usize,
+        strings: usize,
+        entries: usize,
+        work: usize,
+    ) -> Result<(), NativeDirectoryFailure> {
+        self.charge(operations, calls, declared, strings, entries, work)
+    }
+    /// Refuse every later phase using these counters, including sibling clones.
+    ///
+    /// Composing producers call this before their captured-health denial and
+    /// physical settlement. It preserves all paid costs and the minimum E.
+    /// Denial grants no native ownership or permission and cannot be reversed.
+    pub fn deny(&self) {
         self.inner
             .state
             .lock()

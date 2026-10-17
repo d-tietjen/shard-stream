@@ -24,7 +24,7 @@ mod store;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use store::{
     OwnedPinnedShardGcComplete, OwnedPinnedShardGcCost, OwnedPinnedShardGcFailure,
-    RetainedOwnedPinnedShardGcError, owned_pinned_shard_gc_cost,
+    OwnedPinnedShardGcReport, RetainedOwnedPinnedShardGcError, owned_pinned_shard_gc_cost,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use store::{

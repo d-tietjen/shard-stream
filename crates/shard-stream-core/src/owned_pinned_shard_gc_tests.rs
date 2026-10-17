@@ -606,3 +606,49 @@ fn actual_private_pin_would_block_and_poison_results_remain_observable_after_den
             .expect("actual borrow refusal kept whole original owner");
     }
 }
+
+#[test]
+fn actual_report_and_whole_store_transfer_retain_original_pin_in_either_drop_order() {
+    fn send<T: Send>() {}
+    send::<OwnedPinnedShardGcReport>();
+    for report_first in [false, true] {
+        let path = Temporary::new();
+        let owner = DirectoryOwnership::acquire(&path.path).expect("actual Core owner");
+        let weak = Arc::downgrade(&owner);
+        let root = owner.root_handle().expect("actual original Core FD");
+        let paid = budget(core_limits());
+        let owned = path.open(&root, &paid);
+        let checks = HostChecks::new();
+        let complete = owned
+            .garbage_collect_until(&floors(), gc_limits(), &paid, &checks)
+            .expect("real successful native collection");
+        let (store, report) = complete.into_store_and_report();
+        assert!(Arc::ptr_eq(store.owner(), report.owner()));
+        assert!(Arc::ptr_eq(report.owner(), &owner));
+        assert_eq!(report.report().stats().packs_removed, 2);
+        assert!(report.report().usage().entered_io_calls > 0);
+        assert!(store.store().contains(&reservation(2)));
+        assert!(!store.store().contains(&reservation(0)));
+        let mut store = Some(store);
+        let mut report = Some(report);
+        drop(paid);
+        drop(root);
+        drop(owner);
+        if report_first {
+            drop(report.take());
+        } else {
+            drop(store.take());
+        }
+        path.contended();
+        assert!(weak.upgrade().is_some());
+        if let Some(report) = &report {
+            assert_eq!(report.report().stats().packs_removed, 2);
+        }
+        drop(report);
+        drop(store);
+        assert!(weak.upgrade().is_none());
+        DirectoryOwnership::acquire(&path.path).expect("actual last Core parent released");
+        ShardRecoveryGuard::try_acquire(path.lock(), path.path.clone())
+            .expect("actual last native pin released");
+    }
+}
