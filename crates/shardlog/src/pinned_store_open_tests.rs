@@ -226,6 +226,10 @@ impl Fixture {
         .expect("actual same descriptor/guard identity join");
         Self { pin, root, config }
     }
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain actual native open partials and original inputs in the fixture without boxing"
+    )]
     fn open(&self, checks: &Checks) -> Result<OpenedPinnedShardStore, PinnedStoreOpenError> {
         ShardStore::open_pinned_until(self.config.clone(), &self.pin, limits(), expiry(), checks)
     }
@@ -460,9 +464,9 @@ fn real_prepaid_native_calls_fit_exactly_and_one_less_refuses_without_new_phase(
     .expect_err("one less actual native call");
     assert_eq!(error.failure(), PinnedStoreOpenFailure::Capacity);
     assert!(checks.denied.get());
-    assert!(error.usage().entered_io_calls <= calls - 1);
-    assert!(error.usage().reserved_io_calls <= calls - 1);
-    assert_eq!(error.scope.store.is_some(), false);
+    assert!(error.usage().entered_io_calls < calls);
+    assert!(error.usage().reserved_io_calls < calls);
+    assert!(error.scope.store.is_none());
 }
 
 #[test]

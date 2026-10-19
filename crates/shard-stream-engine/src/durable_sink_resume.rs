@@ -84,6 +84,10 @@ impl NativeResumeSinkOutcome {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "retain the complete prepaid append command inline through actual physical settlement"
+)]
 enum Action {
     Checkpoint(TopicPartition),
     Pending,
@@ -483,7 +487,7 @@ pub(super) fn execute(
     command: BoundedCommand,
 ) {
     let mut provider_entered = false;
-    let result = (|| {
+    let result = || {
         command.work.check().map_err(refused)?;
         command.work.reserve_callback().map_err(refused)?;
         command.work.check().map_err(refused)?;
@@ -535,7 +539,7 @@ pub(super) fn execute(
                     .map(|()| Value::Finalized)
             }
         }
-    });
+    };
     let result = match catch_unwind(AssertUnwindSafe(result)) {
         Ok(result) => result,
         Err(payload) => Err(NativeResumeCallbackError::from_panic(payload)),
@@ -586,7 +590,7 @@ pub(super) fn execute(
                 (Action::Decision(decision), Ok(Value::Finalized)) => {
                     publish_decision(shared, decision.group, &command.work)
                 }
-                (Action::Pending, Ok(Value::Pending(_))) => return Ok(()),
+                (Action::Pending, Ok(Value::Pending(_))) => Ok(()),
                 _ => Err(NativeResumeCallbackError::invalid_state(
                     "native sink callback result mismatch",
                 )),

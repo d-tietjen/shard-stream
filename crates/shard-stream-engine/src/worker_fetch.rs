@@ -118,6 +118,10 @@ pub(crate) const fn bounded_fetch_command_bytes() -> usize {
 }
 
 impl ShardHandle {
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain actual budget and queue failures inline without a refusal allocation"
+    )]
     pub(crate) fn begin_bounded_fetch_plan(
         &self,
         input: PlanInput,
@@ -143,7 +147,7 @@ impl ShardHandle {
             })?;
         let bytes = std::mem::size_of::<Command>()
             .checked_add(COMMAND_OVERHEAD_BYTES)
-            .ok_or_else(|| DispatchError::Budget {
+            .ok_or(DispatchError::Budget {
                 failure: StorageFetchFailure::Capacity,
                 queue_error: None,
             })?;
@@ -170,6 +174,10 @@ impl ShardHandle {
         };
         self.send_bounded_fetch(command, bytes)
     }
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain actual budget and queue failures inline without a refusal allocation"
+    )]
     pub(crate) fn begin_bounded_fetch_read(
         &self,
         lane: usize,
@@ -192,7 +200,7 @@ impl ShardHandle {
             .checked_mul(std::mem::size_of::<StoredBatchMetadata>())
             .and_then(|value| value.checked_add(COMMAND_OVERHEAD_BYTES))
             .and_then(|value| value.checked_add(std::mem::size_of::<Command>()))
-            .ok_or_else(|| DispatchError::Budget {
+            .ok_or(DispatchError::Budget {
                 failure: StorageFetchFailure::Capacity,
                 queue_error: None,
             })?;
@@ -214,6 +222,10 @@ impl ShardHandle {
         };
         self.send_bounded_fetch(command, bytes)
     }
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain actual budget and queue failures inline without a refusal allocation"
+    )]
     fn send_bounded_fetch(&self, mut command: Command, bytes: usize) -> Result<(), DispatchError> {
         if let Err(failure) = command.budget.check() {
             command.reply.disarm();
@@ -284,7 +296,7 @@ pub(super) fn execute(stores: &mut LaneStores, mut command: Command) {
     }
     let lane = command.reply.lane;
     let operation = std::mem::replace(&mut command.operation, Operation::Taken);
-    let result = match stores.primary.native() {
+    let result = match stores.primary.native_mut() {
         Some(primary) => match operation {
             Operation::Plan {
                 topic_partition,

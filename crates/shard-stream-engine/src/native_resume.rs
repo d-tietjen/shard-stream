@@ -459,7 +459,7 @@ impl NativeResumeCallbackError {
         }
     }
     /// Borrow the actual retained bounded producer error.
-    pub fn external_error(&self) -> Option<&(dyn Error + Send)> {
+    pub fn external_error(&self) -> Option<&(dyn Error + Send + 'static)> {
         match &self.cause {
             CallbackCause::External(error) => Some(error.as_ref()),
             _ => None,
@@ -668,6 +668,10 @@ impl NativeResumeCoordinatorOutcome {
 
 /// Retained actual native replay observations; none imply serving authority.
 #[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "retain actual GC store and result custody inline under the existing outcome prepayment"
+)]
 pub enum NativeResumeOutcome {
     /// Actual same-lane consuming Core GC completion or retained refusal.
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -844,6 +848,10 @@ impl Scope {
         ));
         value.ok_or(NativeResumeFailure::Callback)
     }
+    #[allow(
+        dead_code,
+        reason = "retain this existing bounded resume primitive while its consuming integration remains unavailable"
+    )]
     fn inspect_group(
         &mut self,
         group: DurableAtomicGroup,
@@ -868,6 +876,10 @@ impl Scope {
         ));
         value.ok_or(NativeResumeFailure::Callback)
     }
+    #[allow(
+        dead_code,
+        reason = "retain this existing bounded resume primitive while its consuming integration remains unavailable"
+    )]
     fn sink_checkpoint(
         &mut self,
         partition: TopicPartition,
@@ -893,6 +905,10 @@ impl Scope {
         self.work.check()?;
         checkpoint.ok_or(NativeResumeFailure::Callback)
     }
+    #[allow(
+        dead_code,
+        reason = "retain this existing bounded resume primitive while its consuming integration remains unavailable"
+    )]
     fn sink_append(
         &mut self,
         expected: DurableSinkCheckpoint,
@@ -926,6 +942,10 @@ impl Scope {
         self.current_append.take();
         Ok(())
     }
+    #[allow(
+        dead_code,
+        reason = "retain this existing bounded resume primitive while its consuming integration remains unavailable"
+    )]
     fn sink_decision(
         &mut self,
         decision: DurableAtomicDecision,
@@ -949,6 +969,10 @@ impl Scope {
             Err(NativeResumeFailure::Callback)
         }
     }
+    #[allow(
+        dead_code,
+        reason = "retain this existing bounded resume primitive while its consuming integration remains unavailable"
+    )]
     fn sink_pending(&mut self) -> Result<Vec<DurableAtomicGroup>, NativeResumeFailure> {
         self.work.reserve_outcomes(1)?;
         self.work.check()?;
@@ -1190,6 +1214,10 @@ pub fn native_resume_cost(
     })
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "retain the original engine and early refusal without a new allocation"
+)]
 fn start(
     owner: &EngineHandle,
     limits: NativeResumeLimits,
@@ -1525,6 +1553,10 @@ impl ReplicationReplay for StrictReplication<'_> {
 }
 
 impl Scope {
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain the original engine and actual outcomes without a refusal allocation"
+    )]
     fn finish(mut self: Box<Self>) -> Result<NativeResumeReport, RetainedNativeResumeError> {
         let usage = match self.work.usage() {
             Ok(usage) => usage,
@@ -1538,11 +1570,11 @@ impl Scope {
             return Err(self.fail(error.into()));
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        if let Some(policy) = &self.gc_policy {
-            if let Err(error) = policy.budget.check() {
-                self.gc_budget_error = Some(error);
-                return Err(self.fail(NativeResumeFailure::Callback));
-            }
+        if let Some(policy) = &self.gc_policy
+            && let Err(error) = policy.budget.check()
+        {
+            self.gc_budget_error = Some(error);
+            return Err(self.fail(NativeResumeFailure::Callback));
         }
         let outcomes = std::mem::take(&mut self.outcomes);
         Ok(NativeResumeReport {
@@ -1566,6 +1598,10 @@ impl EngineHandle {
     /// Retains the same engine with actual partial fetch, coordinator, transport
     /// and unwind results on expiry, capacity or producer refusal. An entered
     /// ticket is physically drained before returning, even after expiry.
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain the original engine and actual outcomes without a refusal allocation"
+    )]
     pub fn resume_recovered_replication_until(
         &self,
         partitions: &[TopicPartition],

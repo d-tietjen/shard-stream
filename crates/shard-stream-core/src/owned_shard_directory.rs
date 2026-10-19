@@ -137,6 +137,10 @@ impl OwnedShardDirectory {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "retain the original acquired guard and Core parent inline before allocation admission"
+)]
 enum Custody {
     Early {
         guard: AcquiredShardRecoveryGuard,

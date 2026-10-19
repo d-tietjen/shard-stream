@@ -34,6 +34,10 @@ mod primary;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use primary::{NativePrimaryOutcomes, NativePrimaryRecovery};
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "retain the original primary and its prepaid outcomes inline without a new allocation"
+)]
 #[derive(Default)]
 enum PrimarySetup {
     #[default]
@@ -508,10 +512,10 @@ impl NativeRecoveryCensus {
     pub fn cap_expiry(&mut self, earlier: Instant) {
         self.attempt.expiry = self.attempt.expiry.min(earlier);
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        if let PrimarySetup::Owned(primary) = &mut self.attempt.primary_setup {
-            if let Err(error) = primary.context.budget.cap_expiry(self.attempt.expiry) {
-                primary.outcomes.record_budget_error(error);
-            }
+        if let PrimarySetup::Owned(primary) = &mut self.attempt.primary_setup
+            && let Err(error) = primary.context.budget.cap_expiry(self.attempt.expiry)
+        {
+            primary.outcomes.record_budget_error(error);
         }
     }
     /// Copies bounded original bytes from a retained source before mutable open.
@@ -724,7 +728,7 @@ impl Attempt {
                 mul(self.native_discovery_path_bytes, 4)?,
                 mul(
                     self.native_discovery_visits,
-                    size_of::<PathBuf>() * 8 + size_of::<u64>() * 8 + 128,
+                    size_of::<[PathBuf; 8]>() + size_of::<[u64; 8]>() + 128,
                 )?,
             )?,
         )?;
@@ -856,15 +860,14 @@ impl Attempt {
             self.validate_sources()?;
         }
         for path in &self.missing_paths {
-            if self.restore_started {
-                if let Some(parent) = self
+            if self.restore_started
+                && let Some(parent) = self
                     .restored_parents
                     .iter()
                     .find(|held| held.path() == path)
-                {
-                    parent.validate().map_err(identity)?;
-                    continue;
-                }
+            {
+                parent.validate().map_err(identity)?;
+                continue;
             }
             match std::fs::symlink_metadata(path) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -1085,8 +1088,21 @@ impl Attempt {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if let PrimarySetup::Owned(primary) = &mut self.primary_setup {
             primary.check(self.expiry)?;
-            let observed = root.open_optional_file_until(name, access, &primary.context.budget);
-            let file = primary.directory_result(observed)?;
+            let file = if matches!(access, OwnedFileAccess::ReadOnly) {
+                let observed = root.open_optional_file_until(name, &primary.context.budget);
+                primary.directory_result(observed)?
+            } else {
+                // Optional opens are read-only. Observe genuine absence without
+                // denying this SAME budget, then retain the actual writable
+                // coordinator handle through the existing noncreating producer.
+                let observed = root.entry_kind_until(name, &primary.context.budget);
+                if primary.directory_result(observed)?.is_some() {
+                    let observed = root.open_file_until(name, access, &primary.context.budget);
+                    Some(primary.directory_result(observed)?)
+                } else {
+                    None
+                }
+            };
             // Save a real opened handle in the caller before its next check.
             if file.is_none() {
                 self.missing(root, name)?;

@@ -192,6 +192,10 @@ impl Fixture {
     fn pending_path(&self) -> PathBuf {
         pending_pack_deletion_path(&self.old_path())
     }
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain actual native collection outcomes in the fixture without boxing"
+    )]
     fn collect(&mut self, checks: &Checks) -> Result<PinnedShardGcReport, PinnedShardGcError> {
         self.store
             .garbage_collect_pinned_until(&self.pin, &starts(), limits(), expiry(), checks)
@@ -636,12 +640,12 @@ fn actual_exact_work_and_calls_fit_and_one_less_retains_real_partial_effects() {
         assert!(checks.denied.get());
         assert!(error.report().usage().reserved_io_calls <= short.max_io_calls);
         assert!(error.report().usage().work_bytes <= short.max_work_bytes);
-        if let Some(pack) = error.report().pack(0) {
-            if matches!(pack.rename_result(), Some(Ok(()))) {
-                assert!(matches!(pack.rename_sync_result(), Some(Ok(()))));
-                if pack.unlink_result().is_none() {
-                    assert!(fixture.pending_path().exists());
-                }
+        if let Some(pack) = error.report().pack(0)
+            && matches!(pack.rename_result(), Some(Ok(())))
+        {
+            assert!(matches!(pack.rename_sync_result(), Some(Ok(()))));
+            if pack.unlink_result().is_none() {
+                assert!(fixture.pending_path().exists());
             }
         }
         fixture.contended();

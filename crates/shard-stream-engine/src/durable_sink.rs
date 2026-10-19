@@ -1231,6 +1231,10 @@ fn run_dispatcher(
     shared.decision_changed.notify_all();
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "keep actual dispatcher state borrows and output flag explicit at the command boundary"
+)]
 fn handle_command(
     command: Command,
     factory: &Arc<dyn DurableAppendSinkFactory>,

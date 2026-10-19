@@ -319,10 +319,10 @@ impl ShardDirectoryChecks for Checks<'_> {
     fn check(&self) -> Result<(), ShardDirectoryCheckFailure> {
         self.check_budget()?;
         let observed = self.outer.check();
-        if let Err(error) = observed {
-            if self.checkpoint_error.get().is_none() {
-                self.checkpoint_error.set(Some(error));
-            }
+        if let Err(error) = observed
+            && self.checkpoint_error.get().is_none()
+        {
+            self.checkpoint_error.set(Some(error));
         }
         self.check_budget()?;
         observed
@@ -805,10 +805,10 @@ impl OwnedPinnedShardStore {
                     Err(OwnedPinnedShardAppendFailure::Unwind)
                 }
             };
-            if observed.is_err() {
-                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| checks.deny())) {
-                    effects.deny_panic_payload = Some(payload);
-                }
+            if observed.is_err()
+                && let Err(payload) = catch_unwind(AssertUnwindSafe(|| checks.deny()))
+            {
+                effects.deny_panic_payload = Some(payload);
             }
             drop(borrowed);
             observed
@@ -823,10 +823,10 @@ impl OwnedPinnedShardStore {
             },
             Err(failure) => failure,
         };
-        if !checks.denial_attempted.get() {
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| checks.deny())) {
-                effects.deny_panic_payload = Some(payload);
-            }
+        if !checks.denial_attempted.get()
+            && let Err(payload) = catch_unwind(AssertUnwindSafe(|| checks.deny()))
+        {
+            effects.deny_panic_payload = Some(payload);
         }
         if effects.budget_error.is_none() {
             effects.budget_error = checks.budget_error.into_inner();

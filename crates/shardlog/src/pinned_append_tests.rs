@@ -163,6 +163,10 @@ impl Fixture {
         .expect("actual pin");
         Self { store, pin, root }
     }
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain actual native append inputs and settlement in the fixture without boxing"
+    )]
     fn append(
         &mut self,
         inputs: Vec<PinnedShardAppendInput>,

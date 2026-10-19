@@ -7,6 +7,10 @@ use super::*;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use shard_stream_core::{OwnedPinnedShardStore, OwnedShardStoreDirectory};
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "retain the actual whole Core store inline under its existing owner and prepayment"
+)]
 pub(crate) enum PrimaryStore {
     Ordinary(ShardStore),
     #[cfg(any(target_os = "linux", target_os = "android"))]

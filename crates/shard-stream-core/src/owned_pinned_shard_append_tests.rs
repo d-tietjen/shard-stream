@@ -84,22 +84,20 @@ impl ShardDirectoryChecks for HostChecks {
         if self.denied.get() {
             return Err(ShardDirectoryCheckFailure::Refused);
         }
-        if !self.fired.get() {
-            if let Some((path, initial, action)) = &self.after_write {
-                if fs::metadata(path)
-                    .expect("actual append file metadata")
-                    .len()
-                    > *initial
-                {
-                    self.fired.set(true);
-                    match action {
-                        AfterWrite::Panic => {
-                            std::panic::panic_any(io::Error::other("after actual native write"))
-                        }
-                        AfterWrite::Expire(budget) => {
-                            assert!(budget.cap_expiry(Instant::now()).is_err());
-                        }
-                    }
+        if !self.fired.get()
+            && let Some((path, initial, action)) = &self.after_write
+            && fs::metadata(path)
+                .expect("actual append file metadata")
+                .len()
+                > *initial
+        {
+            self.fired.set(true);
+            match action {
+                AfterWrite::Panic => {
+                    std::panic::panic_any(io::Error::other("after actual native write"))
+                }
+                AfterWrite::Expire(budget) => {
+                    assert!(budget.cap_expiry(Instant::now()).is_err());
                 }
             }
         }
@@ -459,6 +457,10 @@ fn exact_actual_capacity_fee_enters_and_one_less_declared_fee_stops_before_entry
         let mut caps = core_limits();
         caps.max_declared_bytes = cost.declared_bytes - usize::from(short);
         let paid = budget(caps);
+        #[allow(
+            clippy::arc_with_non_send_sync,
+            reason = "same-thread observer retains this existing Arc holder; no cross-thread sharing occurs"
+        )]
         let entered = Arc::new(Cell::new(false));
         let seen = entered.clone();
         let _observe = observe(move |phase| {
@@ -643,8 +645,8 @@ fn actual_missing_named_active_native_io_error_retains_original_file_input_and_r
     let report = error.native_report().expect("real native partial report");
     assert!(report.metadata_results().any(|(_, result)| result.is_err()));
     assert!(
-        !std::error::Error::source(&error)
-            .is_some_and(|source| source.downcast_ref::<PinnedShardAppendError>().is_some()),
+        std::error::Error::source(&error)
+            .is_none_or(|source| source.downcast_ref::<PinnedShardAppendError>().is_none()),
         "dyn Error must not downcast to the raw FD-bearing native wrapper"
     );
     assert!(report.write_results().next().is_none());

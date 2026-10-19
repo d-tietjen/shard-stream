@@ -133,10 +133,10 @@ impl PrimaryRecovery {
             return Err(limited());
         }
         let checked = self.context.open_checks.check();
-        if let Err(error) = checked {
-            if self.outcomes.checkpoint_error.is_none() {
-                self.outcomes.checkpoint_error = Some(error);
-            }
+        if let Err(error) = checked
+            && self.outcomes.checkpoint_error.is_none()
+        {
+            self.outcomes.checkpoint_error = Some(error);
         }
         let after = self.context.budget.check();
         if let Err(error) = after {
@@ -153,10 +153,10 @@ impl PrimaryRecovery {
             return;
         }
         self.denial_attempted = true;
-        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| self.context.open_checks.deny())) {
-            if self.outcomes.deny_panic.is_none() {
-                self.outcomes.deny_panic = Some(payload);
-            }
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| self.context.open_checks.deny()))
+            && self.outcomes.deny_panic.is_none()
+        {
+            self.outcomes.deny_panic = Some(payload);
         }
     }
     pub(super) fn unwind(&mut self, payload: Box<dyn Any + Send>) {
@@ -398,10 +398,10 @@ impl Attempt {
                 Err(identity("actual primary operation unwound"))
             }
         };
-        if result.is_err() {
-            if let PrimarySetup::Owned(primary) = &mut self.primary_setup {
-                primary.deny();
-            }
+        if result.is_err()
+            && let PrimarySetup::Owned(primary) = &mut self.primary_setup
+        {
+            primary.deny();
         }
         result
     }

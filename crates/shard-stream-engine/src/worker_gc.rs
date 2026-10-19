@@ -232,6 +232,10 @@ pub(crate) fn command_cost() -> Option<usize> {
 // allocator overhead is outside this declared logical source domain.
 pub(crate) const COMMAND_ENTRIES: usize = 25;
 impl ShardHandle {
+    #[allow(
+        clippy::result_large_err,
+        reason = "return the actual retained store and result custody without a refusal allocation"
+    )]
     pub(crate) fn begin_owned_gc(
         &self,
         tp: TopicPartition,

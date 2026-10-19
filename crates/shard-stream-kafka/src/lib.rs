@@ -1722,7 +1722,7 @@ mod tests {
             target_pack_bytes: 4096,
             max_pack_age: std::time::Duration::from_secs(30),
             max_batch_bytes: 4096,
-            max_fetch_bytes: 1 << 20,
+            max_fetch_bytes: 4096,
             append_linger: std::time::Duration::ZERO,
         };
         let engine = Arc::new(StreamEngine::open(cfg.clone()).expect("real native RF1 engine"));

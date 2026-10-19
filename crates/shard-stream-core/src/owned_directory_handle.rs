@@ -426,6 +426,20 @@ fn validate_entry_identity(
     Ok(())
 }
 
+fn validate_root_handle_identity(
+    observed: &std::fs::Metadata,
+    actual: &std::fs::Metadata,
+) -> Result<()> {
+    if !observed.is_dir()
+        || observed.file_type().is_symlink()
+        || observed.dev() != actual.dev()
+        || observed.ino() != actual.ino()
+    {
+        return Err(DirectoryOwnershipError::IdentityMismatch);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,18 +618,4 @@ mod tests {
             .expect("real final handle drop releases original custody");
         std::fs::remove_dir_all(path).expect("fixture cleanup");
     }
-}
-
-fn validate_root_handle_identity(
-    observed: &std::fs::Metadata,
-    actual: &std::fs::Metadata,
-) -> Result<()> {
-    if !observed.is_dir()
-        || observed.file_type().is_symlink()
-        || observed.dev() != actual.dev()
-        || observed.ino() != actual.ino()
-    {
-        return Err(DirectoryOwnershipError::IdentityMismatch);
-    }
-    Ok(())
 }

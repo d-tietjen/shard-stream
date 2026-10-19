@@ -7,8 +7,8 @@ use crate::{
     TopicId, VirtualLaneId,
 };
 use shardlog::{
-    AcquiredShardRecoveryGuard, PinnedShardDirectoryLimits, PinnedStoreOpenFailure, Reservation,
-    ShardGuardAcquireLimits, ShardRecoveryGuard,
+    AcquiredShardRecoveryGuard, PinnedShardDirectoryLimits, PinnedStoreOpenFailure,
+    PinnedStoreOpenOutcome, Reservation, ShardGuardAcquireLimits, ShardRecoveryGuard, StorageError,
 };
 use std::fs::{self, File, OpenOptions};
 use std::num::NonZeroU32;
@@ -513,7 +513,36 @@ fn actual_corrupt_native_frame_and_partial_reader_survive_bridge_error_custody()
     let native = error
         .native_error()
         .expect("actual typed native failure retained");
-    assert!(native.native_error().is_some());
+    assert_eq!(native.failure(), PinnedStoreOpenFailure::Native);
+    let corrupt = native
+        .outcomes()
+        .iter()
+        .find_map(|outcome| {
+            let PinnedStoreOpenOutcome::Decode {
+                offset: 0,
+                result: Err(error),
+            } = outcome
+            else {
+                return None;
+            };
+            match error {
+                StorageError::Corrupt {
+                    path,
+                    offset: 0,
+                    reason,
+                } if std::path::Path::new(path) == pack.as_path()
+                    && reason == "extent checksum mismatch" =>
+                {
+                    Some(error)
+                }
+                _ => None,
+            }
+        })
+        .expect("actual original native checksum error retained in Decode row");
+    let source = std::error::Error::source(native)
+        .and_then(|error| error.downcast_ref::<StorageError>())
+        .expect("actual retained native error is the Error source");
+    assert!(std::ptr::eq(corrupt, source));
     assert!(native.retained_file_slots() > 0);
     assert!(native.usage().completed_read_bytes > 0);
     assert_eq!(fs::read(&pack).expect("actual pack after refusal"), bytes);

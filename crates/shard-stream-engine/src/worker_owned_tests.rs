@@ -384,7 +384,21 @@ fn actual_sync_worker_keeps_native_pin_after_lane_store_and_lane_thread_are_gone
     });
     *SYNC_BARRIER.lock().expect("register actual inode") = Some(barrier.clone());
     let release = ReleaseSync;
-    let completion = handle.begin_sync().expect("actual sync command");
+    // An explicit Sync command waits for fsync on the lane itself. Use the
+    // ordinary asynchronous durable append path so this test can join the lane
+    // while the separate physical sync worker still owns its real request.
+    let (response, completion) = sync_channel(1);
+    handle
+        .begin_append(
+            reservation(3),
+            None,
+            None,
+            Bytes::from_static(b"actual retained sync frame"),
+            false,
+            None,
+            response,
+        )
+        .expect("actual asynchronous durable append");
     let state = barrier.state.lock().expect("actual request barrier");
     let (state, wait) = barrier
         .changed
@@ -410,10 +424,12 @@ fn actual_sync_worker_keeps_native_pin_after_lane_store_and_lane_thread_are_gone
         Err(std::sync::mpsc::TryRecvError::Empty)
     ));
     drop(release);
-    completion
+    let durability = completion
         .recv()
         .expect("actual response")
         .expect("real fsync");
+    assert_eq!(durability.durable_replicas, 1);
+    assert!(!durability.object_durable);
     drop(handle);
     assert!(weak.upgrade().is_none());
     DirectoryOwnership::acquire(&temp.root).expect("last physical sync worker returned");
@@ -808,7 +824,9 @@ impl ShardDirectoryChecks for RenameChecks {
             && self.pending.exists()
             && !self.observed_rename.swap(true, Ordering::AcqRel)
         {
-            if let Some(e) = *self.late.lock().expect("actual scoped rename callback") {
+            // Hold the same actual mutex guard through the original deadline wait.
+            let late = self.late.lock().expect("actual scoped rename callback");
+            if let Some(e) = *late {
                 thread::sleep(
                     e.saturating_duration_since(Instant::now()) + Duration::from_millis(5),
                 );

@@ -1872,6 +1872,10 @@ fn native_pack_name(sequence: u64) -> String {
 }
 
 #[cfg(unix)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "keep actual pack identity, repair mode, index borrows and original deadline explicit"
+)]
 fn scan_pack_until(
     path: &Path,
     pack_sequence: u64,
@@ -2061,8 +2065,11 @@ fn recovery_gc_clock(expiry: Instant) -> StorageResult<()> {
     Ok(())
 }
 #[cfg(all(unix, test))]
+type RecoveryTestStep = std::cell::RefCell<Option<Box<dyn FnMut(&str)>>>;
+
+#[cfg(all(unix, test))]
 thread_local! {
-    static RECOVERY_DIRECTORY_STEP: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> =
+    static RECOVERY_DIRECTORY_STEP: RecoveryTestStep =
         const { std::cell::RefCell::new(None) };
 }
 #[cfg(all(unix, test))]
@@ -2076,7 +2083,7 @@ fn recovery_directory_test_step(step: &str) {
 
 #[cfg(all(unix, test))]
 thread_local! {
-    static RECOVERY_GC_STEP: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> =
+    static RECOVERY_GC_STEP: RecoveryTestStep =
         const { std::cell::RefCell::new(None) };
 }
 #[cfg(all(unix, test))]

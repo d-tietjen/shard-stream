@@ -23,7 +23,7 @@ impl Attempt {
         self.shards.iter().any(|(id, _)| *id == shard)
     }
 
-    fn restore_objects(&mut self) -> Result<()> {
+    pub(super) fn restore_objects(&mut self) -> Result<()> {
         self.clock()?;
         let headers = self
             .tier_manifests
@@ -236,10 +236,10 @@ impl Attempt {
                 .flat_map(|m| m.native.objects.iter())
                 .map(|o| o.pack_sequence)
                 .max();
-            if let Some(last) = current {
-                if highest.is_none_or(|primary| primary <= last) {
-                    active.push((shard, last.checked_add(1).ok_or_else(limited)?));
-                }
+            if let Some(last) = current
+                && highest.is_none_or(|primary| primary <= last)
+            {
+                active.push((shard, last.checked_add(1).ok_or_else(limited)?));
             }
         }
 

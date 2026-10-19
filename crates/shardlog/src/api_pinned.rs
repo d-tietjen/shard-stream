@@ -435,6 +435,10 @@ impl OpenedPinnedShardStore {
     /// success or error retains this whole store until its own destruction.
     /// No I/O, plain reopen or new store/lock owner is fabricated. This method
     /// does not supply bounded reads, appends, sealing, compaction or serving.
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain the whole actual store and inspection outcomes without allocating on refusal"
+    )]
     pub fn into_shard_log_until(
         self,
         budget: &StorageFetchBudget,
@@ -487,7 +491,9 @@ pub enum PinnedShardLogReadFailure {
     Native(StorageFetchFailure),
     /// Actual SAME composing checkpoint refusal.
     Checkpoint {
+        /// Actual error returned by the composing checkpoint.
         result: ShardDirectoryCheckFailure,
+        /// Native budget refusal observed after the composing check, if any.
         native_postcheck: Option<StorageFetchFailure>,
     },
     /// Native metadata planning refused; actual plan error remains retained.
@@ -892,6 +898,10 @@ impl OpenedPinnedShardLog {
     /// Retains actual plan/read/allocation/mapping Results, partial buffers and
     /// canonical prefix before whole log LAST. Denies SAME counters and attempts
     /// composing health denial once, preserving independent panic payloads.
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain actual read inputs, partial results and whole log without a failure allocation"
+    )]
     pub fn read_from_until(
         self,
         pin: &crate::PinnedShardDirectory,

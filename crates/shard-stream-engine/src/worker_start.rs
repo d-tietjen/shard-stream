@@ -16,6 +16,15 @@ pub(super) struct LaneInput {
 }
 pub(super) type InputSlot = Arc<Mutex<Option<LaneInput>>>;
 
+// The actual native channel result, with both endpoints or its original error.
+type LaneChannelResult = Result<
+    (
+        ByteBoundedSender<ShardCommand>,
+        shard_stream_core::ByteBoundedReceiver<ShardCommand>,
+    ),
+    shard_stream_core::ChannelConfigError,
+>;
+
 struct Start {
     primary: Option<PrimaryStore>,
     tier: Option<LocalObjectTier>,
@@ -23,15 +32,7 @@ struct Start {
     catalog: Vec<ExtentCatalogEntry>,
     sync_spawn: Option<io::Result<JoinHandle<()>>>,
     lane_spawn: Option<io::Result<JoinHandle<()>>>,
-    channel_result: Option<
-        Result<
-            (
-                ByteBoundedSender<ShardCommand>,
-                shard_stream_core::ByteBoundedReceiver<ShardCommand>,
-            ),
-            shard_stream_core::ChannelConfigError,
-        >,
-    >,
+    channel_result: Option<LaneChannelResult>,
     sync_ready: Option<Result<(), RecvTimeoutError>>,
     lane_ready: Option<Result<(), RecvTimeoutError>>,
     panic_payload: Option<Box<dyn Any + Send>>,
@@ -259,10 +260,10 @@ impl Start {
         );
         // Store the real JoinHandle immediately, including late success, before
         // any checkpoint or test callback. Failure leaves the real IO error.
-        if matches!(self.sync_spawn, Some(Ok(_))) {
-            if let Some(Ok(thread)) = self.sync_spawn.take() {
-                self.handle.sync_thread = Some(thread);
-            }
+        if matches!(self.sync_spawn, Some(Ok(_)))
+            && let Some(Ok(thread)) = self.sync_spawn.take()
+        {
+            self.handle.sync_thread = Some(thread);
         }
         #[cfg(test)]
         recovered_open_test_step("sync-spawned");
@@ -363,10 +364,10 @@ impl Start {
                     drop(directory);
                 }),
         );
-        if matches!(self.lane_spawn, Some(Ok(_))) {
-            if let Some(Ok(thread)) = self.lane_spawn.take() {
-                self.handle.thread = Some(thread);
-            }
+        if matches!(self.lane_spawn, Some(Ok(_)))
+            && let Some(Ok(thread)) = self.lane_spawn.take()
+        {
+            self.handle.thread = Some(thread);
         }
         #[cfg(test)]
         recovered_open_test_step("lane-spawned");

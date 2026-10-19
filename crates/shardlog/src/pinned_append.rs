@@ -820,6 +820,10 @@ impl ShardStore {
     /// composing Core owner, this store and pin through all report/error cleanup.
     /// On any refusal the budget and SAME composing operation are denied before
     /// physical rollback/durability settlement; this store must not be reused.
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain actual append inputs and partial native settlement without a failure allocation"
+    )]
     pub fn append_group_pinned_until(
         &mut self,
         pin: &PinnedShardDirectory,
@@ -831,6 +835,10 @@ impl ShardStore {
         append_entry(self, pin, inputs, sync, false, budget, checks)
     }
     /// Seal the actual nonempty active pack by the same bounded rotation path.
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain actual native seal settlement without allocating during refusal"
+    )]
     pub fn seal_active_pinned_until(
         &mut self,
         pin: &PinnedShardDirectory,
@@ -840,6 +848,10 @@ impl ShardStore {
         append_entry(self, pin, Vec::new(), false, true, budget, checks)
     }
 }
+#[allow(
+    clippy::result_large_err,
+    reason = "retain original payloads and actual native settlement without a failure allocation"
+)]
 fn append_entry(
     store: &mut ShardStore,
     pin: &PinnedShardDirectory,

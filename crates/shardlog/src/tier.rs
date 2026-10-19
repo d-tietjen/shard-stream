@@ -689,8 +689,13 @@ fn tier_recovery_clock(expiry: std::time::Instant) -> StorageResult<()> {
     Ok(())
 }
 #[cfg(all(unix, test))]
+type TierRecoveryTestStep = std::cell::RefCell<Option<Box<dyn FnMut(&str)>>>;
+#[cfg(all(unix, test))]
+type TierCopyTestStep = std::cell::RefCell<Option<Box<dyn FnMut(&str, &Path)>>>;
+
+#[cfg(all(unix, test))]
 thread_local! {
-    static TIER_RECOVERY_STEP: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> =
+    static TIER_RECOVERY_STEP: TierRecoveryTestStep =
         const { std::cell::RefCell::new(None) };
 }
 #[cfg(all(unix, test))]
@@ -704,7 +709,7 @@ fn tier_recovery_test_step(step: &str) {
 
 #[cfg(all(unix, test))]
 thread_local! {
-    static TIER_COPY_STEP: std::cell::RefCell<Option<Box<dyn FnMut(&str, &Path)>>> =
+    static TIER_COPY_STEP: TierCopyTestStep =
         const { std::cell::RefCell::new(None) };
 }
 #[cfg(all(unix, test))]

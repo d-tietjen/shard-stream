@@ -42,6 +42,8 @@ fn observe(f: impl FnMut(Phase) + 'static) -> Observe {
     });
     Observe
 }
+type CheckAction = RefCell<Option<Box<dyn FnMut(usize)>>>;
+
 struct Checks {
     denied: Rc<Cell<bool>>,
     calls: Cell<usize>,
@@ -49,7 +51,7 @@ struct Checks {
     panic_deny: Cell<bool>,
     core: Option<NativeDirectoryBudget>,
     native: Option<StorageFetchBudget>,
-    action: RefCell<Option<Box<dyn FnMut(usize)>>>,
+    action: CheckAction,
 }
 impl Checks {
     fn new() -> Self {

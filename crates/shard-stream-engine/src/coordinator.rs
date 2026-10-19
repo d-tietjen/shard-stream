@@ -2757,8 +2757,11 @@ pub(crate) fn recover_partition_states_until(
 }
 
 #[cfg(all(unix, test))]
+type RecoveryReduceHook = Box<dyn FnMut(&str)>;
+
+#[cfg(all(unix, test))]
 thread_local! {
-    pub(crate) static RECOVERY_REDUCE_STEP: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> =
+    pub(crate) static RECOVERY_REDUCE_STEP: std::cell::RefCell<Option<RecoveryReduceHook>> =
         const { std::cell::RefCell::new(None) };
 }
 

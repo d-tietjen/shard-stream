@@ -192,10 +192,10 @@ impl ShardDirectoryChecks for Checks<'_> {
     fn check(&self) -> Result<(), ShardDirectoryCheckFailure> {
         self.check_budget()?;
         let observed = self.outer.check();
-        if let Err(error) = observed {
-            if self.checkpoint_error.get().is_none() {
-                self.checkpoint_error.set(Some(error));
-            }
+        if let Err(error) = observed
+            && self.checkpoint_error.get().is_none()
+        {
+            self.checkpoint_error.set(Some(error));
         }
         // Keep the actual composing result before checking the SAME minimum E.
         self.check_budget()?;
@@ -224,6 +224,10 @@ struct Scope {
     // Last: all actual results/configuration settle before the original parent.
     directory: OwnedShardStoreDirectory,
 }
+#[allow(
+    clippy::large_enum_variant,
+    reason = "retain original store configuration and directory inline before allocation admission"
+)]
 enum Custody {
     Early {
         config: ShardStoreConfig,

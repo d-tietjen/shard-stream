@@ -1067,10 +1067,10 @@ impl Scope {
         // No new admission, retry or E after denial: ONLY already-prepaid slots
         // settle on the SAME descriptor. Each phase has independent unwind
         // custody so an earlier panic cannot skip a later prepaid durability call.
-        if let Some(pending) = &self.pending_file {
-            if pending.sequence != store.active.sequence {
-                return Err(PinnedShardAppendFailure::Refused);
-            }
+        if let Some(pending) = &self.pending_file
+            && pending.sequence != store.active.sequence
+        {
+            return Err(PinnedShardAppendFailure::Refused);
         }
         if self
             .pending_file

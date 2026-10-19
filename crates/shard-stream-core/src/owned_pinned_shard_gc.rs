@@ -135,10 +135,10 @@ impl ShardDirectoryChecks for Checks<'_> {
     fn check(&self) -> Result<(), ShardDirectoryCheckFailure> {
         self.check_budget()?;
         let observed = self.outer.check();
-        if let Err(error) = observed {
-            if self.checkpoint_error.get().is_none() {
-                self.checkpoint_error.set(Some(error));
-            }
+        if let Err(error) = observed
+            && self.checkpoint_error.get().is_none()
+        {
+            self.checkpoint_error.set(Some(error));
         }
         self.check_budget()?;
         observed
@@ -486,17 +486,17 @@ impl OwnedPinnedShardStore {
                     Err(OwnedPinnedShardGcFailure::Unwind)
                 }
             };
-            let observed = observed.and_then(|()| {
+            let observed = observed.and({
                 if matches!(effects.native.as_ref(), Some(Ok(_))) {
                     Ok(())
                 } else {
                     Err(OwnedPinnedShardGcFailure::Invariant)
                 }
             });
-            if observed.is_err() {
-                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| checks.deny())) {
-                    effects.deny_panic_payload = Some(payload);
-                }
+            if observed.is_err()
+                && let Err(payload) = catch_unwind(AssertUnwindSafe(|| checks.deny()))
+            {
+                effects.deny_panic_payload = Some(payload);
             }
             // SAME denial and already-prepaid native settlement precede unlock.
             // All native results and the whole owner remain outside this frame.

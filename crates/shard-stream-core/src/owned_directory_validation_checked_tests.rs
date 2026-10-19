@@ -167,7 +167,6 @@ fn trace(handle: &OwnedDirectoryHandle) -> Vec<Event> {
     assert_eq!(checks.denials.get(), 0);
     drop(report);
     Rc::try_unwrap(events)
-        .ok()
         .expect("only reference collector")
         .into_inner()
 }
@@ -423,7 +422,7 @@ fn actual_phase_unwind_and_independent_health_denial_unwind_preserve_both_payloa
     let p = Temporary::new();
     let (_owner, handle) = fixture(&p, 1);
     let expected = trace(&handle);
-    for target in 0..expected.len() {
+    for (target, expected_event) in expected.iter().enumerate() {
         let (core, native) = budgets();
         let mut checks = HostChecks::new(&core, &native);
         checks.path = Some(p.0.clone());
@@ -465,13 +464,13 @@ fn actual_phase_unwind_and_independent_health_denial_unwind_preserve_both_payloa
         assert_eq!(checks.denials.get(), 1);
         assert_eq!(n.get(), target + 1);
         contended(&p.0);
-        if !expected[target].1 {
+        if !expected_event.1 {
             assert_eq!(
                 e.observations()
                     .last()
                     .expect("actual raw value before panic")
                     .phase(),
-                expected[target].0
+                expected_event.0
             );
         }
     }

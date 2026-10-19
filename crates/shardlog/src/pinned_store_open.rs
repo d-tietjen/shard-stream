@@ -1169,6 +1169,10 @@ impl Scope {
         }
         length.ok_or(PinnedStoreOpenFailure::Identity)
     }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "keep descriptor slot, physical range, read mode and actual checks/callback explicit"
+    )]
     fn read(
         &mut self,
         slot: usize,
@@ -1228,6 +1232,10 @@ impl Scope {
         self.work.check(checks)?;
         count.ok_or(PinnedStoreOpenFailure::Io)
     }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "keep descriptor slot, physical range, read mode and actual checks/callback explicit"
+    )]
     fn fill(
         &mut self,
         slot: usize,

@@ -40,20 +40,20 @@ impl Scope {
         self.work.deny();
         if let Some(policy) = &self.gc_actual_policy {
             policy.budget.deny();
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| policy.checks.deny())) {
-                if self.gc_deny_panic.is_none() {
-                    self.gc_deny_panic = Some(payload);
-                }
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| policy.checks.deny()))
+                && self.gc_deny_panic.is_none()
+            {
+                self.gc_deny_panic = Some(payload);
             }
-        } else if !self.gc_preentry_denial_attempted {
-            if let Some(policy) = &self.gc_policy {
-                self.gc_preentry_denial_attempted = true;
-                policy.budget.deny();
-                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| policy.checks.deny())) {
-                    if self.gc_deny_panic.is_none() {
-                        self.gc_deny_panic = Some(payload);
-                    }
-                }
+        } else if !self.gc_preentry_denial_attempted
+            && let Some(policy) = &self.gc_policy
+        {
+            self.gc_preentry_denial_attempted = true;
+            policy.budget.deny();
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| policy.checks.deny()))
+                && self.gc_deny_panic.is_none()
+            {
+                self.gc_deny_panic = Some(payload);
             }
         }
     }
@@ -173,6 +173,10 @@ impl EngineHandle {
     /// # Errors
     /// Retains this same engine, actual Core report/refused whole store, pending
     /// command settlement and typed work/checkpoint/unwind outcomes.
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain actual entered GC results and the same engine without a refusal allocation"
+    )]
     pub fn collect_garbage_until(
         &self,
         partition: TopicPartition,

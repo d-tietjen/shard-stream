@@ -681,13 +681,30 @@ fn actual_object_restore_then_native_gc_reclaims_links_and_snapshot_fds_before_r
     .expect("actual pinned snapshot")
     .restore_storage()
     .expect("actual no-replace copy and temp cleanup");
+    // Keep each exact inode alive through the process-wide FD census: another
+    // parallel test must not recycle an unlinked pack's (device, inode) pair.
+    let witnesses = [
+        File::open(&pack0).expect("independent read-only restored-pack witness"),
+        File::open(&pack1).expect("independent read-only original-pack witness"),
+    ];
+    #[cfg(target_os = "linux")]
+    let witness_fds = [
+        std::os::fd::AsRawFd::as_raw_fd(&witnesses[0]),
+        std::os::fd::AsRawFd::as_raw_fd(&witnesses[1]),
+    ];
     let identities = [
-        fs::metadata(&pack0).expect("restored actual primary").dev(),
-        fs::metadata(&pack1).expect("original actual primary").dev(),
+        witnesses[0]
+            .metadata()
+            .expect("restored actual primary")
+            .dev(),
+        witnesses[1]
+            .metadata()
+            .expect("original actual primary")
+            .dev(),
     ];
     let inodes = [
-        fs::metadata(&pack0).expect("restored inode").ino(),
-        fs::metadata(&pack1).expect("original inode").ino(),
+        witnesses[0].metadata().expect("restored inode").ino(),
+        witnesses[1].metadata().expect("original inode").ino(),
     ];
     for pack in [&pack0, &pack1] {
         assert_eq!(fs::metadata(pack).expect("one canonical link").nlink(), 1);
@@ -716,16 +733,37 @@ fn actual_object_restore_then_native_gc_reclaims_links_and_snapshot_fds_before_r
             .any(|f| f.device == identities[1] && f.inode == inodes[1]),
         "ordinary old facts survive source FD retirement"
     );
+    for witness in &witnesses {
+        assert_eq!(
+            witness.metadata().expect("same original witness").nlink(),
+            0,
+            "actual GC must remove every link while original inode identity is pinned"
+        );
+    }
     #[cfg(target_os = "linux")]
     for entry in fs::read_dir("/proc/self/fd").expect("actual process descriptor census") {
         let entry = entry.expect("actual FD name");
+        let fd = entry
+            .file_name()
+            .to_str()
+            .expect("numeric actual FD name")
+            .parse::<std::os::fd::RawFd>()
+            .expect("actual numeric process FD");
+        if witness_fds.contains(&fd) {
+            continue; // Exclude only these two retained, independent fixture FDs.
+        }
         if let Ok(metadata) = fs::metadata(entry.path()) {
             assert!(
                 !(0..2).any(|i| metadata.dev() == identities[i] && metadata.ino() == inodes[i]),
-                "native GC must not leave a retired copy or original snapshot descriptor holding primary bytes"
+                "native GC must not leave a retired copy or original snapshot descriptor holding primary bytes: fd {fd}, target {:?}, device {}, inode {}, links {}, fixture witnesses {witness_fds:?}",
+                fs::read_link(entry.path()),
+                metadata.dev(),
+                metadata.ino(),
+                metadata.nlink()
             );
         }
     }
+    drop(witnesses); // Release only the last fixture-owned pins before restart.
     assert!(
         DirectoryOwnership::acquire(&temp.0).is_err(),
         "SAME physical custody survives retirement and GC"

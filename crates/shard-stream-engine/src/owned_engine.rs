@@ -43,10 +43,10 @@ impl std::ops::DerefMut for JoiningEngine {
 }
 impl Drop for JoiningEngine {
     fn drop(&mut self) {
-        if let Some(engine) = &mut self.0 {
-            if let Some(sink) = &mut engine.durable_sink {
-                sink.join_owned_recovery();
-            }
+        if let Some(engine) = &mut self.0
+            && let Some(sink) = &mut engine.durable_sink
+        {
+            sink.join_owned_recovery();
         }
     }
 }
@@ -293,10 +293,10 @@ impl StreamEngine {
         if let Err(error) = result {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             if opening.worker_start_error.is_none()
-                && !opening
+                && opening
                     .gc_outcomes
                     .last()
-                    .is_some_and(|outcome| !outcome.accepted())
+                    .is_none_or(|outcome| outcome.accepted())
             {
                 opening.storage.recovery_deny_primary();
             }
@@ -323,6 +323,13 @@ impl StreamEngine {
         }
         Ok(recovered)
     }
+}
+
+// The test fixture prices the same complete fixed opening/error owners. Keep
+// this test-only getter tied to the exact construct framing expression.
+#[cfg(test)]
+pub(crate) fn recovery_opening_framing_bytes_for_test() -> usize {
+    size_of::<Opening>() + size_of::<OwnedRecoveredEngine>() + size_of::<OwnedEngineOpenError>()
 }
 
 impl Opening {

@@ -105,7 +105,7 @@ impl NativeRecoveryCensus {
             + size_of::<NativeRecoveryPartition<'_>>()
             + size_of::<HashMap<TopicPartition, BTreeMap<RingEpoch, Vec<ShardId>>>>()
             + size_of::<HashMap<TopicPartition, PartitionReplicationPolicy>>()
-            + 8 * size_of::<usize>()
+            + size_of::<[usize; 8]>()
             + ERROR_BYTES;
         self.attempt.charge(0, 8, fixed, 0, fixed as u64)?;
 

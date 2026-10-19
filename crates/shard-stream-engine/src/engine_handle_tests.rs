@@ -174,7 +174,7 @@ mod recovered {
         .expect("actual missing primary");
         let owner =
             DirectoryOwnership::acquire(&cfg.data_dir).expect("actual original primary owner");
-        let objects = DirectoryOwnership::acquire(root.join("objects"))
+        let objects = DirectoryOwnership::acquire(&root.join("objects"))
             .expect("actual original object owner");
         let census = NativeRecoveryCensus::read_for_engine(
             cfg,
@@ -195,7 +195,7 @@ mod recovered {
     fn contended(root: &Path) {
         for path in [root.join("data"), root.join("objects")] {
             assert!(matches!(
-                DirectoryOwnership::acquire(path),
+                DirectoryOwnership::acquire(&path),
                 Err(DirectoryOwnershipError::Contended)
             ));
         }
@@ -203,7 +203,7 @@ mod recovered {
     fn free(root: &Path) {
         for path in [root.join("data"), root.join("objects")] {
             drop(
-                DirectoryOwnership::acquire(path)
+                DirectoryOwnership::acquire(&path)
                     .expect("real native owners released after complete cleanup"),
             );
         }

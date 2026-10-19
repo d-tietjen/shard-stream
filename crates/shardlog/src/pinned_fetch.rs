@@ -556,6 +556,10 @@ fn grow<T>(
 impl OpenedPinnedShardStore {
     /// Plan using this actual store and SAME cumulative native work/deadline.
     /// No read, new owner or completion authority is produced by metadata.
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain the actual partial native plan and observations without a failure allocation"
+    )]
     pub fn plan_fetch_pinned_until(
         &self,
         topic: TopicPartition,
@@ -1019,6 +1023,10 @@ impl ReadState {
         }
         Ok(())
     }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "keep the actual opened store, pin, range and original budget/checks borrowed explicitly"
+    )]
     fn read_range(
         &mut self,
         opened: &OpenedPinnedShardStore,
@@ -1245,6 +1253,10 @@ impl OpenedPinnedShardStore {
     /// Retains input plan, actual IO/allocation results, completed payloads,
     /// partial bytes and independent unwind/denial payloads. All refusals deny
     /// SAME native counters and composing health before retained cleanup.
+    #[allow(
+        clippy::result_large_err,
+        reason = "retain the actual plan, partial native bytes and outcomes without a failure allocation"
+    )]
     pub fn read_fetch_plan_pinned_until(
         &self,
         pin: &PinnedShardDirectory,

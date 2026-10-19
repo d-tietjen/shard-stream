@@ -141,7 +141,7 @@ fn recovered(root: &Path) -> EngineHandle {
 #[cfg(unix)]
 fn contended(root: &Path) {
     assert!(matches!(
-        DirectoryOwnership::acquire(root.join("data")),
+        DirectoryOwnership::acquire(&root.join("data")),
         Err(DirectoryOwnershipError::Contended)
     ));
 }

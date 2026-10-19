@@ -825,7 +825,7 @@ fn run_worker(
                     lane,
                     result: stores
                         .primary
-                        .native()
+                        .native_mut()
                         .ok_or_else(primary::unavailable)
                         .and_then(|primary| primary.read_fetch_plan(&planned)),
                 });
@@ -1090,7 +1090,7 @@ impl BorrowedLaneStores<'_> {
         if self.primary.seal_active_if_older(max_pack_age)?.is_some()
             && let Some(tier) = &mut self.tier
         {
-            offload_sealed_packs(&self.primary, tier)?;
+            offload_sealed_packs(self.primary, tier)?;
         }
         Ok(())
     }
@@ -1203,10 +1203,10 @@ impl BorrowedLaneStores<'_> {
             let object_durable = if requires_object {
                 self.primary
                     .seal_active()
-                    .and_then(|_| offload_sealed_packs(&self.primary, tier))
+                    .and_then(|_| offload_sealed_packs(self.primary, tier))
                     .is_ok()
             } else {
-                let _ = offload_sealed_packs(&self.primary, tier);
+                let _ = offload_sealed_packs(self.primary, tier);
                 false
             };
             if object_durable {
@@ -1308,8 +1308,11 @@ fn offload_sealed_packs_until(
 }
 
 #[cfg(all(unix, test))]
+type RecoveredOpenHook = Box<dyn FnMut(&str)>;
+
+#[cfg(all(unix, test))]
 thread_local! {
-    pub(crate) static RECOVERED_OPEN_STEP: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> =
+    pub(crate) static RECOVERED_OPEN_STEP: std::cell::RefCell<Option<RecoveredOpenHook>> =
         const { std::cell::RefCell::new(None) };
 }
 #[cfg(all(unix, test))]

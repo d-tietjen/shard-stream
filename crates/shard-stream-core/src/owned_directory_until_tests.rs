@@ -498,10 +498,15 @@ fn real_optional_absence_and_native_trace_kinds_do_not_deny_fitting_first_boot_b
             .expect("actual native kind"),
         Some(OwnedEntryKind::Directory)
     );
-    let socket = std::os::unix::net::UnixListener::bind(path.0.join("socket-trace"))
-        .expect("another real native trace kind");
+    // A real FIFO exercises the native Other kind with filesystem-only setup.
+    rustix::fs::mkfifoat(
+        rustix::fs::CWD,
+        path.0.join("fifo-trace"),
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    )
+    .expect("another real native trace kind");
     assert_eq!(
-        root.entry_kind_until(OsStr::new("socket-trace"), &paid)
+        root.entry_kind_until(OsStr::new("fifo-trace"), &paid)
             .expect("other native kind still observed"),
         Some(OwnedEntryKind::Other)
     );
@@ -528,7 +533,7 @@ fn real_optional_absence_and_native_trace_kinds_do_not_deny_fitting_first_boot_b
         NativeDirectoryFailure::Ownership(DirectoryOwnershipError::IdentityMismatch)
     ));
     assert!(rejected.progress().symlink_observed);
-    drop(socket);
+    fs::remove_file(path.0.join("fifo-trace")).expect("remove actual non-regular trace");
     drop(child);
 }
 

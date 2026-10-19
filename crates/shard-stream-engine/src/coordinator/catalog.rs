@@ -164,7 +164,7 @@ mod tests {
         let full = recover_partition_states(&config, &events, &HashMap::new(), 1)
             .expect("actual full native typed reducer");
         assert_eq!(full[&tp].replication_policy, policies[&tp]);
-        assert_eq!(full[&tp].sequencer.ring_epoch, RingEpoch::new(1));
+        assert_eq!(full[&tp].sequencer.ring_epoch(), RingEpoch::new(1));
         assert_eq!(policies[&tp].policy_generation, 2);
         assert_eq!(policies[&tp].min_in_sync_replicas, 1);
         assert_eq!(

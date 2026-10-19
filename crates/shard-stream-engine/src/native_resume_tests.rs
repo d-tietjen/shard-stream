@@ -163,7 +163,7 @@ fn recovered_with_sink(
 }
 fn contended(root: &Path) {
     assert!(matches!(
-        DirectoryOwnership::acquire(root.join("data")),
+        DirectoryOwnership::acquire(&root.join("data")),
         Err(DirectoryOwnershipError::Contended)
     ));
 }
@@ -1271,21 +1271,95 @@ mod table_probe_regressions {
             ),
         )
     }
+    fn finalized_history_recovery_limits(
+        config: &EngineConfig,
+        sink: &DurableSinkConfig,
+        journal_bytes: usize,
+    ) -> (NativeRecoveryLimits, usize, usize) {
+        // This positive fixture retains its 3 initial frames plus all 96 real
+        // committed atomic frames. Bound only its complete setup suffix; the
+        // shared native_limits and exact/one-less probe budgets stay unchanged.
+        const EXTENTS: usize = 99;
+        const FACTS: usize = 8; // One journal and seven actual primary packs.
+        const EVENTS: usize = 256;
+        const SOURCE_BYTES: usize = 1 << 20;
+        let ordinary = native_limits();
+        assert_eq!(config.shard_count, 1);
+        assert!(journal_bytes <= SOURCE_BYTES);
+        let sources = FACTS + EXTENTS;
+        let visits = (FACTS + 1 + 1) * 4;
+        // Source has exactly OwnedFileHandle and RecoverySourceFact fields.
+        // Include both field alignments rather than assume a Rust repr layout.
+        let source_width = size_of::<shard_stream_core::OwnedFileHandle>()
+            + size_of::<crate::RecoverySourceFact>()
+            + std::mem::align_of::<shard_stream_core::OwnedFileHandle>()
+            + std::mem::align_of::<crate::RecoverySourceFact>();
+        let sizing_bytes = 2 * size_of::<crate::worker::PrimaryStore>();
+        let facts_bytes = FACTS * size_of::<crate::RecoverySourceFact>();
+        let per_object = 4 * size_of::<shardlog::TierObject>() + 4 * ordinary.max_path_bytes + 1024;
+        let native_tier = (sources + 1) * per_object
+            + (EXTENTS + 1) * (4 * size_of::<shardlog::TierExtent>() + 1024);
+        let worker = crate::worker::recovery_worker_bytes(config)
+            .expect("actual ordinary worker typed cost");
+        let fixed = worker
+            + 4 * size_of::<crate::worker::ShardHandle>()
+            + 16 * ordinary.max_path_bytes
+            + journal_bytes * 64;
+        let admission_bytes = fixed
+            + native_tier * (sources + 8)
+            + (sources + 1) * shardlog::LocalObjectTier::recovery_hash_buffer_bytes()
+            + (EXTENTS + 1) * size_of::<shardlog::ExtentCatalogEntry>() * 8;
+        let opening = crate::engine::owned::recovery_opening_framing_bytes_for_test();
+        let journal_open = ordinary.max_path_bytes * 4 + 1024;
+        let dispatcher =
+            crate::durable_sink::recovery_dispatcher_bytes(sink, 1, config.queue_bytes_per_shard)
+                .expect("same real sink configuration typed cost");
+        let coordinator =
+            crate::coordinator::recovery_coordinator_bytes(1, EXTENTS + EVENTS + 1, EXTENTS)
+                .expect("actual complete coordinator queue/map/dense-slot upper cost");
+        let suffix_bytes = sizing_bytes
+            + facts_bytes
+            + admission_bytes
+            + opening
+            + journal_open
+            + dispatcher
+            + coordinator;
+        let wide = |bytes: usize| u64::try_from(bytes).expect("bounded typed work fits u64");
+        let sizing_work = wide(visits * (size_of::<crate::worker::PrimaryStore>() + source_width));
+        let admission_work = 16 * wide(SOURCE_BYTES)
+            + 8 * wide(admission_bytes)
+            + wide((EXTENTS + 1) * (sources + 1) * 256);
+        let slot_sizing_work = (EXTENTS + 1)
+            * (EXTENTS + EVENTS + 1)
+            * (size_of::<shardlog::ExtentCatalogEntry>() + size_of::<shardlog::JournalEvent>());
+        let suffix_work = sizing_work
+            + admission_work
+            + wide(opening)
+            + wide(dispatcher)
+            + 1024
+            + wide(slot_sizing_work)
+            + 8 * wide(coordinator);
+        let suffix_entries = visits + FACTS + (EXTENTS + 1) * (sources + 8) + 2;
+        let suffix_read = 8 * SOURCE_BYTES;
+        let limits = NativeRecoveryLimits {
+            max_files: ordinary
+                .max_files
+                .checked_add(8 * (sources + 1) + 2)
+                .expect("bounded actual file-operation fee"),
+            max_declared_bytes: ordinary
+                .max_declared_bytes
+                .checked_add(suffix_bytes)
+                .expect("typed complete setup byte fee"),
+            max_work_bytes: ordinary
+                .max_work_bytes
+                .checked_add(suffix_work)
+                .expect("complete cumulative setup work"),
+            ..ordinary
+        };
+        (limits, suffix_entries, suffix_read)
+    }
     fn reopen_with_sink(root: &Path, factory: Arc<FileFactory>) -> EngineHandle {
         let config = config(root);
-        let owner =
-            DirectoryOwnership::acquire(&config.data_dir).expect("actual released source root");
-        let census = NativeRecoveryCensus::read_for_engine(
-            config,
-            owner,
-            None,
-            native_limits(),
-            Instant::now() + Duration::from_secs(60),
-        )
-        .expect("actual existing committed history census");
-        let storage = census
-            .restore_storage()
-            .expect("actual same-source storage");
         let sink = DurableSinkConfig::new(factory).with_options(DurableSinkOptions {
             atomic_visibility: DurableSinkAtomicVisibility::CommittedOnly,
             recovery_mode: DurableSinkRecoveryMode::Background,
@@ -1294,16 +1368,87 @@ mod table_probe_regressions {
             max_pending_bytes: Some(2 << 20),
             ..DurableSinkOptions::default()
         });
-        EngineHandle::from_recovered(Arc::new(
-            StreamEngine::open_recovered_storage(
-                storage,
-                None,
-                Some(Arc::new(LegacyOnly::default())),
-                None,
-                Some(sink),
-            )
-            .expect("genuine committed-source recovered workers"),
-        ))
+        let expiry = Instant::now() + Duration::from_secs(60);
+        let journal_bytes = usize::try_from(
+            fs::metadata(config.data_dir.join("coordinator.ssj"))
+                .expect("actual finalized fixture journal before sizing")
+                .len(),
+        )
+        .expect("actual fixture journal length fits usize");
+        let (recovery, suffix_entries, suffix_read) =
+            finalized_history_recovery_limits(&config, &sink, journal_bytes);
+        let owner =
+            DirectoryOwnership::acquire(&config.data_dir).expect("actual released source root");
+        let census = NativeRecoveryCensus::read_for_engine(config, owner, None, recovery, expiry)
+            .expect("actual existing committed history census");
+        assert_eq!(census.extents().len(), 99);
+        assert_eq!(census.sources().count(), 8);
+        assert_eq!(
+            census
+                .sources()
+                .filter(|s| s.kind == crate::RecoverySourceKind::PrimaryPack)
+                .count(),
+            7
+        );
+        assert!(census.sources().map(|s| s.bytes).sum::<u64>() <= 1 << 20);
+        assert_eq!(
+            census
+                .sources()
+                .find(|s| s.kind == crate::RecoverySourceKind::Coordinator)
+                .expect("same actual journal")
+                .bytes,
+            u64::try_from(journal_bytes).expect("bounded journal bytes")
+        );
+        assert!(census.journal().len() <= 256);
+        let batch_ids = census
+            .extents()
+            .iter()
+            .map(|e| e.native.reservation.batch_id.get())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            batch_ids,
+            (0..99).collect(),
+            "actual contiguous completed batch identities bound recovery slots"
+        );
+        assert!(census.journal().iter().all(|event| !matches!(
+            event,
+            shardlog::JournalEvent::Truncate { .. }
+                | shardlog::JournalEvent::TruncateCheckpoint { .. }
+        )));
+        assert_eq!(census.absolute_expiry(), expiry);
+        let storage = census
+            .restore_storage()
+            .expect("actual same-source storage");
+        let prefix = storage.usage();
+        let ordinary = native_limits();
+        assert!(prefix.files <= ordinary.max_files);
+        assert!(prefix.declared_bytes <= ordinary.max_declared_bytes);
+        assert!(prefix.work_bytes <= ordinary.max_work_bytes);
+        assert!(
+            prefix
+                .entries
+                .checked_add(suffix_entries)
+                .expect("bounded entries")
+                <= ordinary.max_entries
+        );
+        assert!(
+            prefix
+                .read_bytes
+                .checked_add(u64::try_from(suffix_read).expect("bounded reads"))
+                .expect("bounded cumulative reads")
+                <= ordinary.max_read_bytes
+        );
+        assert_eq!(storage.absolute_expiry(), expiry);
+        let recovered = StreamEngine::open_recovered_storage(
+            storage,
+            None,
+            Some(Arc::new(LegacyOnly::default())),
+            None,
+            Some(sink),
+        )
+        .expect("genuine committed-source recovered workers");
+        assert_eq!(recovered.absolute_expiry(), expiry);
+        EngineHandle::from_recovered(Arc::new(recovered))
     }
 
     #[test]
@@ -1464,7 +1609,7 @@ mod table_probe_regressions {
             let handle = with_sink(&root.0, factory.clone());
             let weak = handle.downgrade();
             let batch = handle
-                .fetch_stored_internal(fetch())
+                .fetch_stored_internal(fetch(), false)
                 .expect("genuine stored native input")
                 .remove(0);
             let append = durable_append_from_stored(&handle.config, batch);
@@ -1509,7 +1654,7 @@ mod table_probe_regressions {
             match &retained {
                 Ok(report) => {
                     assert!(weak.upgrade().is_none());
-                    let owner = DirectoryOwnership::acquire(root.0.join("data"))
+                    let owner = DirectoryOwnership::acquire(&root.0.join("data"))
                         .expect("plain completed report releases actual engine root");
                     assert!(report.outcomes().iter().any(|outcome| matches!(outcome, NativeResumeOutcome::Sink { observed, .. } if observed.apply_result() == Some(DurableSinkApply::Applied))));
                     drop(owner);
@@ -1521,7 +1666,7 @@ mod table_probe_regressions {
             }
             drop(retained);
             assert!(weak.upgrade().is_none());
-            let owner = DirectoryOwnership::acquire(root.0.join("data"))
+            let owner = DirectoryOwnership::acquire(&root.0.join("data"))
                 .expect("dropping actual retained refusal releases engine root");
             drop(owner);
         }
