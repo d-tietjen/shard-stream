@@ -1161,16 +1161,24 @@ impl StreamEngine {
                 ),
             };
         }
-        self.coordinators
-            .observe_leader_epoch(topic_partition, batch.reservation.placement.leader_epoch)?;
-        let response = match self.coordinators.reserve_replica(
+        let epoch_activity = self.coordinators.observe_replica_leader_epoch(
+            topic_partition,
+            batch.reservation.placement.leader_epoch,
+        )?;
+        let reserved = self.coordinators.reserve_replica(
             topic_partition,
             batch.reservation,
             batch.producer,
             batch.atomic_group,
             payload_bytes,
             batch.payload_digest,
-        )? {
+        )?;
+        // A new reservation now owns its active unit in BatchRuntime. Until
+        // that handoff, retain the real earlier epoch observation across RPCs.
+        if let Some(activity) = epoch_activity {
+            activity.settle();
+        }
+        let response = match reserved {
             ReserveOutcome::Duplicate { response, .. } => {
                 return Ok(ReplicaAppendPlan::Duplicate(response));
             }
@@ -1559,6 +1567,13 @@ impl StreamEngine {
 
     pub fn watermarks(&self, topic_partition: TopicPartition) -> EngineResult<PartitionWatermarks> {
         self.coordinators.watermarks(topic_partition)
+    }
+
+    pub(crate) fn query_lineage_source(
+        &self,
+        partition: TopicPartition,
+    ) -> EngineResult<Arc<crate::query_lineage::Source>> {
+        self.coordinators.query_lineage_source(partition)
     }
 
     pub fn partition_replication_policy(
@@ -5154,6 +5169,12 @@ mod tests {
                 shards: None,
             })
             .expect("follower topic");
+        let owner = crate::EngineHandle::from(follower.clone());
+        let partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        let original = owner
+            .observe_query_lineage(partition)
+            .expect("source RPC")
+            .expect("genuine initially settled follower source");
         let queue =
             crate::DurableApplyQueue::spawn(follower.clone(), crate::DurableApplyConfig::default())
                 .expect("actual follower queue");
@@ -5198,10 +5219,19 @@ mod tests {
                 last_stable_offset: LogicalOffset::new(0),
             }
         );
+        assert!(
+            original.is_current_for(&owner, partition),
+            "pure refused context did not enter"
+        );
         let applied = queue
             .append_from_peer(batch.clone(), source)
             .expect("actual guarded replica");
         assert_eq!(applied.placement, receipt.placement);
+        assert!(!original.is_current_for(&owner, partition));
+        let settled = owner
+            .observe_query_lineage(partition)
+            .expect("source RPC")
+            .expect("actual follower write physically settled");
         let partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
         let before = follower
             .watermarks(partition)
@@ -5236,6 +5266,10 @@ mod tests {
             before
         );
         assert_eq!(pending.physical_admissions.load(Ordering::Relaxed), 1);
+        assert!(
+            settled.is_current_for(&owner, partition),
+            "exact duplicate is immutable"
+        );
         assert_eq!(pending.active.load(Ordering::Acquire), 0);
         let fetched = follower
             .fetch(fetch_request(0))
@@ -5246,6 +5280,46 @@ mod tests {
         assert_eq!(
             fetched[0].payload,
             Bytes::from_static(b"actual leader payload")
+        );
+        // A second real batch uses the SAME leader epoch. Replica input must
+        // still invalidate, since this ingress does not run the leader sink.
+        let mut second_request = append_request(2, b"second actual source batch", None);
+        second_request.leader_epoch = Some(7);
+        let second = leader
+            .append(second_request)
+            .expect("actual same-epoch leader append");
+        let second_batch = ReplicaAppend {
+            reservation: Reservation {
+                topic_id: partition.topic_id,
+                partition_id: partition.partition_id,
+                batch_id: second.batch_id,
+                first_offset: second.first_offset,
+                last_offset: second.last_offset,
+                record_count: NonZeroU32::new(1).expect("actual single-record input"),
+                placement: second.placement,
+            },
+            producer: None,
+            atomic_group: None,
+            extension_context: None,
+            payload_digest: [0; 16],
+            payload: Bytes::from_static(b"second actual source batch"),
+        };
+        queue
+            .append_from_peer(second_batch, source)
+            .expect("actual second receiver write");
+        assert!(!settled.is_current_for(&owner, partition));
+        assert!(
+            owner
+                .observe_query_lineage(partition)
+                .expect("source RPC")
+                .is_some()
+        );
+        assert_eq!(
+            follower
+                .fetch(fetch_request(0))
+                .expect("both actual WAL batches")
+                .len(),
+            2
         );
         // The fixed context verifies plumbing only; it is not a TLS identity,
         // current remote lease or distributed ownership qualification.
@@ -6322,5 +6396,441 @@ mod tests {
                 target
             );
         }
+    }
+
+    fn lineage_partition() -> TopicPartition {
+        TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0))
+    }
+
+    fn lineage_topic(engine: &StreamEngine) {
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(1),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("actual topic");
+    }
+
+    fn lineage_capture(owner: &crate::EngineHandle) -> crate::EngineQueryLineage {
+        owner
+            .observe_query_lineage(lineage_partition())
+            .expect("actual source RPC")
+            .expect("actual settled source")
+    }
+
+    fn lineage_real_replica(leader: &StreamEngine, payload: &'static [u8]) -> ReplicaAppend {
+        let mut request = append_request(1, payload, None);
+        request.leader_epoch = Some(7);
+        let receipt = leader
+            .append(request)
+            .expect("actual leader WAL reservation");
+        let fetched = leader
+            .fetch(fetch_request(receipt.first_offset.get()))
+            .expect("real checksummed leader batch");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].payload, payload);
+        ReplicaAppend {
+            reservation: Reservation {
+                topic_id: TopicId::new(1),
+                partition_id: LogicalPartitionId::new(0),
+                batch_id: receipt.batch_id,
+                first_offset: receipt.first_offset,
+                last_offset: receipt.last_offset,
+                record_count: fetched[0].record_count,
+                placement: fetched[0].placement,
+            },
+            producer: None,
+            atomic_group: None,
+            extension_context: None,
+            payload_digest: [0; 16],
+            payload: fetched[0].payload.clone(),
+        }
+    }
+
+    #[test]
+    fn query_lineage_retains_exact_owner_and_partition_without_replacement() {
+        let temp = TempDir::new("query-lineage-owner");
+        let engine = Arc::new(StreamEngine::open(config(&temp.0)).expect("actual engine"));
+        lineage_topic(&engine);
+        let owner = crate::EngineHandle::from(engine.clone());
+        let weak = owner.downgrade();
+        let observation = lineage_capture(&owner);
+        assert!(observation.is_current_for(&owner, lineage_partition()));
+        assert!(!observation.is_current_for(
+            &owner,
+            TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(1))
+        ));
+        let other_temp = TempDir::new("query-lineage-foreign-owner");
+        let other = Arc::new(StreamEngine::open(config(&other_temp.0)).expect("other real engine"));
+        lineage_topic(&other);
+        assert!(
+            !observation.is_current_for(&crate::EngineHandle::from(other), lineage_partition())
+        );
+        lineage_topic(&engine); // The real idempotent Create cannot reset a source.
+        assert!(observation.is_current_for(&owner, lineage_partition()));
+        drop(owner);
+        drop(engine);
+        assert!(
+            weak.upgrade().is_some(),
+            "original owner remains through observation"
+        );
+        drop(observation);
+        assert!(
+            weak.upgrade().is_none(),
+            "no engine/source/observation owner cycle"
+        );
+    }
+
+    #[test]
+    fn query_lineage_actual_ring_policy_and_pure_refusals_keep_old_revision_stale() {
+        let temp = TempDir::new("query-lineage-control");
+        let engine = Arc::new(StreamEngine::open(config(&temp.0)).expect("actual engine"));
+        lineage_topic(&engine);
+        let owner = crate::EngineHandle::from(engine.clone());
+        let original = lineage_capture(&owner);
+        assert!(
+            engine
+                .reconfigure_partition(
+                    lineage_partition(),
+                    RingEpoch::new(1),
+                    vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)]
+                )
+                .is_err()
+        );
+        assert!(original.is_current_for(&owner, lineage_partition()));
+        engine
+            .reconfigure_partition(
+                lineage_partition(),
+                RingEpoch::new(2),
+                vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+            )
+            .expect("actual ring effect");
+        assert!(!original.is_current_for(&owner, lineage_partition()));
+        let after_ring = lineage_capture(&owner);
+        engine
+            .update_topic_replication_policy(
+                TopicId::new(1),
+                1,
+                PartitionReplicationPolicy {
+                    policy_generation: 2,
+                    replication_factor: 1,
+                    min_in_sync_replicas: 1,
+                },
+            )
+            .expect("actual same-data policy change");
+        assert!(!after_ring.is_current_for(&owner, lineage_partition()));
+        let after_policy = lineage_capture(&owner);
+        engine
+            .update_topic_replication_policy(
+                TopicId::new(1),
+                1,
+                PartitionReplicationPolicy {
+                    policy_generation: 2,
+                    replication_factor: 1,
+                    min_in_sync_replicas: 1,
+                },
+            )
+            .expect("actual replay-safe equal policy");
+        assert!(after_policy.is_current_for(&owner, lineage_partition()));
+        assert!(!original.is_current_for(&owner, lineage_partition()));
+    }
+
+    #[test]
+    fn query_lineage_same_epoch_indexed_append_atomic_sync_and_replay_remain_valid() {
+        let temp = TempDir::new("query-lineage-ordinary-progress");
+        let control = Arc::new(RecordingSinkControl::default());
+        let engine = Arc::new(
+            StreamEngine::open_with_durable_sink(
+                config(&temp.0),
+                recording_sink_config(&control, DurableSinkOptions::default()),
+            )
+            .expect("actual installed sink and WAL"),
+        );
+        lineage_topic(&engine);
+        let owner = crate::EngineHandle::from(engine.clone());
+        let observed = lineage_capture(&owner);
+        engine
+            .append(append_request(1, b"actual indexed input", None))
+            .expect("actual append");
+        wait_for_test(|| {
+            engine
+                .durable_sink_checkpoint(lineage_partition())
+                .expect("checkpoint")
+                .is_some_and(|cp| cp.next_offset == LogicalOffset::new(1))
+        });
+        engine
+            .append(atomic_request(2, 700, 0, b"committed group"))
+            .expect("real staged group");
+        engine
+            .commit_atomic_group(lineage_partition(), 700)
+            .expect("actual commit marker");
+        engine
+            .append(atomic_request(3, 701, 0, b"aborted group"))
+            .expect("real staged abort");
+        engine
+            .abort_atomic_group(lineage_partition(), 701)
+            .expect("actual abort marker");
+        wait_for_test(|| engine.durable_sink_stats().pending_items == 0);
+        engine.sync().expect("actual physical sync");
+        engine
+            .resume_durable_sink(&[lineage_partition()])
+            .expect("same installed sink replay");
+        engine
+            .resume_recovered_replication(&[lineage_partition()])
+            .expect("actual no-transport branch supplies no authority");
+        let rows = engine.fetch(fetch_request(0)).expect("actual visible WAL");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].payload, b"actual indexed input".as_slice());
+        assert!(
+            control
+                .state
+                .lock()
+                .expect("actual sink state")
+                .appends
+                .iter()
+                .any(|append| append.payload == b"actual indexed input".as_slice())
+        );
+        assert!(observed.is_current_for(&owner, lineage_partition()));
+    }
+
+    #[test]
+    fn query_lineage_actual_admitted_epoch_change_invalidates_but_next_same_epoch_does_not() {
+        let temp = TempDir::new("query-lineage-admitted-epoch");
+        let fence = Arc::new(FixtureEpochFence(AtomicU64::new(7)));
+        let engine = Arc::new(
+            StreamEngine::open_with_fence(config(&temp.0), fence.clone())
+                .expect("actual fenced engine"),
+        );
+        lineage_topic(&engine);
+        let owner = crate::EngineHandle::from(engine.clone());
+        let original = lineage_capture(&owner);
+        let mut first = append_request(1, b"first epoch", None);
+        first.leader_epoch = Some(7);
+        engine.append(first).expect("actual first admitted epoch");
+        assert!(!original.is_current_for(&owner, lineage_partition()));
+        let stable = lineage_capture(&owner);
+        let mut second = append_request(2, b"same epoch", None);
+        second.leader_epoch = Some(7);
+        engine
+            .append(second)
+            .expect("normal actual same-epoch progress");
+        assert!(stable.is_current_for(&owner, lineage_partition()));
+        fence.0.store(8, Ordering::Release);
+        let mut third = append_request(3, b"next epoch", None);
+        third.leader_epoch = Some(8);
+        engine.append(third).expect("actual later admitted epoch");
+        assert!(!stable.is_current_for(&owner, lineage_partition()));
+        assert!(!original.is_current_for(&owner, lineage_partition()));
+        assert_eq!(
+            engine
+                .fetch(fetch_request(0))
+                .expect("all actual bytes")
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn query_lineage_legacy_reservation_cancel_revive_and_physical_completion_keep_activity() {
+        let temp = TempDir::new("query-lineage-legacy-owner");
+        let leader = StreamEngine::open_with_fence(
+            config(&temp.0.join("leader")),
+            Arc::new(ExactEpochFence),
+        )
+        .expect("actual leader");
+        lineage_topic(&leader);
+        let batch = lineage_real_replica(&leader, b"real source payload");
+        let follower = Arc::new(
+            StreamEngine::open(config(&temp.0.join("follower"))).expect("actual follower"),
+        );
+        lineage_topic(&follower);
+        let owner = crate::EngineHandle::from(follower.clone());
+        let original = lineage_capture(&owner);
+        let plan = follower
+            .plan_replica_append(&batch)
+            .expect("real reservation");
+        assert!(!original.is_current_for(&owner, lineage_partition()));
+        assert!(
+            owner
+                .observe_query_lineage(lineage_partition())
+                .expect("active source RPC")
+                .is_none()
+        );
+        // Actual still-unentered work is cancelled by the existing producer.
+        follower
+            .cancel_replica_append(&batch)
+            .expect("known unentered cancellation");
+        drop(plan);
+        let cancelled = lineage_capture(&owner);
+        let retry = follower
+            .plan_replica_append(&batch)
+            .expect("actual aborted-batch revival");
+        assert!(!cancelled.is_current_for(&owner, lineage_partition()));
+        assert!(
+            owner
+                .observe_query_lineage(lineage_partition())
+                .expect("source RPC")
+                .is_none()
+        );
+        follower
+            .execute_replica_append(batch.clone(), retry)
+            .expect("actual physical receiver WAL");
+        let settled = lineage_capture(&owner);
+        let duplicate = follower
+            .plan_replica_append(&batch)
+            .expect("actual immutable duplicate");
+        follower
+            .execute_replica_append(batch, duplicate)
+            .expect("duplicate receipt");
+        assert!(settled.is_current_for(&owner, lineage_partition()));
+        assert!(!original.is_current_for(&owner, lineage_partition()));
+        let rows = follower.fetch(fetch_request(0)).expect("real retained WAL");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].payload, b"real source payload".as_slice());
+    }
+
+    #[test]
+    fn query_lineage_epoch_effect_before_failed_legacy_reservation_cannot_be_renewed() {
+        let temp = TempDir::new("query-lineage-partial-epoch");
+        let leader = StreamEngine::open_with_fence(
+            config(&temp.0.join("leader")),
+            Arc::new(ExactEpochFence),
+        )
+        .expect("actual leader");
+        lineage_topic(&leader);
+        let mut batch = lineage_real_replica(&leader, b"actual leader bytes");
+        // A negative input changes only the actual coordinates being refused.
+        batch.reservation.first_offset = LogicalOffset::new(9);
+        batch.reservation.last_offset = LogicalOffset::new(9);
+        let follower = Arc::new(
+            StreamEngine::open(config(&temp.0.join("follower"))).expect("actual follower"),
+        );
+        lineage_topic(&follower);
+        let owner = crate::EngineHandle::from(follower.clone());
+        let original = lineage_capture(&owner);
+        assert!(matches!(
+            follower.plan_replica_append(&batch),
+            Err(EngineError::Fenced(_))
+        ));
+        assert_eq!(
+            follower
+                .partition_epochs(lineage_partition())
+                .expect("real epoch")
+                .leader_epoch,
+            LeaderEpoch::new(7)
+        );
+        assert!(!original.is_current_for(&owner, lineage_partition()));
+        assert!(
+            owner
+                .observe_query_lineage(lineage_partition())
+                .expect("source RPC")
+                .is_none()
+        );
+        assert!(
+            follower
+                .fetch(fetch_request(0))
+                .expect("no receiver WAL entered")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn query_lineage_retained_floor_change_invalidates_but_exact_noop_does_not() {
+        let temp = TempDir::new("query-lineage-retention");
+        let engine = Arc::new(StreamEngine::open(config(&temp.0)).expect("actual engine"));
+        lineage_topic(&engine);
+        engine
+            .append(append_request(1, b"actual retained WAL", None))
+            .expect("actual append");
+        let owner = crate::EngineHandle::from(engine.clone());
+        let observed = lineage_capture(&owner);
+        engine
+            .truncate_partition(lineage_partition(), LogicalOffset::new(0))
+            .expect("exact noop");
+        assert!(observed.is_current_for(&owner, lineage_partition()));
+        engine
+            .truncate_partition(lineage_partition(), LogicalOffset::new(1))
+            .expect("real retained-floor journal and GC");
+        assert!(!observed.is_current_for(&owner, lineage_partition()));
+        assert!(matches!(
+            engine.fetch(fetch_request(0)),
+            Err(EngineError::OffsetOutOfRange { requested, log_start })
+                if requested == LogicalOffset::new(0) && log_start == LogicalOffset::new(1)
+        ));
+        assert!(
+            engine
+                .fetch(fetch_request(1))
+                .expect("fetch at the actual retained floor")
+                .is_empty()
+        );
+        assert!(
+            owner
+                .observe_query_lineage(lineage_partition())
+                .expect("settled source")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn query_lineage_post_result_check_rejects_real_inflight_source_change() {
+        let temp = TempDir::new("query-lineage-materialized-result");
+        let engine = Arc::new(StreamEngine::open(config(&temp.0)).expect("actual engine"));
+        lineage_topic(&engine);
+        engine
+            .append(append_request(
+                1,
+                b"real result retained before recheck",
+                None,
+            ))
+            .expect("actual WAL");
+        let owner = crate::EngineHandle::from(engine.clone());
+        let observed = lineage_capture(&owner);
+        let (entered, ready) = sync_channel(1);
+        let (release, released) = sync_channel(1);
+        std::thread::scope(|scope| {
+            let observed_ref = &observed;
+            let owner_ref = &owner;
+            let engine_ref = &engine;
+            let worker = scope.spawn(move || {
+                assert!(observed_ref.is_current_for(owner_ref, lineage_partition()));
+                let actual_result = engine_ref
+                    .fetch(fetch_request(0))
+                    .expect("real nonempty result");
+                entered
+                    .send(())
+                    .expect("actual materialized result retained");
+                released
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("finite publication barrier");
+                (
+                    actual_result,
+                    observed_ref.is_current_for(owner_ref, lineage_partition()),
+                )
+            });
+            ready
+                .recv_timeout(Duration::from_secs(5))
+                .expect("genuine result reached barrier");
+            engine
+                .reconfigure_partition(
+                    lineage_partition(),
+                    RingEpoch::new(2),
+                    vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+                )
+                .expect("actual control effect");
+            release.send(()).expect("release actual result holder");
+            let (actual, current) = worker.join().expect("physical fetch owner settled");
+            assert_eq!(actual.len(), 1);
+            assert_eq!(
+                actual[0].payload,
+                b"real result retained before recheck".as_slice()
+            );
+            assert!(
+                !current,
+                "a precheck cannot authorize a later completed result"
+            );
+        });
+        // Engine-only primitive regression: this does not execute SDK/private
+        // native HTTP/status/Describe publication or claim those integrations.
     }
 }

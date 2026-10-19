@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 
@@ -62,6 +63,8 @@ struct BatchRuntime {
     payload_digest: Option<[u8; 16]>,
     payload_bytes: u64,
     object_durable: bool,
+    // Active unit owned by this real reservation through physical settlement.
+    query_lineage_active: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +151,7 @@ pub(crate) enum VisibilityMode {
 
 #[derive(Debug)]
 pub(crate) struct PartitionState {
+    query_lineage: Arc<crate::query_lineage::Source>,
     sequencer: TopicSequencer,
     log_start: LogicalOffset,
     batches: DenseOrderedMap<BatchRuntime>,
@@ -169,6 +173,7 @@ pub(crate) struct PartitionState {
 impl PartitionState {
     fn empty(sequencer: TopicSequencer, replication_policy: PartitionReplicationPolicy) -> Self {
         Self {
+            query_lineage: Arc::new(crate::query_lineage::Source::default()),
             sequencer,
             log_start: LogicalOffset::new(0),
             batches: DenseOrderedMap::new(0),
@@ -518,6 +523,10 @@ impl Drop for ControlJournal {
 }
 
 enum CoordinatorCommand {
+    QueryLineageSource {
+        topic_partition: TopicPartition,
+        response: SyncSender<EngineResult<Arc<crate::query_lineage::Source>>>,
+    },
     BoundedFetch(bounded_fetch::Command),
     BoundedResume(bounded_resume::Command),
     Create {
@@ -568,7 +577,7 @@ enum CoordinatorCommand {
     ObserveLeaderEpoch {
         topic_partition: TopicPartition,
         leader_epoch: LeaderEpoch,
-        response: SyncSender<EngineResult<()>>,
+        response: SyncSender<EngineResult<Option<crate::query_lineage::Mutation>>>,
     },
     Complete {
         topic_partition: TopicPartition,
@@ -989,11 +998,26 @@ impl CoordinatorPool {
         receive(receiver)
     }
 
-    pub(crate) fn observe_leader_epoch(
+    pub(crate) fn query_lineage_source(
+        &self,
+        topic_partition: TopicPartition,
+    ) -> EngineResult<Arc<crate::query_lineage::Source>> {
+        let (response, receiver) = sync_channel(1);
+        self.send(
+            topic_partition,
+            CoordinatorCommand::QueryLineageSource {
+                topic_partition,
+                response,
+            },
+        )?;
+        receive(receiver)
+    }
+
+    pub(crate) fn observe_replica_leader_epoch(
         &self,
         topic_partition: TopicPartition,
         leader_epoch: LeaderEpoch,
-    ) -> EngineResult<()> {
+    ) -> EngineResult<Option<crate::query_lineage::Mutation>> {
         let (response, receiver) = sync_channel(1);
         self.send(
             topic_partition,
@@ -1363,6 +1387,14 @@ fn run_coordinator(
 ) {
     while let Ok(command) = receiver.recv() {
         match command {
+            CoordinatorCommand::QueryLineageSource {
+                topic_partition,
+                response,
+            } => {
+                let actual = state(&states, topic_partition)
+                    .map(|partition| Arc::clone(&partition.query_lineage));
+                let _ = response.send(actual);
+            }
             CoordinatorCommand::BoundedFetch(command) => bounded_fetch::execute(&states, command),
             CoordinatorCommand::BoundedResume(command) => bounded_resume::execute(&states, command),
             CoordinatorCommand::Create {
@@ -1482,8 +1514,10 @@ fn run_coordinator(
                 response,
             } => {
                 let result = state_mut(&mut states, topic_partition).and_then(|state| {
+                    let activity = (leader_epoch > state.sequencer.leader_epoch())
+                        .then(|| state.query_lineage.begin());
                     state.sequencer.observe_leader_epoch(leader_epoch)?;
-                    Ok(())
+                    Ok(activity)
                 });
                 let _ = response.send(result);
             }
@@ -1632,12 +1666,14 @@ fn run_coordinator(
                 let result = state_mut(&mut states, topic_partition).and_then(|state| {
                     let mut candidate = TopicSequencer::restore(state.sequencer.state())?;
                     candidate.reconfigure(ring_epoch, shards.clone())?;
+                    let activity = state.query_lineage.begin();
                     journal.append(JournalEvent::Configure {
                         topic_partition,
                         ring_epoch,
                         shards,
                     })?;
                     state.sequencer = candidate;
+                    activity.settle();
                     Ok(())
                 });
                 let _ = response.send(result);
@@ -1790,6 +1826,7 @@ fn complete(
             },
         );
     }
+    finish_query_lineage_batch(state, completion.reservation);
     Ok(completion.response)
 }
 
@@ -1919,6 +1956,8 @@ fn reserve_replica(
     payload_bytes: u64,
     payload_digest: [u8; 16],
 ) -> EngineResult<ReserveOutcome> {
+    let source = Arc::clone(&state.query_lineage);
+    let lineage_activity;
     if let Some(existing) = state.batches.get_mut(reservation.batch_id.get()) {
         let identity_matches = existing.reservation == reservation
             && existing.producer == producer
@@ -1946,6 +1985,8 @@ fn reserve_replica(
                 return Err(EngineError::ReplicaInFlight(reservation.batch_id));
             }
             BatchStatus::Aborted => {
+                lineage_activity = Some(source.begin());
+                existing.query_lineage_active = true;
                 existing.status = BatchStatus::Pending;
                 existing.producer = producer;
                 existing.atomic_group = atomic_group;
@@ -1963,6 +2004,9 @@ fn reserve_replica(
             register_atomic_chunk(state, group, reservation, payload_bytes)?;
         }
         state.reset_cached_watermarks_after_truncate();
+        if let Some(activity) = lineage_activity {
+            activity.transfer_to_batch();
+        }
         return Ok(ReserveOutcome::Reserved {
             reservation,
             producer: producer.map(|identity| ProducerSequence {
@@ -1993,6 +2037,7 @@ fn reserve_replica(
         )));
     }
     let previous = state.sequencer.state();
+    let activity = source.begin();
     let expected = state.sequencer.reserve(reservation.record_count)?;
     if expected != reservation {
         state.sequencer =
@@ -2020,12 +2065,14 @@ fn reserve_replica(
             atomic_group,
             payload_digest: Some(payload_digest),
             payload_bytes,
+            query_lineage_active: true,
             object_durable: false,
         },
     )?;
     if let Some(group) = atomic_group {
         register_atomic_chunk(state, group, reservation, payload_bytes)?;
     }
+    activity.transfer_to_batch();
     Ok(ReserveOutcome::Reserved {
         reservation,
         producer: producer.map(|identity| ProducerSequence {
@@ -2089,8 +2136,25 @@ fn fail(
     if definitely_not_written {
         mark_batch(state, reservation, BatchStatus::Aborted, 0)?;
         rollback_atomic_chunk(state, reservation)?;
+        finish_query_lineage_batch(state, reservation);
+    } else if state
+        .batches
+        .get(reservation.batch_id.get())
+        .is_some_and(|batch| batch.query_lineage_active)
+    {
+        // The actual worker did not prove no-write. No rollback/renewal fact.
+        state.query_lineage.deny();
     }
     Ok(())
+}
+
+fn finish_query_lineage_batch(state: &mut PartitionState, reservation: Reservation) {
+    if let Some(batch) = state.batches.get_mut(reservation.batch_id.get())
+        && batch.query_lineage_active
+    {
+        batch.query_lineage_active = false;
+        state.query_lineage.finish();
+    }
 }
 
 fn rollback_atomic_chunk(state: &mut PartitionState, reservation: Reservation) -> EngineResult<()> {
@@ -2277,6 +2341,7 @@ fn update_replication_policy(
                 .map_or(0, |batch| batch.durable_replicas),
         });
     }
+    let activity = state.query_lineage.begin();
     journal.append(JournalEvent::UpdateReplicationPolicy {
         topic_partition,
         expected_policy_generation,
@@ -2286,6 +2351,7 @@ fn update_replication_policy(
     })?;
     state.replication_policy = replication_policy;
     state.reset_cached_watermarks_after_truncate();
+    activity.settle();
     Ok(())
 }
 
@@ -2349,6 +2415,7 @@ fn truncate(
             "retention cannot discard an unresolved sequencer tail".into(),
         ));
     }
+    let activity = state.query_lineage.begin();
     journal.append(JournalEvent::TruncateCheckpoint {
         topic_partition,
         log_start,
@@ -2365,6 +2432,7 @@ fn truncate(
             .is_some_and(|batch_id| *batch_id >= first_retained)
     });
     state.reset_cached_watermarks_after_truncate();
+    activity.settle();
     Ok(state.watermarks())
 }
 
@@ -2644,7 +2712,8 @@ pub(crate) fn recovery_coordinator_bytes(
             + size_of::<ExtentCatalogEntry>() * 4,
     )?;
     let maps = partitions.checked_mul(
-        size_of::<PartitionState>() * 4
+        crate::query_lineage::allocation_bytes()
+            + size_of::<PartitionState>() * 4
             + size_of::<TopicSequencer>() * 2
             + size_of::<HashMap<TopicPartition, PartitionState>>() * 8
             + 1024,
@@ -3055,6 +3124,7 @@ fn recover_partition_states_inner(
                         .map(|producer| producer.payload_digest)
                         .or_else(|| entry.atomic_group.map(|group| group.payload_digest)),
                     payload_bytes: entry.payload_bytes,
+                    query_lineage_active: false,
                     object_durable: entry.object_durable,
                 },
             )?;
@@ -3251,6 +3321,7 @@ fn append_recovered_aborts(
                 atomic_group: None,
                 payload_digest: None,
                 payload_bytes: 0,
+                query_lineage_active: false,
                 object_durable: false,
             },
         )?;
@@ -3335,6 +3406,7 @@ fn append_recovered_aborts_until(
                 atomic_group: None,
                 payload_digest: None,
                 payload_bytes: 0,
+                query_lineage_active: false,
                 object_durable: false,
             },
         )?;

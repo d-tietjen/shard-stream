@@ -7,6 +7,7 @@ mod durable_sink;
 mod engine;
 mod engine_handle;
 mod error;
+mod query_lineage;
 #[cfg(unix)]
 mod recovery_archived;
 #[cfg(unix)]
@@ -49,6 +50,7 @@ pub use engine::{
 };
 pub use engine_handle::{EngineHandle, WeakEngineHandle};
 pub use error::{EngineError, EngineResult};
+pub use query_lineage::EngineQueryLineage;
 pub use shard_stream_protocol::ReplicaAppend;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use worker::{NativeGcOutcome, NativeResumeGcPolicy};

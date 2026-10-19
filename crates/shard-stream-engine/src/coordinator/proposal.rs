@@ -274,6 +274,23 @@ pub(super) fn commit(
     prepared: PreparedAppend,
     control: Option<&CommitControl>,
 ) -> EngineResult<ReserveOutcome> {
+    commit_source(state, prepared, control, false)
+}
+
+pub(super) fn commit_replica(
+    state: &mut PartitionState,
+    prepared: PreparedAppend,
+    control: &CommitControl,
+) -> EngineResult<ReserveOutcome> {
+    commit_source(state, prepared, Some(control), true)
+}
+
+fn commit_source(
+    state: &mut PartitionState,
+    prepared: PreparedAppend,
+    control: Option<&CommitControl>,
+    replica_source: bool,
+) -> EngineResult<ReserveOutcome> {
     // A concurrent completion can turn this exact input into an existing receipt.
     // No proposal epoch or coordinates may replace its historical placement.
     if let Some(outcome) = duplicate(state, prepared.intent)? {
@@ -298,6 +315,8 @@ pub(super) fn commit(
     if let Some(control) = control {
         control.begin_commit()?;
     }
+    let activity = (replica_source || prepared.proposal.changes_leader_epoch())
+        .then(|| state.query_lineage.begin());
     let reservation = state.sequencer.commit_reservation(prepared.proposal)?;
     // Every logical failure below was checked against this same serialized
     // state before commit; no producer/group updates happen on a refusal.
@@ -315,6 +334,7 @@ pub(super) fn commit(
                 payload_digest: Some(prepared.intent.payload_digest),
                 payload_bytes: prepared.intent.payload_bytes,
                 object_durable: false,
+                query_lineage_active: activity.is_some(),
             },
         )
         .expect("dense insertion was validated before reservation commit");
@@ -336,6 +356,9 @@ pub(super) fn commit(
         group.next_sequence = after.next_sequence;
         group.payload_bytes = after.payload_bytes;
         group.record_count = after.record_count;
+    }
+    if let Some(activity) = activity {
+        activity.transfer_to_batch();
     }
     Ok(ReserveOutcome::Reserved {
         reservation,
@@ -421,6 +444,10 @@ mod tests {
     #[test]
     fn cancelled_pending_commit_cannot_allocate_after_its_response_deadline() {
         let (mut state, prepared) = prepared_fixture();
+        let original_source = state
+            .query_lineage
+            .capture()
+            .expect("settled before prepare");
         let control = CommitControl::default();
         let (sender, receiver) = sync_channel(1);
         assert!(matches!(
@@ -436,6 +463,7 @@ mod tests {
         assert!(state.producers.is_empty());
         assert!(state.atomic_groups.is_empty());
         assert_eq!(state.batches.len(), 0);
+        assert_eq!(state.query_lineage.capture(), Some(original_source));
         drop(sender);
     }
 
@@ -454,6 +482,10 @@ mod tests {
             CommitOutcome::Unknown(EngineError::CorruptState(_))
         ));
         assert!(!control.cancel());
+        assert!(
+            state.query_lineage.capture().is_none(),
+            "entered allocation stays active"
+        );
         assert_eq!(state.sequencer.next_offset(), LogicalOffset::new(1));
         assert_eq!(state.producers[&22].next_sequence, 1);
         assert_eq!(state.atomic_groups[&33].batch_ids.len(), 1);
@@ -639,6 +671,10 @@ mod tests {
             ProposedAppendOutcome::Unknown(EngineError::CorruptState(_))
         ));
         assert_eq!(admission.0.load(Ordering::Acquire), 0);
+        assert!(
+            state.query_lineage.capture().is_none(),
+            "physical reply loss cannot qualify capture"
+        );
         assert_eq!(state.sequencer.next_offset(), LogicalOffset::new(1));
         assert_eq!(
             state.batches.get(0).expect("no fabricated abort").status,

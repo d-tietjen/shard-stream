@@ -126,7 +126,9 @@ pub(super) fn commit(
     // It also permits an exact concurrent completion to return its immutable ACK.
     match prepare(state, prepared.intent())? {
         PrepareReplicaOutcome::Duplicate(outcome) => Ok(outcome),
-        PrepareReplicaOutcome::New(_) => proposal::commit(state, prepared.prepared, Some(control)),
+        PrepareReplicaOutcome::New(_) => {
+            proposal::commit_replica(state, prepared.prepared, control)
+        }
     }
 }
 

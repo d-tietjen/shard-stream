@@ -133,6 +133,13 @@ impl ReservationProposal {
         self.reservation.placement
     }
 
+    /// Whether this exact proposal advances the actual saved leader epoch.
+    /// This is a source fact only, without reservation or write permission.
+    #[must_use]
+    pub const fn changes_leader_epoch(&self) -> bool {
+        self.previous_leader_epoch.get() != self.reservation.placement.leader_epoch.get()
+    }
+
     /// Tests exact coordinates after a successful sequencer commit.
     #[must_use]
     pub fn matches_reservation(&self, reservation: &Reservation) -> bool {
@@ -308,6 +315,12 @@ impl TopicSequencer {
     #[must_use]
     pub const fn next_offset(&self) -> LogicalOffset {
         LogicalOffset::new(self.next_offset)
+    }
+
+    /// Borrows the actual epoch without cloning the sequencer's ring vector.
+    #[must_use]
+    pub const fn leader_epoch(&self) -> LeaderEpoch {
+        self.leader_epoch
     }
 
     #[must_use]
