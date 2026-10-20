@@ -1,5 +1,6 @@
 //! Bounded native retention GC on the actual pinned directory descriptor.
 
+use super::store_open::{TrackedGcSources, TrackedGcStage};
 use super::*;
 use rustix::fs::{CWD, RenameFlags, fsync, renameat_with, unlinkat};
 use std::collections::TryReserveError;
@@ -312,6 +313,20 @@ impl fmt::Debug for PinnedShardGcReport {
     }
 }
 impl PinnedShardGcReport {
+    // Safe private relay of actual raw unit outcomes; borrowed native Pack
+    // wrappers do not escape into the public canonical observation.
+    pub(crate) fn physical_results(&self) -> impl Iterator<Item = &io::Result<()>> {
+        self.scope.packs.iter().flat_map(|p| {
+            [
+                p.rename.as_ref(),
+                p.sync_rename.as_ref(),
+                p.unlink.as_ref(),
+                p.sync_unlink.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+        })
+    }
     /// Actual native directory name prepared before the final entry check.
     pub fn directory_name(&self) -> Option<&CStr> {
         self.scope.directory_name.as_deref()
@@ -1307,6 +1322,61 @@ impl Scope {
         limits: PinnedShardGcLimits,
         checks: &dyn PinnedShardGcChecks,
     ) -> Result<(), PinnedShardGcFailure> {
+        self.collect_with_tracked(store, pin, limits, checks, None)
+    }
+    fn tracked_identity(
+        &mut self,
+        index: usize,
+        stage: TrackedGcStage,
+        pin: &PinnedShardDirectory,
+        limits: PinnedShardGcLimits,
+        checks: &dyn PinnedShardGcChecks,
+        sources: &mut TrackedGcSources<'_>,
+    ) -> Result<(), PinnedShardGcFailure> {
+        sources.notify(stage);
+        self.check(checks)?;
+        // Each of these six extra per-pack attempts is independently reserved,
+        // entered and saved in the caller's outside-catch strict trace.
+        self.reserve_calls(2, limits, checks)?;
+        sources.prepare_held(index, checks)?;
+        self.enter(PinnedShardGcPhase::PackMetadata, Some(index))?;
+        sources.held(index, stage)?;
+        self.after(PinnedShardGcPhase::PackMetadata, checks)?;
+        self.enter(PinnedShardGcPhase::PackMetadata, Some(index))?;
+        let pack = &self.packs[index];
+        let name = match stage {
+            TrackedGcStage::BeforeEpoch => pack.native_name.as_deref(),
+            TrackedGcStage::BeforeIndex | TrackedGcStage::BeforeUnlink => {
+                pack.native_pending.as_deref()
+            }
+        }
+        .ok_or(PinnedShardGcFailure::Invariant)?;
+        sources.named(index, stage, pin, name);
+        self.after(PinnedShardGcPhase::PackMetadata, checks)?;
+        sources.compare(index, stage)
+    }
+    fn collect_with_tracked(
+        &mut self,
+        store: &mut ShardStore,
+        pin: &PinnedShardDirectory,
+        limits: PinnedShardGcLimits,
+        checks: &dyn PinnedShardGcChecks,
+        mut sources: Option<&mut TrackedGcSources<'_>>,
+    ) -> Result<(), PinnedShardGcFailure> {
+        if let Some(actual) = sources.as_deref_mut() {
+            for index in 0..self.packs.len() {
+                actual.select(index, self.packs[index].sequence, checks)?;
+                self.check(checks)?;
+                self.tracked_identity(
+                    index,
+                    TrackedGcStage::BeforeEpoch,
+                    pin,
+                    limits,
+                    checks,
+                    actual,
+                )?;
+            }
+        }
         if !self.packs.is_empty() {
             self.work(1, limits, checks)?;
             let next = store
@@ -1344,6 +1414,14 @@ impl Scope {
                 Some(Err(_)) => return Err(PinnedShardGcFailure::Io),
                 None => return Err(PinnedShardGcFailure::Invariant),
             };
+            if let Some(actual) = sources.as_deref_mut() {
+                let stat = self.packs[index]
+                    .metadata
+                    .as_ref()
+                    .and_then(|v| v.as_ref().ok())
+                    .ok_or(PinnedShardGcFailure::Io)?;
+                actual.compare_original(index, stat)?;
+            }
             self.reserve_calls(2, limits, checks)?;
             self.enter(PinnedShardGcPhase::Rename, Some(index))?;
             self.packs[index].rename_entered = true;
@@ -1372,7 +1450,27 @@ impl Scope {
             self.packs[index]
                 .sync_rename_outcome
                 .ok_or(PinnedShardGcFailure::Invariant)??;
+            if let Some(actual) = sources.as_deref_mut() {
+                self.tracked_identity(
+                    index,
+                    TrackedGcStage::BeforeIndex,
+                    pin,
+                    limits,
+                    checks,
+                    actual,
+                )?;
+            }
             self.remove_indexes(store, index, limits, checks)?;
+            if let Some(actual) = sources.as_deref_mut() {
+                self.tracked_identity(
+                    index,
+                    TrackedGcStage::BeforeUnlink,
+                    pin,
+                    limits,
+                    checks,
+                    actual,
+                )?;
+            }
             self.reserve_calls(2, limits, checks)?;
             self.enter(PinnedShardGcPhase::Unlink, Some(index))?;
             self.packs[index].unlink_entered = true;
@@ -1415,6 +1513,20 @@ impl Scope {
         limits: PinnedShardGcLimits,
         checks: &dyn PinnedShardGcChecks,
     ) -> Result<(), PinnedShardGcFailure> {
+        self.run_with_tracked(store, pin, starts, limits, checks, None)
+    }
+    fn run_with_tracked(
+        &mut self,
+        store: &mut ShardStore,
+        pin: &PinnedShardDirectory,
+        starts: &HashMap<TopicPartition, LogicalOffset>,
+        limits: PinnedShardGcLimits,
+        checks: &dyn PinnedShardGcChecks,
+        mut sources: Option<&mut TrackedGcSources<'_>>,
+    ) -> Result<(), PinnedShardGcFailure> {
+        if let Some(actual) = sources.as_deref_mut() {
+            actual.validate_store(store, limits)?;
+        }
         self.check(checks)?;
         if limits.max_plan_packs > limits.max_packs
             || limits.max_name_bytes == 0
@@ -1433,8 +1545,44 @@ impl Scope {
             return Err(PinnedShardGcFailure::Capacity);
         }
         self.allocate(limits, checks)?;
+        if let Some(actual) = sources.as_deref_mut() {
+            actual.native_capacities(
+                [
+                    (
+                        self.packs.capacity(),
+                        limits.max_plan_packs,
+                        size_of::<Pack>(),
+                    ),
+                    (
+                        self.batches.capacity(),
+                        limits.max_batch_slots,
+                        size_of::<BatchRemoval>(),
+                    ),
+                    (
+                        self.topics.capacity(),
+                        limits.max_topic_slots,
+                        size_of::<TopicPartition>(),
+                    ),
+                    (
+                        self.locations.capacity(),
+                        limits.max_location_slots,
+                        size_of::<LocationRemoval>(),
+                    ),
+                    (
+                        self.removed_topics.capacity(),
+                        limits.max_topic_slots,
+                        size_of::<TopicRemoval>(),
+                    ),
+                ],
+                checks,
+            )?;
+            self.check(checks)?;
+        }
         self.plan(store, starts, limits, checks)?;
-        self.collect(store, pin, limits, checks)
+        match sources {
+            Some(actual) => self.collect_with_tracked(store, pin, limits, checks, Some(actual)),
+            None => self.collect(store, pin, limits, checks),
+        }
     }
 }
 
@@ -1468,9 +1616,23 @@ impl ShardStore {
         original_expiry: Instant,
         checks: &dyn PinnedShardGcChecks,
     ) -> Result<PinnedShardGcReport, PinnedShardGcError> {
+        self.garbage_collect_with_tracked(pin, log_starts, limits, original_expiry, checks, None)
+    }
+    fn garbage_collect_with_tracked(
+        &mut self,
+        pin: &PinnedShardDirectory,
+        log_starts: &HashMap<TopicPartition, LogicalOffset>,
+        limits: PinnedShardGcLimits,
+        original_expiry: Instant,
+        checks: &dyn PinnedShardGcChecks,
+        sources: Option<&mut TrackedGcSources<'_>>,
+    ) -> Result<PinnedShardGcReport, PinnedShardGcError> {
         let mut scope = Scope::new(original_expiry, self.plan_epoch);
-        let actual = catch_unwind(AssertUnwindSafe(|| {
-            scope.run(self, pin, log_starts, limits, checks)
+        let actual = catch_unwind(AssertUnwindSafe(|| match sources {
+            Some(actual) => {
+                scope.run_with_tracked(self, pin, log_starts, limits, checks, Some(actual))
+            }
+            None => scope.run(self, pin, log_starts, limits, checks),
         }));
         let actual = match actual {
             Ok(result) => result,
@@ -1503,3 +1665,21 @@ impl ShardStore {
 #[cfg(test)]
 #[path = "pinned_gc_tests.rs"]
 mod tests;
+
+// Library-private only: the concrete Sources constructor exists solely on the
+// actual opened-owner split-field path, with no public FD/identity factory.
+#[allow(
+    clippy::result_large_err,
+    reason = "retain actual native collection plans and outcomes without a failure allocation"
+)]
+pub(super) fn collect_tracked(
+    store: &mut ShardStore,
+    pin: &PinnedShardDirectory,
+    starts: &HashMap<TopicPartition, LogicalOffset>,
+    limits: PinnedShardGcLimits,
+    expiry: Instant,
+    checks: &dyn PinnedShardGcChecks,
+    sources: &mut TrackedGcSources<'_>,
+) -> Result<PinnedShardGcReport, PinnedShardGcError> {
+    store.garbage_collect_with_tracked(pin, starts, limits, expiry, checks, Some(sources))
+}

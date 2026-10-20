@@ -43,6 +43,15 @@ pub use shard_directory::{
     OwnedPinnedShardAppendLimits, OwnedPinnedShardAppendObservation, OwnedPinnedShardAppendReport,
     RetainedOwnedPinnedShardAppendError, owned_pinned_shard_append_cost,
 };
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use shard_directory::{
+    OwnedPinnedShardLogMutationComplete, OwnedPinnedShardLogMutationCost,
+    OwnedPinnedShardLogMutationFailure, OwnedPinnedShardLogMutationObservation,
+    RetainedOwnedPinnedShardLogMutationError, owned_pinned_shard_log_gc_cost,
+    owned_pinned_shard_log_write_cost,
+};
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use shard_directory::{
     OwnedPinnedShardGcComplete, OwnedPinnedShardGcCost, OwnedPinnedShardGcFailure,
@@ -61,8 +70,10 @@ pub use shard_directory::{
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use shard_directory::{
     OwnedPinnedShardLog, OwnedPinnedShardLogCost, OwnedPinnedShardLogFailure,
-    OwnedPinnedShardLogObservation, OwnedPinnedShardLogValidation,
-    RetainedOwnedPinnedShardLogError, owned_pinned_shard_log_cost,
+    OwnedPinnedShardLogObservation, OwnedPinnedShardLogValidation, OwnedPinnedShardReadComplete,
+    OwnedPinnedShardReadCost, OwnedPinnedShardReadFailure, OwnedPinnedShardReadObservation,
+    RetainedOwnedPinnedShardLogError, RetainedOwnedPinnedShardReadError,
+    owned_pinned_shard_log_cost, owned_pinned_shard_read_cost,
 };
 
 /// Native file opening modes; none silently truncates an existing file.

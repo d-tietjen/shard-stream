@@ -28,6 +28,23 @@ use std::{
     time::Instant,
 };
 
+#[path = "owned_pinned_shard_read.rs"]
+mod bounded_read;
+pub use bounded_read::{
+    OwnedPinnedShardReadComplete, OwnedPinnedShardReadCost, OwnedPinnedShardReadFailure,
+    OwnedPinnedShardReadObservation, RetainedOwnedPinnedShardReadError,
+    owned_pinned_shard_read_cost,
+};
+
+#[path = "owned_pinned_shard_write.rs"]
+mod bounded_write;
+pub use bounded_write::{
+    OwnedPinnedShardLogMutationComplete, OwnedPinnedShardLogMutationCost,
+    OwnedPinnedShardLogMutationFailure, OwnedPinnedShardLogMutationObservation,
+    RetainedOwnedPinnedShardLogMutationError, owned_pinned_shard_log_gc_cost,
+    owned_pinned_shard_log_write_cost,
+};
+
 type Validation =
     Result<RetainedCheckedDirectoryValidation, RetainedCheckedDirectoryValidationError>;
 type Native = Result<OpenedPinnedShardLog, PinnedShardLogOpenError>;
@@ -382,9 +399,9 @@ impl Scope {
 
 /// Canonical Core log retaining both validations and the actual native result.
 ///
-/// No budget, Session, callback or serving permission is stored. This first
-/// bridge supplies bounded conversion only; bounded log operations need their
-/// own genuine producers. There is no native/store/descriptor extractor.
+/// No budget, Session, callback or serving permission is stored. Consuming read,
+/// append, seal and tracked-compaction entries use their genuine bounded native
+/// producers. There is no native/store/descriptor extractor.
 pub struct OwnedPinnedShardLog {
     scope: Scope,
 }

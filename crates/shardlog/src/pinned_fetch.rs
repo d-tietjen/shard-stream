@@ -165,7 +165,7 @@ pub struct PinnedShardFetchObservation {
     composing_deny_panic: Option<Box<dyn Any + Send>>,
 }
 impl PinnedShardFetchObservation {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             outcomes: Vec::new(),
             ranges: Vec::new(),
@@ -189,6 +189,15 @@ impl PinnedShardFetchObservation {
         let range = self.ranges.get(range)?;
         Some((
             range.bytes.as_deref().unwrap_or(&range.buffer),
+            range.filled,
+        ))
+    }
+    /// Actual retained physical range length and completed prefix length.
+    /// This view never exposes coalesced bytes outside the selected payloads.
+    pub fn partial_buffer_lengths(&self, range: usize) -> Option<(usize, usize)> {
+        let range = self.ranges.get(range)?;
+        Some((
+            range.bytes.as_ref().map_or(range.buffer.len(), Bytes::len),
             range.filled,
         ))
     }
@@ -418,7 +427,7 @@ pub struct PinnedShardFetchCost {
     /// Conservative actual IO ceiling: each call spends at least one entry.
     pub native_call_slots: usize,
 }
-fn fixed_fee() -> Bounded<(usize, usize, usize)> {
+pub(super) fn fixed_fee() -> Bounded<(usize, usize, usize)> {
     let values = [
         size_of::<PinnedShardFetchPlan>(),
         size_of::<PinnedShardFetchPlanError>(),
@@ -579,6 +588,12 @@ impl OpenedPinnedShardStore {
             let (fixed, entries, _) = fixed_fee()?;
             debit(budget, fixed, entries, fixed)?;
             checkpoint(budget, checks)?;
+            if self.store.plan_epoch != self.tracked_epoch
+                || self.store.active.sequence != self.tracked_active_sequence
+                || self.store.active.bytes != self.scope.active_bytes
+            {
+                return Err(PinnedShardFetchFailure::Stale);
+            }
             if max_bytes == 0 || max_batches == 0 || max_batches > budget.limits().max_plan_batches
             {
                 return Err(PinnedShardFetchFailure::Input);
@@ -717,13 +732,19 @@ impl PinnedShardFetchObservation {
                 .ok_or(PinnedShardFetchFailure::Invariant)?,
         )
     }
-    fn validate_pin(
+    pub(super) fn validate_pin(
         &mut self,
         opened: &OpenedPinnedShardStore,
         pin: &PinnedShardDirectory,
         budget: &StorageFetchBudget,
         checks: &dyn PinnedShardFetchChecks,
     ) -> Bounded<()> {
+        if opened.store.plan_epoch != opened.tracked_epoch
+            || opened.store.active.sequence != opened.tracked_active_sequence
+            || opened.store.active.bytes != opened.scope.active_bytes
+        {
+            return Err(PinnedShardFetchFailure::Stale);
+        }
         let path = pin.directory();
         let bytes = path.as_os_str().as_bytes().len();
         if bytes > budget.limits().max_path_bytes
@@ -849,19 +870,50 @@ impl ReadState {
             .find(|p| p.sequence == sequence)
             .copied()
             .ok_or(PinnedShardFetchFailure::Stale)?;
-        if opened.scope.active_slot == Some(pack.slot) {
-            if opened.store.active.sequence != sequence
-                || opened.store.active.bytes != opened.scope.active_bytes
-            {
-                return Err(PinnedShardFetchFailure::Stale);
+        match pack.source {
+            ScannedPackSource::Active => {
+                if opened.store.active.sequence != sequence
+                    || opened.store.active.bytes != opened.scope.active_bytes
+                {
+                    return Err(PinnedShardFetchFailure::Stale);
+                }
+                Ok((&opened.store.active.file, pack))
             }
-            return Ok((&opened.store.active.file, pack));
+            ScannedPackSource::Original if opened.scope.active_slot == Some(pack.slot) => {
+                if opened.store.active.sequence != sequence
+                    || opened.store.active.bytes != opened.scope.active_bytes
+                {
+                    return Err(PinnedShardFetchFailure::Stale);
+                }
+                Ok((&opened.store.active.file, pack))
+            }
+            ScannedPackSource::Original => Ok((
+                opened
+                    .scope
+                    .file(pack.slot)
+                    .map_err(|_| PinnedShardFetchFailure::Stale)?,
+                pack,
+            )),
+            ScannedPackSource::Retired(index) => {
+                debit(
+                    budget,
+                    size_of::<Option<&ActivePack>>(),
+                    1,
+                    size_of::<Option<&ActivePack>>(),
+                )?;
+                checkpoint(budget, checks)?;
+                let retained = opened
+                    .write_catalog
+                    .as_ref()
+                    .and_then(|catalog| catalog.retired.get(index))
+                    .and_then(|entry| entry.pack.as_ref())
+                    .ok_or(PinnedShardFetchFailure::Stale)?;
+                if retained.sequence != sequence {
+                    return Err(PinnedShardFetchFailure::Stale);
+                }
+                Ok((&retained.file, pack))
+            }
         }
-        let file = opened
-            .scope
-            .file(pack.slot)
-            .map_err(|_| PinnedShardFetchFailure::Stale)?;
-        Ok((file, pack))
     }
     fn prepare_range(
         &mut self,

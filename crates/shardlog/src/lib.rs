@@ -22,10 +22,12 @@ mod tier;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use api::{
-    OpenedPinnedShardLog, PinnedShardLogOpenChecks, PinnedShardLogOpenError,
-    PinnedShardLogOpenFailure, PinnedShardLogOpenObservation, PinnedShardLogReadComplete,
-    PinnedShardLogReadError, PinnedShardLogReadFailure, PinnedShardLogReadPhase,
-    pinned_shard_log_open_cost, pinned_shard_log_read_cost,
+    OpenedPinnedShardLog, PinnedShardLogGcChecks, PinnedShardLogGcComplete, PinnedShardLogGcError,
+    PinnedShardLogGcFailure, PinnedShardLogGcObservation, PinnedShardLogOpenChecks,
+    PinnedShardLogOpenError, PinnedShardLogOpenFailure, PinnedShardLogOpenObservation,
+    PinnedShardLogReadComplete, PinnedShardLogReadError, PinnedShardLogReadFailure,
+    PinnedShardLogReadPhase, pinned_shard_log_gc_cost, pinned_shard_log_open_cost,
+    pinned_shard_log_read_cost,
 };
 pub use api::{
     ShardLog, ShardLogAppendReceipt, ShardLogCompactionReceipt, ShardLogConfig, ShardLogRecord,
@@ -130,3 +132,22 @@ pub use fetch_limits::{
     StorageFetchBudget, StorageFetchCost, StorageFetchFailure, StorageFetchLimits,
     StorageFetchPlanError, StorageFetchReadError, StorageFetchUsage, storage_fetch_cost,
 };
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) use extent::WriteTrackingPhase;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) use extent::{
+    TrackedWriteFailure, TrackedWriteLimits, TrackedWriteObservation, tracking_fixed_fee,
+};
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use api::{
+    PinnedShardLogWriteChecks, PinnedShardLogWriteComplete, PinnedShardLogWriteError,
+    PinnedShardLogWriteFailure, PinnedShardLogWriteLimits, PinnedShardLogWriteObservation,
+    pinned_shard_log_write_cost,
+};
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) use extent::{TrackedGcStage, TrackedGcTransferPhase};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) use extent::{TrackedGcTrace, tracking_gc_cost};

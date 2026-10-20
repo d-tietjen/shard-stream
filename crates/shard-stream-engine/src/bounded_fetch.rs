@@ -520,6 +520,33 @@ pub(super) fn stored_with_budget(
     limits: NativeFetchLimits,
     budget: &StorageFetchBudget,
 ) -> Result<VecDeque<StoredBatch>, RetainedNativeFetchError> {
+    stored_with_visibility(owner, request, true, limits, budget)
+}
+
+// Origin progress must use the ordinary Ordered visibility boundary, unlike
+// recovered sink/replication replay, which intentionally includes unresolved.
+pub(super) fn visible_with_budget(
+    owner: &EngineHandle,
+    request: FetchRequest,
+    limits: NativeFetchLimits,
+    budget: &StorageFetchBudget,
+) -> Result<VecDeque<StoredBatch>, RetainedNativeFetchError> {
+    stored_with_visibility(owner, request, false, limits, budget)
+}
+
+pub(super) fn command_slots(shards: usize) -> Result<usize, StorageFetchFailure> {
+    // One snapshot and candidate observation, one plan per lane, and at most
+    // one read per lane. These are prepaid slots, not a claim all jobs entered.
+    sum(2, product(shards, 2)?)
+}
+
+fn stored_with_visibility(
+    owner: &EngineHandle,
+    request: FetchRequest,
+    include_unresolved: bool,
+    limits: NativeFetchLimits,
+    budget: &StorageFetchBudget,
+) -> Result<VecDeque<StoredBatch>, RetainedNativeFetchError> {
     let early = |failure| RetainedNativeFetchError::early(owner, failure);
     budget.check().map_err(|error| early(error.into()))?;
     let bytes = size_of::<Scope>() + size_of::<RetainedNativeFetchError>();
@@ -532,7 +559,14 @@ pub(super) fn stored_with_budget(
     if let Err(error) = budget.check() {
         return Err(scope.fail(error.into()));
     }
-    if let Err(error) = run(owner, request, true, limits, budget, &mut scope) {
+    if let Err(error) = run(
+        owner,
+        request,
+        include_unresolved,
+        limits,
+        budget,
+        &mut scope,
+    ) {
         return Err(scope.fail(error));
     }
     if let Err(error) = budget.check() {

@@ -36,6 +36,8 @@ pub use gc::{
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[path = "pinned_store_open.rs"]
 mod store_open;
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) use store_open::WriteTrackingPhase;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use store_open::{
     OpenedPinnedShardStore, PinnedShardFetchChecks, PinnedShardFetchComplete, PinnedShardFetchCost,
@@ -45,6 +47,10 @@ pub use store_open::{
     PinnedStoreOpenCost, PinnedStoreOpenError, PinnedStoreOpenFailure, PinnedStoreOpenLimits,
     PinnedStoreOpenOutcome, PinnedStoreOpenPhase, PinnedStoreOpenUsage, pinned_shard_fetch_cost,
     pinned_store_open_cost,
+};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) use store_open::{
+    TrackedWriteFailure, TrackedWriteLimits, TrackedWriteObservation, tracking_fixed_fee,
 };
 
 /// Finite source allowances for one real directory/lease identity observation.
@@ -498,3 +504,8 @@ impl PinnedShardDirectory {
 #[cfg(test)]
 #[path = "pinned_directory_tests.rs"]
 mod tests;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) use store_open::{TrackedGcStage, TrackedGcTransferPhase};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) use store_open::{TrackedGcTrace, tracking_gc_cost};

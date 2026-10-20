@@ -30,6 +30,8 @@ mod fetch;
 #[cfg(unix)]
 #[path = "pinned_directory.rs"]
 mod pinned_directory;
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) use pinned_directory::WriteTrackingPhase;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use pinned_directory::{
     OpenedPinnedShardStore, PinnedShardFetchChecks, PinnedShardFetchComplete, PinnedShardFetchCost,
@@ -58,6 +60,10 @@ pub use pinned_directory::{
     PinnedShardGcChecks, PinnedShardGcCost, PinnedShardGcError, PinnedShardGcFailure,
     PinnedShardGcLimits, PinnedShardGcPack, PinnedShardGcPhase, PinnedShardGcReport,
     PinnedShardGcUsage, pinned_shard_gc_cost,
+};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) use pinned_directory::{
+    TrackedWriteFailure, TrackedWriteLimits, TrackedWriteObservation, tracking_fixed_fee,
 };
 #[cfg(unix)]
 #[path = "guard_acquire.rs"]
@@ -2816,3 +2822,8 @@ mod tests {
 #[cfg(test)]
 #[path = "extent_header_tests.rs"]
 mod header_tests;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) use pinned_directory::{TrackedGcStage, TrackedGcTransferPhase};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) use pinned_directory::{TrackedGcTrace, tracking_gc_cost};

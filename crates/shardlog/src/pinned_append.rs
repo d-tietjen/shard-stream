@@ -144,6 +144,10 @@ impl PinnedShardAppendBudget {
     pub fn usage(&self) -> PinnedShardAppendUsage {
         self.usage
     }
+    /// Deny this same cumulative native budget after a composing late/refusal.
+    pub fn deny(&mut self) {
+        self.refused = true;
+    }
     /// Sticky refusal, which no successful subsequent call can clear.
     pub fn is_refused(&self) -> bool {
         self.refused
@@ -285,7 +289,54 @@ struct Scope {
 pub struct PinnedShardAppendReport {
     scope: Scope,
 }
+// Private actual ownership transfer used only by the canonical owner. It is
+// deliberately absent from the public native report API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RetiredTransferFailure {
+    OutOfRange,
+    Occupied,
+    Missing,
+}
+
 impl PinnedShardAppendReport {
+    pub(super) fn transfer_shape(&self) -> Option<(usize, usize)> {
+        Some((
+            self.scope.rotations.len(),
+            self.scope
+                .outcomes
+                .capacity()
+                .checked_add(1)?
+                .checked_mul(size_of::<Outcome>())?,
+        ))
+    }
+    pub(super) fn has_created_file(&self) -> bool {
+        self.scope
+            .outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Created(Some(_), _)))
+    }
+    pub(super) fn transfer_retired_into(
+        &mut self,
+        index: usize,
+        destination: &mut Option<ActivePack>,
+    ) -> Result<(), RetiredTransferFailure> {
+        if destination.is_some() {
+            return Err(RetiredTransferFailure::Occupied);
+        }
+        let rotation = self
+            .scope
+            .rotations
+            .get_mut(index)
+            .ok_or(RetiredTransferFailure::OutOfRange)?;
+        if rotation.retired.is_none() {
+            return Err(RetiredTransferFailure::Missing);
+        }
+        // All destination capacity and move work is paid by the whole owner.
+        // No callback, allocation, fallible step or displaced File drop occurs
+        // between the actual source take and assignment into an empty slot.
+        *destination = rotation.retired.take();
+        Ok(())
+    }
     /// Actual original input values, including payload bytes.
     pub fn inputs(&self) -> &[PinnedShardAppendInput] {
         &self.scope.inputs

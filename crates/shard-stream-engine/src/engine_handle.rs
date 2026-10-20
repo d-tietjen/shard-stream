@@ -56,6 +56,21 @@ impl EngineHandle {
         }
     }
 
+    /// Borrow the original owned-primary resume policy retained by recovery.
+    ///
+    /// The budget and checks are the SAME allocations supplied to the actual
+    /// primary census/open and bootstrap GC. Ordinary engines and recovery via
+    /// the ordinary primary route return `None`; this never substitutes checks
+    /// or creates authority. Cloning this plain policy retains its original
+    /// deadline and cumulative budget, without renewing either.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn recovered_gc_policy(&self) -> Option<&crate::NativeResumeGcPolicy> {
+        match &self.owner {
+            Owner::Ordinary(_) => None,
+            Owner::Recovered(engine) => engine.recovery_gc_policy(),
+        }
+    }
+
     /// Weakly references the SAME underlying allocation, without a new owner.
     pub fn downgrade(&self) -> WeakEngineHandle {
         let owner = match &self.owner {

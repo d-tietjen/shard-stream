@@ -1505,3 +1505,47 @@ fn strict_sink_pending_initial_admission_keeps_nonempty_allocation() {
     drop(error);
     DirectoryOwnership::acquire(&root.0.join("data")).expect("last retained prefix releases root");
 }
+
+#[test]
+fn captured_resume_policy_keeps_original_budget_checks_and_partition_sources() {
+    let root = Temporary::new();
+    let path = root.0.join("captured-policy-transactions");
+    let factory = Factory::new(&path, None, false);
+    let (handle, supplied, checks) =
+        open_owned(&root.0, factory.clone(), DurableSinkRecoveryMode::Blocking);
+    let captured = handle
+        .recovered_gc_policy()
+        .expect("actual owned primary policy");
+    assert!(Arc::ptr_eq(&captured.budget, &supplied.budget));
+    assert!(Arc::ptr_eq(&captured.checks, &supplied.checks));
+    assert_eq!(handle.recovered_partition_sources(), &[partition()]);
+    let original = captured.budget.absolute_expiry();
+    let weak = handle.downgrade();
+    let report = handle
+        .resume_durable_sink_until(
+            handle.recovered_partition_sources(),
+            captured.clone(),
+            limits(),
+            original + Duration::from_secs(30),
+        )
+        .expect("actual captured-policy replay");
+    assert_eq!(supplied.budget.absolute_expiry(), original);
+    assert_eq!(factory.sink.applied.load(Ordering::Relaxed), 3);
+    assert!(
+        physical_records(&path)
+            .iter()
+            .any(|(kind, _, body)| *kind == 1 && body == BODY)
+    );
+    let captured = handle.recovered_gc_policy().expect("same retained policy");
+    PinnedShardGcChecks::deny(captured.checks.as_ref());
+    assert!(checks.denied.load(Ordering::Acquire));
+    assert!(captured.checks.check().is_err());
+    drop(handle);
+    assert!(
+        weak.upgrade().is_none(),
+        "completed reports retain Core outcomes, not the engine allocation"
+    );
+    contended(&root.0);
+    drop(report);
+    DirectoryOwnership::acquire(&root.0.join("data")).expect("settled last source owner");
+}

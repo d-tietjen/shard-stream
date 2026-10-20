@@ -9,13 +9,17 @@ mod durability;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[path = "api_pinned.rs"]
-mod pinned;
+pub(crate) mod pinned;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use pinned::{
-    OpenedPinnedShardLog, PinnedShardLogOpenChecks, PinnedShardLogOpenError,
-    PinnedShardLogOpenFailure, PinnedShardLogOpenObservation, PinnedShardLogReadComplete,
-    PinnedShardLogReadError, PinnedShardLogReadFailure, PinnedShardLogReadPhase,
-    pinned_shard_log_open_cost, pinned_shard_log_read_cost,
+    OpenedPinnedShardLog, PinnedShardLogGcChecks, PinnedShardLogGcComplete, PinnedShardLogGcError,
+    PinnedShardLogGcFailure, PinnedShardLogGcObservation, PinnedShardLogOpenChecks,
+    PinnedShardLogOpenError, PinnedShardLogOpenFailure, PinnedShardLogOpenObservation,
+    PinnedShardLogReadComplete, PinnedShardLogReadError, PinnedShardLogReadFailure,
+    PinnedShardLogReadPhase, PinnedShardLogWriteChecks, PinnedShardLogWriteComplete,
+    PinnedShardLogWriteError, PinnedShardLogWriteFailure, PinnedShardLogWriteLimits,
+    PinnedShardLogWriteObservation, pinned_shard_log_gc_cost, pinned_shard_log_open_cost,
+    pinned_shard_log_read_cost, pinned_shard_log_write_cost,
 };
 
 use crate::{
@@ -139,20 +143,11 @@ impl ShardLog {
         records: &[Bytes],
         durable: bool,
     ) -> ShardLogResult<ShardLogAppendReceipt> {
-        if records.is_empty() {
-            return Err(StorageError::InvalidInput(
-                "ShardLog append group cannot be empty".to_string(),
-            ));
-        }
-        let last_sequence = first_sequence
-            .checked_add(u64::try_from(records.len() - 1).map_err(|_| sequence_overflow())?)
-            .ok_or_else(sequence_overflow)?;
+        let last_sequence = append_group_last_sequence(first_sequence, records)?;
         let mut payload_bytes = 0u64;
         let mut prepared = Vec::with_capacity(records.len());
         for (index, payload) in records.iter().enumerate() {
-            let sequence = first_sequence
-                .checked_add(u64::try_from(index).map_err(|_| sequence_overflow())?)
-                .ok_or_else(sequence_overflow)?;
+            let sequence = append_group_sequence(first_sequence, index)?;
             payload_bytes = payload_bytes
                 .checked_add(u64::try_from(payload.len()).map_err(|_| sequence_overflow())?)
                 .ok_or_else(sequence_overflow)?;
@@ -212,11 +207,7 @@ impl ShardLog {
             topic_partition(),
             LogicalOffset::new(sequence),
         )]))?;
-        Ok(ShardLogCompactionReceipt {
-            packs_removed: stats.packs_removed,
-            records_removed: stats.extents_removed,
-            bytes_removed: stats.bytes_removed,
-        })
+        Ok(compaction_receipt(stats))
     }
 
     /// Returns the current active pack path for operational inspection.
@@ -291,4 +282,33 @@ fn record_from_batch(batch: crate::StoredBatch) -> ShardLogResult<ShardLogRecord
         sequence,
         payload: batch.payload,
     })
+}
+
+// Shared actual canonical append validation/arithmetic. The ordinary call body
+// is recovered exactly by inlining these two helpers (bound in draft proof).
+fn append_group_last_sequence(first_sequence: u64, records: &[Bytes]) -> ShardLogResult<u64> {
+    if records.is_empty() {
+        return Err(StorageError::InvalidInput(
+            "ShardLog append group cannot be empty".to_string(),
+        ));
+    }
+    let last_sequence = first_sequence
+        .checked_add(u64::try_from(records.len() - 1).map_err(|_| sequence_overflow())?)
+        .ok_or_else(sequence_overflow)?;
+    Ok(last_sequence)
+}
+fn append_group_sequence(first_sequence: u64, index: usize) -> ShardLogResult<u64> {
+    first_sequence
+        .checked_add(u64::try_from(index).map_err(|_| sequence_overflow())?)
+        .ok_or_else(sequence_overflow)
+}
+
+// Pure receipt mapping shared with consuming tracked compaction. No native phase
+// or ordinary retention predicate is changed by this scalar factorization.
+fn compaction_receipt(stats: crate::GarbageCollectionStats) -> ShardLogCompactionReceipt {
+    ShardLogCompactionReceipt {
+        packs_removed: stats.packs_removed,
+        records_removed: stats.extents_removed,
+        bytes_removed: stats.bytes_removed,
+    }
 }

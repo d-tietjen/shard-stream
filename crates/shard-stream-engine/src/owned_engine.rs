@@ -17,6 +17,8 @@ struct Opening {
     gc_allocation_error: Option<std::collections::TryReserveError>,
     #[cfg(any(target_os = "linux", target_os = "android"))]
     gc_receive_error: Option<std::sync::mpsc::RecvError>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    resume_gc_policy: Option<crate::worker::NativeResumeGcPolicy>,
     journal: Option<ControlJournal>,
     sink: JoiningSink,
     write_fence: Option<Arc<dyn WriteFence>>,
@@ -80,12 +82,18 @@ pub struct OwnedRecoveredEngine {
     engine: StreamEngine,
     #[cfg(any(target_os = "linux", target_os = "android"))]
     _gc_outcomes: std::sync::Mutex<Vec<crate::worker::NativeGcOutcome>>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    resume_gc_policy: Option<crate::worker::NativeResumeGcPolicy>,
     custody: OwnedEngineCustody,
 }
 impl OwnedRecoveredEngine {
     /// Normal native catalog/fetch/append API, with the actual supplied components.
     pub fn engine(&self) -> &StreamEngine {
         &self.engine
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn recovery_gc_policy(&self) -> Option<&crate::worker::NativeResumeGcPolicy> {
+        self.resume_gc_policy.as_ref()
     }
     /// Original census clock, never renewed by construction or worker creation.
     pub fn absolute_expiry(&self) -> Instant {
@@ -281,6 +289,8 @@ impl StreamEngine {
             gc_allocation_error: None,
             #[cfg(any(target_os = "linux", target_os = "android"))]
             gc_receive_error: None,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            resume_gc_policy: None,
             journal: None,
             sink: JoiningSink(None),
             write_fence,
@@ -338,6 +348,8 @@ impl Opening {
             engine,
             #[cfg(any(target_os = "linux", target_os = "android"))]
             _gc_outcomes: std::sync::Mutex::new(self.gc_outcomes),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            resume_gc_policy: self.resume_gc_policy,
             custody: self.storage.finish_engine_custody(),
         }
     }
@@ -644,6 +656,13 @@ impl Opening {
                     self.storage.recovery_clock()?;
                 }
             }
+        }
+        // Move the exact already-charged bootstrap policy into the completed
+        // owner. Resumes borrow the original budget and captured health rather
+        // than constructing replacement checks after storage recovery.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            self.resume_gc_policy = owned_gc;
         }
         self.storage.recovery_clock()
     }

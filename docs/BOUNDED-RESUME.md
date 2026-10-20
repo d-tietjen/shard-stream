@@ -258,3 +258,60 @@ redaction case for both raw and promoted custody, are source-only until the norm
 formatting, strict Clippy, exact runtime and full workspace gates are executed.
 This ownership unit does not qualify SDK/private integration, current control,
 HA query service, product hosts or a release.
+
+## Bounded acquisition before recovery
+
+`DirectoryOwnership::directory_acquire_cost` derives a finite source-visible
+ceiling for one normalized absolute directory path. Prepay that cost in the
+composing recovery owner before `DirectoryOwnership::acquire_until`, passing
+the original absolute expiry. Each component and the advisory lock are opened
+descriptor-relatively without following symbolic links. Contention is
+nonblocking. A refused or late acquisition retains its actual descriptors,
+results, created paths and any acquired lock until the returned error drops.
+Entered child and parent synchronization obligations settle through expiry or
+unwind; no created path is silently rolled back. Successful acquisition is
+physical custody, not serving or query authority. Non-Unix acquisition through
+this additive interface remains explicitly unsupported.
+
+## Consuming canonical log operations
+
+`OwnedPinnedShardLog::read_from_until` and the append, seal and compaction
+entries consume the same canonical owner, the caller's original cumulative
+Core/native policies and their minimum expiry. Two fresh checked directory
+validations surround each entered operation. Completion and error values keep
+actual native results, partial output, allocation outcomes and unwind payloads;
+the original constructor context and physical directory remain last. Returning
+the canonical log preserves those original owners and counters rather than
+creating another recovery budget.
+
+Canonical writes retain actual retired pack descriptors in the opened native
+owner. Tracked compaction quarantines actual removed descriptors and rechecks
+held/named identities before epoch, index and unlink effects. Untracked store
+mutation makes subsequent strict operations stale; it does not refresh their
+catalog. The opened-store source tag, tracking state and retained result
+carriers are included by the published typed cost getters. Prepay shared
+policies once and the actual per-call framing on every entry; no cost getter
+grants admission or a whole-process memory/stack bound.
+
+The consuming Core canonical-read observation exposes retained physical range
+lengths and filled-prefix lengths only. Its selected records retain their actual
+payloads, but the observation cannot expose unselected bytes between coalesced
+records, the native observation, or an owning native error. The existing
+shardlog physical-store observation remains an explicit lower-level API; it is
+not forwarded through this Core facade.
+
+The recovered engine handle can borrow its original owned-primary GC policy.
+The completed owner retains the actual already-admitted bootstrap budget,
+limits and captured checks; ordinary and ordinary-primary engines return no
+policy. Borrowing or cloning this plain policy does not renew E, reset work,
+replace current control, or grant serving permission. Opening/returned-owner
+framing continues to use the actual `size_of` values.
+
+Bounded origin progress uses the same actual coordinator producer map and
+ordered visible WAL fetch under one cumulative non-clone origin budget and
+original E. A returned cursor, real absence, queue/native error, uncertain read,
+unwind or late result retains the same engine allocation and entered physical
+command until settlement. It returns data only: hosts must validate the actual
+producer identity/digest and their own bounded envelope/current-control joins.
+No topic, producer cursor, authority observation, fallback read or budget is
+fabricated. The existing query-lineage mutation/serving semantics are unchanged.

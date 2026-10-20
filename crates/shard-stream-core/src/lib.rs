@@ -16,8 +16,10 @@ pub use channel::{
     TrySendError, byte_bounded_channel,
 };
 pub use directory_ownership::{
-    DirectoryOwnership, DirectoryOwnershipError, DirectoryOwnershipUntilError,
-    DirectoryValidationCost,
+    DirectoryAcquireCost, DirectoryAcquireFailure, DirectoryAcquireLimits,
+    DirectoryAcquireObservation, DirectoryAcquirePhase, DirectoryAcquireUsage, DirectoryOwnership,
+    DirectoryOwnershipError, DirectoryOwnershipUntilError, DirectoryValidationCost,
+    RetainedDirectoryAcquireError,
 };
 pub use fencing::{
     PendingWriteAdmission, PhysicalWriteGuard, ReplicaSourceIdentity, WriteFence, WriteFenceError,
@@ -34,6 +36,15 @@ pub use owned_directory_handle::{
     CheckedDirectoryValidationPhase, RetainedCheckedDirectoryValidation,
     RetainedCheckedDirectoryValidationError, checked_directory_validation_cost,
 };
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use owned_directory_handle::{
+    OwnedPinnedShardLogMutationComplete, OwnedPinnedShardLogMutationCost,
+    OwnedPinnedShardLogMutationFailure, OwnedPinnedShardLogMutationObservation,
+    RetainedOwnedPinnedShardLogMutationError, owned_pinned_shard_log_gc_cost,
+    owned_pinned_shard_log_write_cost,
+};
+
 #[cfg(unix)]
 pub use owned_directory_handle::{
     NativeDirectoryProgress, OwnedDirectoryEntries, OwnedDirectoryHandle, OwnedEntryKind,
@@ -59,8 +70,10 @@ pub use owned_directory_handle::{
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use owned_directory_handle::{
     OwnedPinnedShardLog, OwnedPinnedShardLogCost, OwnedPinnedShardLogFailure,
-    OwnedPinnedShardLogObservation, OwnedPinnedShardLogValidation,
-    RetainedOwnedPinnedShardLogError, owned_pinned_shard_log_cost,
+    OwnedPinnedShardLogObservation, OwnedPinnedShardLogValidation, OwnedPinnedShardReadComplete,
+    OwnedPinnedShardReadCost, OwnedPinnedShardReadFailure, OwnedPinnedShardReadObservation,
+    RetainedOwnedPinnedShardLogError, RetainedOwnedPinnedShardReadError,
+    owned_pinned_shard_log_cost, owned_pinned_shard_read_cost,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use owned_directory_handle::{

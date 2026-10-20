@@ -26,8 +26,17 @@ use std::time::Instant;
 mod canonical_log;
 pub use canonical_log::{
     OwnedPinnedShardLog, OwnedPinnedShardLogCost, OwnedPinnedShardLogFailure,
-    OwnedPinnedShardLogObservation, OwnedPinnedShardLogValidation,
-    RetainedOwnedPinnedShardLogError, owned_pinned_shard_log_cost,
+    OwnedPinnedShardLogObservation, OwnedPinnedShardLogValidation, OwnedPinnedShardReadComplete,
+    OwnedPinnedShardReadCost, OwnedPinnedShardReadFailure, OwnedPinnedShardReadObservation,
+    RetainedOwnedPinnedShardLogError, RetainedOwnedPinnedShardReadError,
+    owned_pinned_shard_log_cost, owned_pinned_shard_read_cost,
+};
+
+pub use canonical_log::{
+    OwnedPinnedShardLogMutationComplete, OwnedPinnedShardLogMutationCost,
+    OwnedPinnedShardLogMutationFailure, OwnedPinnedShardLogMutationObservation,
+    RetainedOwnedPinnedShardLogMutationError, owned_pinned_shard_log_gc_cost,
+    owned_pinned_shard_log_write_cost,
 };
 
 #[path = "owned_pinned_shard_append.rs"]

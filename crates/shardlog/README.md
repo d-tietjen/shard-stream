@@ -184,3 +184,13 @@ this tracked identity set. Retired active file descriptors in those reports
 and the exact new active store file must stay with their physical owners;
 safe canonical reports must not expose those raw file-bearing wrappers. This
 initial-history read unit provides no such write or rotation handoff.
+
+## Canonical pinned mutation custody
+
+The consuming pinned log write and tracked compaction APIs retain the original
+opened store, live and retired descriptors, real native outcomes and immutable
+tracking ceilings. They use the supplied cumulative fetch/append budgets and
+minimum original expiry, including through refusal, unwind and entered cleanup.
+No descriptor clone, arbitrary-owner constructor or new serving permission is
+provided. See [`docs/BOUNDED-RESUME.md`](../../docs/BOUNDED-RESUME.md) for Core
+parent retention, per-call cost prepayment and the separate admission contract.

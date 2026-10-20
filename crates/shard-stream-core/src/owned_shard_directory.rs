@@ -27,6 +27,15 @@ pub use store::{
     OwnedPinnedShardAppendLimits, OwnedPinnedShardAppendObservation, OwnedPinnedShardAppendReport,
     RetainedOwnedPinnedShardAppendError, owned_pinned_shard_append_cost,
 };
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use store::{
+    OwnedPinnedShardLogMutationComplete, OwnedPinnedShardLogMutationCost,
+    OwnedPinnedShardLogMutationFailure, OwnedPinnedShardLogMutationObservation,
+    RetainedOwnedPinnedShardLogMutationError, owned_pinned_shard_log_gc_cost,
+    owned_pinned_shard_log_write_cost,
+};
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use store::{
     OwnedPinnedShardGcComplete, OwnedPinnedShardGcCost, OwnedPinnedShardGcFailure,
@@ -41,8 +50,10 @@ pub use store::{
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use store::{
     OwnedPinnedShardLog, OwnedPinnedShardLogCost, OwnedPinnedShardLogFailure,
-    OwnedPinnedShardLogObservation, OwnedPinnedShardLogValidation,
-    RetainedOwnedPinnedShardLogError, owned_pinned_shard_log_cost,
+    OwnedPinnedShardLogObservation, OwnedPinnedShardLogValidation, OwnedPinnedShardReadComplete,
+    OwnedPinnedShardReadCost, OwnedPinnedShardReadFailure, OwnedPinnedShardReadObservation,
+    RetainedOwnedPinnedShardLogError, RetainedOwnedPinnedShardReadError,
+    owned_pinned_shard_log_cost, owned_pinned_shard_read_cost,
 };
 
 /// Plain source-visible bridge/native values before actual continuation.

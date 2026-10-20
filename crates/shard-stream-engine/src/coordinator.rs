@@ -30,6 +30,14 @@ pub(crate) use bounded_fetch::Failure as BoundedFetchCoordinatorFailure;
 #[path = "coordinator_resume.rs"]
 mod bounded_resume;
 
+#[path = "coordinator_origin_progress.rs"]
+mod bounded_origin_progress;
+#[cfg(test)]
+pub(crate) use bounded_origin_progress::observe as observe_origin_progress;
+pub(crate) use bounded_origin_progress::{
+    Ticket as OriginProgressTicket, command_cost as origin_progress_command_cost,
+};
+
 mod catalog;
 pub(crate) use catalog::apply_recovered_catalog_event;
 
@@ -529,6 +537,7 @@ enum CoordinatorCommand {
     },
     BoundedFetch(bounded_fetch::Command),
     BoundedResume(bounded_resume::Command),
+    BoundedOriginProgress(bounded_origin_progress::Command),
     Create {
         topic_partition: TopicPartition,
         shards: Vec<ShardId>,
@@ -1397,6 +1406,9 @@ fn run_coordinator(
             }
             CoordinatorCommand::BoundedFetch(command) => bounded_fetch::execute(&states, command),
             CoordinatorCommand::BoundedResume(command) => bounded_resume::execute(&states, command),
+            CoordinatorCommand::BoundedOriginProgress(command) => {
+                bounded_origin_progress::execute(&states, command)
+            }
             CoordinatorCommand::Create {
                 topic_partition,
                 shards,

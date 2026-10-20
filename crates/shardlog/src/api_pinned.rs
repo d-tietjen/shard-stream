@@ -954,3 +954,18 @@ impl OpenedPinnedShardLog {
         Ok(PinnedShardLogReadComplete { scope })
     }
 }
+
+#[path = "api_pinned_gc.rs"]
+pub(crate) mod gc;
+pub use gc::{
+    PinnedShardLogGcChecks, PinnedShardLogGcComplete, PinnedShardLogGcError,
+    PinnedShardLogGcFailure, PinnedShardLogGcObservation, pinned_shard_log_gc_cost,
+};
+
+#[path = "api_pinned_write.rs"]
+pub(crate) mod write;
+pub use write::{
+    PinnedShardLogWriteChecks, PinnedShardLogWriteComplete, PinnedShardLogWriteError,
+    PinnedShardLogWriteFailure, PinnedShardLogWriteLimits, PinnedShardLogWriteObservation,
+    pinned_shard_log_write_cost,
+};

@@ -1,5 +1,13 @@
 //! Exclusive, cooperating-process custody of an engine's local directory.
 
+#[path = "directory_acquire_until.rs"]
+mod acquisition_until;
+pub use acquisition_until::{
+    DirectoryAcquireCost, DirectoryAcquireFailure, DirectoryAcquireLimits,
+    DirectoryAcquireObservation, DirectoryAcquirePhase, DirectoryAcquireUsage,
+    RetainedDirectoryAcquireError,
+};
+
 #[cfg(unix)]
 #[path = "directory_root_until.rs"]
 mod root_until;

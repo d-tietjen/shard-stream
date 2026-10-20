@@ -59,6 +59,33 @@ impl Scope {
         self.prepare(store, b, c)?;
         if seal {
             if store.active.bytes != 0 {
+                // identify() paid its own probe. Pay this distinct seal probe
+                // before accessing the actual retained BTree and pathname.
+                let seal_lookup_work = store
+                    .pack_paths
+                    .len()
+                    .checked_add(1)
+                    .and_then(|n| n.checked_mul(size_of::<(u64, PathBuf)>()))
+                    .ok_or(PinnedShardAppendFailure::Arithmetic)?;
+                #[cfg(test)]
+                if let Some(limit) = crate::api::pinned::write::tests::seal_probe_limit(
+                    false,
+                    b.usage.work_bytes,
+                    seal_lookup_work,
+                ) {
+                    // Test-only downward fault injection. No production cap,
+                    // saved expiry, counter or other limit is changed.
+                    if limit <= b.limits.max_work_bytes {
+                        b.limits.max_work_bytes = limit;
+                    }
+                }
+                self.work(seal_lookup_work, b, c)?;
+                #[cfg(test)]
+                let _ = crate::api::pinned::write::tests::seal_probe_limit(
+                    true,
+                    b.usage.work_bytes,
+                    seal_lookup_work,
+                );
                 let actual = store
                     .pack_paths
                     .get(&store.active.sequence)

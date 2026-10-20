@@ -49,6 +49,15 @@ pub use bounded_fetch::{
     RetainedNativeFetchError, native_fetch_cost,
 };
 
+#[path = "origin_progress.rs"]
+pub(crate) mod origin_progress;
+pub use origin_progress::{
+    NativeOriginProgressBudget, NativeOriginProgressCost, NativeOriginProgressFailure,
+    NativeOriginProgressLimits, NativeOriginProgressObservation, NativeOriginProgressQueryError,
+    NativeOriginProgressReport, NativeOriginProgressUsage, RetainedNativeOriginProgressError,
+    native_origin_progress_cost,
+};
+
 #[path = "native_resume.rs"]
 pub(crate) mod native_resume;
 pub use native_resume::{

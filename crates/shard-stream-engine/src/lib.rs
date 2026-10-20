@@ -57,6 +57,12 @@ pub use engine::{
     ReplicationTicket, ReplicationTransport, RetainedNativeFetchError, RetainedNativeResumeError,
     RetentionGuard, StreamEngine, native_fetch_cost, native_resume_cost,
 };
+pub use engine::{
+    NativeOriginProgressBudget, NativeOriginProgressCost, NativeOriginProgressFailure,
+    NativeOriginProgressLimits, NativeOriginProgressObservation, NativeOriginProgressQueryError,
+    NativeOriginProgressReport, NativeOriginProgressUsage, RetainedNativeOriginProgressError,
+    native_origin_progress_cost,
+};
 pub use engine_handle::{EngineHandle, WeakEngineHandle};
 pub use error::{EngineError, EngineResult};
 pub use query_lineage::EngineQueryLineage;
@@ -91,3 +97,13 @@ pub use recovery_archived::{
 
 /// Actual cumulative native fetch debit facts, without resource/serving admission.
 pub use shardlog::StorageFetchUsage as NativeFetchUsage;
+
+// Exact native policies used by an owning, data-only Blossom backend bridge.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use shardlog::{
+    AcquiredShardRecoveryGuard, PinnedShardAppendBudget, PinnedShardAppendCost,
+    PinnedShardAppendLimits, PinnedShardAppendUsage, PinnedShardLogWriteLimits,
+    RetainedShardGuardAcquireError, ShardRecoveryGuard, ShardStoreConfig, StorageFetchBudget,
+    StorageFetchCost, StorageFetchFailure, StorageFetchLimits, StorageFetchUsage,
+    pinned_shard_append_cost, shard_guard_acquire_cost, storage_fetch_cost,
+};

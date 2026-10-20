@@ -64,6 +64,11 @@ impl PinnedShardFetchChecks for Checks {
         }
     }
 }
+impl crate::PinnedShardGcChecks for Checks {
+    fn deny(&self) {
+        <Self as PinnedShardFetchChecks>::deny(self);
+    }
+}
 impl PinnedStoreOpenChecks for Checks {
     fn deny(&self) {
         self.denied.set(true);
@@ -348,6 +353,9 @@ fn genuine_untracked_active_append_and_rotation_never_reopen_or_fallback() {
     for rotate in [false, true] {
         let fixture = Fixture::new(&[b"first"], false, false);
         let mut opened = fixture.opened();
+        let b = budget(native_limits());
+        let c = Checks::new();
+        let original_plan = plan(&opened, &b, &c);
         if rotate {
             opened
                 .store_mut()
@@ -358,10 +366,8 @@ fn genuine_untracked_active_append_and_rotation_never_reopen_or_fallback() {
             .store_mut()
             .append(reservation(1, 1), None, b"actual later append", true)
             .expect("actual ordinary append");
-        let b = budget(native_limits());
-        let c = Checks::new();
         let error = opened
-            .read_fetch_plan_pinned_until(&fixture.pin, plan(&opened, &b, &c), &b, &c)
+            .read_fetch_plan_pinned_until(&fixture.pin, original_plan, &b, &c)
             .expect_err("untracked active generation");
         assert!(matches!(
             error.observation().failure(),
@@ -512,10 +518,55 @@ fn actual_sparse_native_map_probe_fee_is_prepaid_with_immutable_exact_and_one_le
     let starts = (1..96)
         .map(|id| (topic(id), LogicalOffset::new(u64::MAX)))
         .collect::<HashMap<_, _>>();
+    // A real tracked collection and descriptor retirement establish the new
+    // current epoch. Ordinary GC would correctly refuse the later strict plan
+    // as Stale before it could reach this independent query-fee boundary.
+    let setup = budget(native_limits());
+    let setup_checks = Checks::new();
+    let gc = crate::PinnedShardGcLimits {
+        max_path_bytes: 8192,
+        max_name_bytes: 1024,
+        // Successful bounded open retains its entire scanned-pack reservation.
+        max_packs: open_limits().max_packs,
+        max_batch_slots: 512,
+        max_log_start_slots: 256,
+        max_topic_slots: 256,
+        max_location_slots: 512,
+        max_plan_packs: 128,
+        max_io_calls: 5 + 11 * 128,
+        max_work_bytes: 1 << 26,
+    };
+    let physical = crate::pinned_shard_gc_cost(gc).expect("actual native GC cost");
+    setup
+        .charge_values(
+            physical.declared_bytes,
+            physical.entries,
+            physical.work_bytes,
+        )
+        .expect("prepay actual native collection before entry");
+    let mut tracking = TrackedGcTrace::new();
+    tracking
+        .prepare(gc, &setup, &setup_checks)
+        .expect("actual prepaid empty quarantine destinations");
+    let native = opened
+        .run_tracked_gc(
+            &fixture.pin,
+            &starts,
+            gc,
+            setup.absolute_expiry(),
+            &setup_checks,
+            &setup,
+            &mut tracking,
+        )
+        .expect("actual bounded collection on same pinned owner");
+    assert!(native.stats().packs_removed > 0);
     opened
-        .store_mut()
-        .garbage_collect(&starts)
-        .expect("ordinary actual sparse retained index lifecycle");
+        .retire_completed_gc(&native, &setup, &mut tracking, &setup_checks)
+        .expect("same actual successful result retires descriptors and updates tracked epoch");
+    assert_eq!(opened.tracked_epoch, native.epochs().1);
+    assert!(!setup_checks.denied.get());
+    // Keep native report and quarantine/retirement trace alive before the same
+    // opened owner drops; each query below has its own original command budget.
     assert!(opened.store.index.capacity() > opened.store.index.len() * 4);
     let (fixed, entries, _) = fixed_fee().expect("independent fixed native value inventory");
     let probe =
@@ -681,9 +732,11 @@ fn genuine_scanned_identity_requests_have_independent_immutable_entry_fees_befor
     let fixture = Fixture::new(&[b"real initial scanned identity"], false, false);
     let packs = open_limits().max_packs;
     let files = packs + 4;
-    // Six independently named new setup values, two requested/actual capacity
-    // slots per ScannedPack+identity pair, and each FileSlot's typed identity.
-    let entries = 6 + 4 * packs + files;
+    // Nine independent values: Vec, ScannedPack, source tag, tracked epoch,
+    // tracked active sequence, identity, optional identity, allocation Result,
+    // and actual capacity. Requested/actual ScannedPack+source+identity slots
+    // cost six entries per pack, plus each FileSlot's typed optional identity.
+    let entries = 9 + 6 * packs + files;
     for fits in [false, true] {
         let mut policy = open_limits();
         policy.max_entries = entries - usize::from(!fits);

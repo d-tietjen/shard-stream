@@ -334,7 +334,31 @@ struct ScannedPack {
     sequence: u64,
     slot: usize,
     identity: (u64, u64),
+    source: ScannedPackSource,
 }
+#[derive(Clone, Copy, Debug)]
+enum ScannedPackSource {
+    Original,
+    Retired(usize),
+    Active,
+}
+
+#[path = "pinned_store_write.rs"]
+mod write;
+use write::TrackedWriteCatalog;
+#[path = "pinned_store_gc.rs"]
+mod gc;
+pub(in crate::extent::pinned_directory) use gc::TrackedGcSources;
+#[cfg(not(test))]
+pub(in crate::extent::pinned_directory) use gc::TrackedGcStage;
+#[cfg(test)]
+pub(crate) use gc::{TrackedGcStage, TrackedGcTransferPhase};
+pub(crate) use gc::{TrackedGcTrace, tracking_gc_cost};
+#[cfg(test)]
+pub(crate) use write::WriteTrackingPhase;
+pub(crate) use write::{
+    TrackedWriteFailure, TrackedWriteLimits, TrackedWriteObservation, tracking_fixed_fee,
+};
 
 #[derive(Debug)]
 struct FileSlot {
@@ -539,21 +563,27 @@ fn scanned_setup_fee(packs: usize, files: usize) -> Option<(usize, usize)> {
     let values = [
         size_of::<Vec<ScannedPack>>(),
         size_of::<ScannedPack>(),
+        size_of::<ScannedPackSource>(),
+        size_of::<u64>(), // actual tracked epoch
+        size_of::<u64>(), // exact initial tracked active sequence
         size_of::<(u64, u64)>(),
         size_of::<Option<(u64, u64)>>(),
         size_of::<Option<Result<(), TryReserveError>>>(),
         size_of::<usize>(),
     ];
     let fixed = values.into_iter().try_fold(0usize, usize::checked_add)?;
-    let pack_slots =
-        packs.checked_mul(size_of::<ScannedPack>().checked_add(size_of::<(u64, u64)>())?)?;
+    let pack_slots = packs.checked_mul(
+        size_of::<ScannedPack>()
+            .checked_add(size_of::<ScannedPackSource>())?
+            .checked_add(size_of::<(u64, u64)>())?,
+    )?;
     let identities = files.checked_mul(size_of::<Option<(u64, u64)>>())?;
     let bytes = fixed
         .checked_add(pack_slots.checked_mul(2)?)?
         .checked_add(identities)?;
     let entries = values
         .len()
-        .checked_add(packs.checked_mul(4)?)?
+        .checked_add(packs.checked_mul(6)?)?
         .checked_add(files)?;
     Some((bytes, entries))
 }
@@ -2217,6 +2247,7 @@ impl Scope {
             sequence,
             slot,
             identity,
+            source: ScannedPackSource::Original,
         });
         self.work.check(checks)?;
         let mut offset = 0u64;
@@ -2553,6 +2584,12 @@ impl Scope {
 /// Completed actual native open result. Ordinary later store methods are not
 /// thereby qualified as descriptor-relative or bounded operations.
 pub struct OpenedPinnedShardStore {
+    // FIRST: actual retired pack Files finish destruction before the original
+    // store/lease and original scan context. External actual pin/Core parent
+    // remains caller-owned LAST; this field order supplies no new authority.
+    write_catalog: Option<TrackedWriteCatalog>,
+    tracked_epoch: u64,
+    tracked_active_sequence: u64,
     store: ShardStore,
     scope: Scope,
 }
@@ -2809,7 +2846,17 @@ impl ShardStore {
         };
         match observed {
             Ok(()) => match scope.store.take() {
-                Some(store) => Ok(OpenedPinnedShardStore { store, scope }),
+                Some(store) => {
+                    let tracked_epoch = store.plan_epoch;
+                    let tracked_active_sequence = store.active.sequence;
+                    Ok(OpenedPinnedShardStore {
+                        store,
+                        scope,
+                        write_catalog: None,
+                        tracked_epoch,
+                        tracked_active_sequence,
+                    })
+                }
                 None => {
                     scope.refuse(pin, PinnedStoreOpenFailure::Invariant, checks);
                     Err(PinnedStoreOpenError { scope })
