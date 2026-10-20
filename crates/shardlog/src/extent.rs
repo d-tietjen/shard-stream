@@ -227,7 +227,7 @@ struct ActivePack {
 }
 
 #[derive(Debug)]
-struct ReadBufferOwner {
+pub(crate) struct ReadBufferOwner {
     buffer: Option<Vec<u8>>,
     recycle: SyncSender<Vec<u8>>,
     cached_buffers: Arc<AtomicUsize>,

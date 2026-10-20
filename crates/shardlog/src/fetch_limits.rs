@@ -84,6 +84,17 @@ pub enum StorageFetchFailure {
     Denied,
     /// The actual entered native phase refused within E.
     Storage(StorageError),
+    /// A retained read reached an inconsistent internal owner transition.
+    ReadState,
+    /// The actual bounded native read frame unwound after retaining its owners.
+    NativeReadUnwind {
+        /// Original source/native unwind payload, never reconstructed.
+        payload: Box<dyn std::any::Any + Send>,
+        /// Actual native error already returned before the unwind, if any.
+        storage_error: Option<StorageError>,
+        /// Original fetch expiry elapsed after this actual outcome.
+        late: bool,
+    },
     /// SAME composing checkpoint refused after retaining an actual native error.
     #[cfg(unix)]
     Checkpoint {
@@ -113,6 +124,8 @@ impl fmt::Display for StorageFetchFailure {
             Self::Poisoned => "native fetch counters poisoned",
             Self::Denied => "native fetch work refused",
             Self::Storage(_) => "native fetch storage phase refused",
+            Self::ReadState => "native fetch read owner transition refused",
+            Self::NativeReadUnwind { .. } => "native fetch read frame unwound",
             #[cfg(unix)]
             Self::Checkpoint { .. } => "native fetch composing checkpoint refused",
             #[cfg(unix)]
@@ -124,6 +137,10 @@ impl Error for StorageFetchFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Expired(Some(error)) | Self::Storage(error) => Some(error),
+            Self::NativeReadUnwind {
+                storage_error: Some(error),
+                ..
+            } => Some(error),
             #[cfg(unix)]
             Self::Checkpoint {
                 storage_error: Some(error),
@@ -230,6 +247,8 @@ pub fn storage_fetch_cost(
     )?;
     #[cfg(unix)]
     let fixed = checked(fixed, size_of::<CheckFailure>())?;
+    let (read_framing, read_entries) = read_custody_cost()?;
+    let fixed = checked(fixed, read_framing)?;
     let string_bytes = limits.max_declared_bytes;
     let declared_bytes = checked(fixed, limits.max_declared_bytes)?;
     // The actual Inner, budget handle, cost and usage values plus the two
@@ -243,6 +262,7 @@ pub fn storage_fetch_cost(
     let entries = checked(limits.max_entries, checked(fixed_values.len(), 2)?)?;
     #[cfg(unix)]
     let entries = checked(entries, 1)?;
+    let entries = checked(entries, read_entries)?;
     Ok(StorageFetchCost {
         declared_bytes,
         entries,
@@ -449,6 +469,71 @@ impl StorageFetchBudget {
             }
         }
     }
+    // Called only after the actual successful native value is already retained
+    // outside the read frame. This is a post-success check, not a native Result.
+    pub(crate) fn completed_success(&self) -> Result<(), StorageFetchFailure> {
+        #[cfg(unix)]
+        if let Some(checks) = &self.inner.checks {
+            if Instant::now() >= self.inner.expiry {
+                self.deny();
+                return Err(StorageFetchFailure::Expired(None));
+            }
+            self.charge_plain(0, 0, 0, 0, 0)?;
+            if let Err(failure) = observe_checks(checks.as_ref()) {
+                self.deny();
+                let failure = failure.retain(None);
+                return Err(if Instant::now() >= self.inner.expiry {
+                    failure.late()
+                } else {
+                    failure
+                });
+            }
+            return self.charge_plain(0, 0, 0, 0, 0);
+        }
+        if Instant::now() >= self.inner.expiry {
+            self.deny();
+            return Err(StorageFetchFailure::Expired(None));
+        }
+        self.check()
+    }
+    // The real returned error moves exactly once into this terminal cause.
+    // Native-error precedence over prior sibling denial matches completed().
+    pub(crate) fn completed_error(&self, error: StorageError) -> StorageFetchFailure {
+        #[cfg(unix)]
+        if let Some(checks) = &self.inner.checks {
+            if Instant::now() >= self.inner.expiry {
+                self.deny();
+                return StorageFetchFailure::Expired(Some(error));
+            }
+            if self.charge_plain(0, 0, 0, 0, 0).is_err() {
+                self.deny();
+                return StorageFetchFailure::Storage(error);
+            }
+            if let Err(failure) = observe_checks(checks.as_ref()) {
+                self.deny();
+                let failure = failure.retain(Some(error));
+                return if Instant::now() >= self.inner.expiry {
+                    failure.late()
+                } else {
+                    failure
+                };
+            }
+            let after = self.charge_plain(0, 0, 0, 0, 0);
+            self.deny();
+            return if matches!(after, Err(StorageFetchFailure::Expired(_))) {
+                StorageFetchFailure::Expired(Some(error))
+            } else {
+                StorageFetchFailure::Storage(error)
+            };
+        }
+        if Instant::now() >= self.inner.expiry {
+            self.deny();
+            StorageFetchFailure::Expired(Some(error))
+        } else {
+            self.deny();
+            StorageFetchFailure::Storage(error)
+        }
+    }
     pub(crate) fn completed<T>(
         &self,
         result: Result<T, StorageError>,
@@ -533,6 +618,15 @@ impl StorageFetchFailure {
         match self {
             Self::Storage(error) => Self::Expired(Some(error)),
             Self::Expired(error) => Self::Expired(error),
+            Self::NativeReadUnwind {
+                payload,
+                storage_error,
+                ..
+            } => Self::NativeReadUnwind {
+                payload,
+                storage_error,
+                late: true,
+            },
             #[cfg(unix)]
             Self::Checkpoint {
                 failure,
@@ -585,13 +679,175 @@ impl Error for StorageFetchPlanError {
     }
 }
 
+// One current range only. Actual buffer/result children precede File owners
+// on drop; enclosing engine fetch Scope already drops this before its engine.
+#[derive(Default)]
+pub(crate) struct ReadCustody {
+    pub(crate) pack_sequence: Option<u64>,
+    pub(crate) range_start: u64,
+    pub(crate) next_offset: u64,
+    pub(crate) range_len: usize,
+    pub(crate) confirmed_bytes: usize,
+    pub(crate) read_entered: bool,
+    pub(crate) read_returned: bool,
+    pub(crate) read_error_returned: bool,
+    pub(crate) open_error_returned: bool,
+    pub(crate) raw: Option<crate::extent::ReadBufferOwner>,
+    pub(crate) promoted: Option<bytes::Bytes>,
+    pub(crate) read_result: Option<Result<usize, StorageError>>,
+    pub(crate) reader: Option<std::fs::File>,
+    pub(crate) open_result: Option<Result<std::fs::File, StorageError>>,
+}
+// Physical coalescing can include unselected records between requested batches.
+// Keep that complete owner for custody without formatting its bytes or File.
+impl fmt::Debug for ReadCustody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadCustody")
+            .field("pack_sequence", &self.pack_sequence)
+            .field("range_start", &self.range_start)
+            .field("next_offset", &self.next_offset)
+            .field("range_len", &self.range_len)
+            .field("confirmed_bytes", &self.confirmed_bytes)
+            .field("read_entered", &self.read_entered)
+            .field("read_returned", &self.read_returned)
+            .field("read_error_returned", &self.read_error_returned)
+            .field("open_error_returned", &self.open_error_returned)
+            .field("has_raw_buffer", &self.raw.is_some())
+            .field("has_promoted_buffer", &self.promoted.is_some())
+            .field("has_read_result", &self.read_result.is_some())
+            .field("has_native_reader", &self.has_reader())
+            .field("has_open_result", &self.open_result.is_some())
+            .finish()
+    }
+}
+impl ReadCustody {
+    pub(crate) fn take_native_error(&mut self) -> Option<StorageError> {
+        if self.read_result.as_ref().is_some_and(Result::is_err)
+            && let Some(Err(error)) = self.read_result.take()
+        {
+            self.read_error_returned = true;
+            return Some(error);
+        }
+        if self.open_result.as_ref().is_some_and(Result::is_err)
+            && let Some(Err(error)) = self.open_result.take()
+        {
+            self.open_error_returned = true;
+            return Some(error);
+        }
+        None
+    }
+    fn buffer_len(&self) -> Option<usize> {
+        self.raw
+            .as_ref()
+            .map(|raw| raw.as_ref().len())
+            .or_else(|| self.promoted.as_ref().map(bytes::Bytes::len))
+    }
+    #[cfg(test)]
+    fn bytes(&self) -> Option<&[u8]> {
+        self.raw
+            .as_ref()
+            .map(AsRef::as_ref)
+            .or(self.promoted.as_deref())
+    }
+    fn has_reader(&self) -> bool {
+        self.reader.is_some() || self.open_result.as_ref().is_some_and(Result::is_ok)
+    }
+}
+
+// This pays both the live source owner and its terminal error/return carrier,
+// the actual open/read return-and-move slots, and the caught Result metadata.
+// It is source-visible logical framing, not a stack/RSS or panic-payload bound.
+pub(crate) fn read_custody_cost() -> Result<(usize, usize), StorageFetchFailure> {
+    let values = [
+        size_of::<ReadCustody>(),
+        size_of::<StorageFetchReadError>(),
+        size_of::<Result<Vec<crate::StoredBatch>, StorageFetchReadError>>(),
+        size_of::<Result<(), StorageFetchFailure>>(),
+        size_of::<Result<Result<(), StorageFetchFailure>, Box<dyn std::any::Any + Send>>>(),
+        size_of::<Result<std::fs::File, StorageError>>(),
+        size_of::<Result<std::fs::File, StorageError>>(),
+        size_of::<Result<usize, StorageError>>(),
+        size_of::<Result<usize, StorageError>>(),
+        size_of::<std::alloc::Layout>(),
+        size_of::<std::alloc::Layout>(),
+    ];
+    let bytes = values.into_iter().try_fold(0usize, checked)?;
+    Ok((bytes, values.len()))
+}
+
 /// A refused native read retaining every completed payload owner.
 #[derive(Debug)]
 pub struct StorageFetchReadError {
     pub(crate) failure: StorageFetchFailure,
     pub(crate) batches: Vec<crate::StoredBatch>,
+    pub(crate) current: Option<ReadCustody>,
 }
 impl StorageFetchReadError {
+    // Shardlog-only physical owner tests need the actual allocation identity.
+    // This range can contain unselected records and is never a public byte view.
+    #[cfg(test)]
+    pub(crate) fn unpublished_bytes(&self) -> Option<&[u8]> {
+        self.current.as_ref().and_then(ReadCustody::bytes)
+    }
+    /// Length of the retained initialized current buffer, if any.
+    /// Coalesced gaps may hold unselected records; no range contents are exposed.
+    pub fn unpublished_buffer_len(&self) -> Option<usize> {
+        self.current.as_ref().and_then(ReadCustody::buffer_len)
+    }
+    /// Whether the same actual returned native File is still owned.
+    /// No File/FD or retry capability is exposed.
+    pub fn has_native_reader(&self) -> bool {
+        self.current.as_ref().is_some_and(ReadCustody::has_reader)
+    }
+    /// Original pack-relative start and requested length of the retained range.
+    pub fn read_range(&self) -> Option<(u64, usize)> {
+        let owner = self.current.as_ref()?;
+        Some((owner.range_start, owner.range_len))
+    }
+    /// Last actual successful read_at result, even if its postcheck refused.
+    /// EOF is the native Ok(0), distinct from the derived UnexpectedEof cause.
+    pub fn last_read_bytes(&self) -> Option<usize> {
+        self.current
+            .as_ref()?
+            .read_result
+            .as_ref()?
+            .as_ref()
+            .ok()
+            .copied()
+    }
+    /// Whether an actual read_at was entered in the current retained range.
+    pub fn read_entered(&self) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|owner| owner.read_entered)
+    }
+    /// Whether the actual open/read returned Err now owned by the terminal cause.
+    pub fn native_error_returned(&self) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|owner| owner.open_error_returned || owner.read_error_returned)
+    }
+    /// Whether the last actual read_at returned a Result before refusal/unwind.
+    /// A returned Err may have moved into failure(); it is never reconstructed.
+    pub fn read_returned(&self) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|owner| owner.read_returned)
+    }
+    /// Bytes accepted through the original post-read checkpoint in this range.
+    pub fn confirmed_read_bytes(&self) -> usize {
+        self.current
+            .as_ref()
+            .map_or(0, |owner| owner.confirmed_bytes)
+    }
+    /// Original source/native read unwind payload, without formatting or retry.
+    pub fn read_panic_payload(&self) -> Option<&(dyn std::any::Any + Send)> {
+        match &self.failure {
+            StorageFetchFailure::NativeReadUnwind { payload, .. } => Some(payload.as_ref()),
+            _ => None,
+        }
+    }
+
     /// Actual native deadline/resource/I/O refusal.
     pub fn failure(&self) -> &StorageFetchFailure {
         &self.failure

@@ -57,6 +57,10 @@ fn phase_observer() -> Option<PhaseObserver> {
     PHASE_OBSERVER.with(|observer| observer.borrow().clone())
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "keep actual read owners inline without a refusal allocation; fetch setup prepays completion slots"
+)]
 pub(crate) enum BoundedFetchCompletion {
     Plan {
         lane: usize,

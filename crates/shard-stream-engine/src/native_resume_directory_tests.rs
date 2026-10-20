@@ -429,3 +429,116 @@ fn dynamic_directory_finish_observation_keeps_first_error_before_later_denial() 
     DirectoryOwnership::acquire(&root.0.join("data"))
         .expect("last retained engine owner releases root");
 }
+
+#[test]
+fn native_resume_raw_read_error_keeps_original_core_fetch_ledgers_and_first_failure() {
+    let root = Temporary::new();
+    let handle = recovered(&root.0, Arc::new(LegacyOnly::default()));
+    let weak = handle.downgrade();
+    let expiry = Instant::now() + Duration::from_secs(30);
+    let original = directory(expiry);
+    let checks = DirectoryFetchChecks::new(original.clone()).expect("same paid original checker");
+    let core_before = original.usage().expect("actual original Core usage");
+    let mut allowed = limits();
+    allowed.fetch.max_read_attempts = 1;
+    // The existing one-batch selection causes two real passes through the SAME
+    // cumulative fetch ledger; no replacement budget or replay owner is created.
+    assert_eq!(allowed.fetch.max_selected_batches, 1);
+    let mut scope = start_inner(&handle, allowed, expiry, Some(checks))
+        .expect("same original native resume owner");
+    let escaped = scope.work.clone();
+    scope
+        .fetch_stored(partition(), LogicalOffset::new(0), 4096)
+        .expect("first actual native range fits its original read allowance");
+    assert_eq!(scope.buffered.len(), 1);
+    assert!(
+        scope
+            .fetch_stored(partition(), LogicalOffset::new(1), 4096)
+            .is_err()
+    );
+    let fetched = scope
+        .fetch_error
+        .as_ref()
+        .expect("real refused second pass");
+    let raw = fetched
+        .storage_read_failures()
+        .next()
+        .expect("actual owned native read error");
+    assert!(matches!(raw.failure(), StorageFetchFailure::Capacity));
+    assert!(raw.has_native_reader());
+    assert_eq!(
+        raw.unpublished_buffer_len(),
+        Some(b"actual retained resume body".len())
+    );
+    assert!(!raw.read_entered());
+    assert_eq!(
+        escaped
+            .inner
+            .fetch
+            .usage()
+            .expect("same cumulative attempts")
+            .read_attempts,
+        1
+    );
+    assert_eq!(
+        escaped
+            .usage()
+            .expect("separate same resume work")
+            .fetch_passes,
+        2
+    );
+    assert_eq!(
+        original.usage().expect("same original Core counters"),
+        core_before
+    );
+    assert_eq!(escaped.absolute_expiry(), expiry);
+    assert_eq!(escaped.inner.fetch.absolute_expiry(), expiry);
+    // A later genuine Core deadline refusal must not erase the already retained
+    // read owner or be replaced with a later Denied observation.
+    let earlier = Instant::now();
+    assert!(original.cap_expiry(earlier).is_err());
+    assert_eq!(scope.work.check(), Err(NativeResumeRefusal::Expired));
+    let first = scope
+        .work
+        .inner
+        .directory
+        .as_ref()
+        .expect("same checker")
+        .first_failure()
+        .expect("actual first typed Core refusal") as *const NativeDirectoryFailure;
+    let error = scope.fail(NativeResumeFailure::Fetch);
+    assert!(matches!(
+        error.gc_budget_error(),
+        Some(NativeDirectoryFailure::Expired(_))
+    ));
+    assert_eq!(
+        error.gc_budget_error().expect("same original first error")
+            as *const NativeDirectoryFailure,
+        first
+    );
+    escaped.deny();
+    assert!(escaped.check().is_err());
+    assert_eq!(
+        error.gc_budget_error().expect("immutable first error") as *const NativeDirectoryFailure,
+        first
+    );
+    assert!(
+        error
+            .fetch_error()
+            .expect("same nested failed fetch")
+            .storage_read_failures()
+            .next()
+            .expect("same retained raw owner")
+            .has_native_reader()
+    );
+    assert_eq!(original.absolute_expiry(), earlier);
+    drop(handle);
+    contended(&root.0);
+    assert!(weak.upgrade().is_some());
+    drop(error);
+    assert!(
+        weak.upgrade().is_none(),
+        "escaped work/checker has no engine back-edge"
+    );
+    StreamEngine::open(config(&root.0)).expect("physical native root released after final owner");
+}

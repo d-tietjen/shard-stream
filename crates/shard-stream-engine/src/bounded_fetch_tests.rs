@@ -506,3 +506,134 @@ fn ordinary_selector_before_bounded(
         merge_order,
     })
 }
+
+#[test]
+#[cfg(unix)]
+fn native_fetch_error_transports_unpublished_owner_until_last_engine_drop() {
+    let root = Temporary::new();
+    let mut cfg = config(&root.0);
+    // Keep one physical pack while an unselected partition's genuine payload
+    // separates the two selected ranges beyond the native 4096-byte gap.
+    cfg.target_pack_bytes = 8192;
+    {
+        let writer = StreamEngine::open(cfg.clone()).expect("actual one-pack native producer");
+        writer
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(11),
+                partitions: 2,
+                shards: None,
+            })
+            .expect("actual two-partition native topic");
+        for (request_id, partition_id, payload) in [
+            (0, 0, Bytes::from_static(b"actual retained native body")),
+            (1, 1, Bytes::from_static(&[b'b'; 5000])),
+            (2, 0, Bytes::from_static(b"actual retained native body")),
+        ] {
+            writer
+                .append(AppendRequest {
+                    request_id,
+                    topic_id: TopicId::new(11),
+                    partition_id: LogicalPartitionId::new(partition_id),
+                    record_count: 1,
+                    payload,
+                    durability: Durability::Leader,
+                    producer: None,
+                    atomic_group: None,
+                    leader_epoch: None,
+                    extension_context: None,
+                })
+                .expect("real interleaved native extent");
+        }
+    }
+    let directory = DirectoryOwnership::acquire(&cfg.data_dir).expect("actual original root owner");
+    let census = NativeRecoveryCensus::read_for_engine(
+        cfg.clone(),
+        directory,
+        None,
+        native_limits(),
+        Instant::now() + Duration::from_secs(30),
+    )
+    .expect("real bounded pre-open census");
+    assert_eq!(census.sources().count(), 2, "one coordinator and one pack");
+    let pack = census
+        .sources()
+        .find(|source| source.kind == crate::RecoverySourceKind::PrimaryPack)
+        .expect("actual single primary source");
+    assert!(pack.bytes <= cfg.target_pack_bytes);
+    let extents = census.extents();
+    assert_eq!(extents.len(), 3);
+    assert_eq!(
+        [
+            extents[0].native.reservation.partition_id.get(),
+            extents[1].native.reservation.partition_id.get(),
+            extents[2].native.reservation.partition_id.get(),
+        ],
+        [0, 1, 0]
+    );
+    assert!(extents.iter().all(|entry| {
+        entry.source_index == extents[0].source_index
+            && entry.native.pack_sequence == extents[0].native.pack_sequence
+    }));
+    assert_eq!(extents[1].native.payload_bytes, 5000);
+    assert!(extents[0].file_offset < extents[1].file_offset);
+    assert!(extents[1].file_offset < extents[2].file_offset);
+    let storage = census
+        .restore_storage()
+        .expect("same native storage restore");
+    let handle = EngineHandle::from_recovered(Arc::new(
+        StreamEngine::open_recovered_storage(storage, None, None, None, None)
+            .expect("actual recovered native worker"),
+    ));
+    let weak = handle.downgrade();
+    let expiry = Instant::now() + Duration::from_secs(30);
+    let mut allowed = limits();
+    allowed.max_read_attempts = 1;
+    let error = handle
+        .fetch_until(request(), allowed, expiry)
+        .expect_err("second real native range cannot enter an unbudgeted read");
+    assert!(matches!(error.failure(), NativeFetchFailure::Shard(_)));
+    assert_eq!(
+        error.scope().expect("actual entered owner").pending,
+        0,
+        "the typed read owner is returned only after physical worker completion"
+    );
+    let raw = error
+        .storage_read_failures()
+        .next()
+        .expect("actual typed read completion");
+    assert!(matches!(raw.failure(), StorageFetchFailure::Capacity));
+    assert!(raw.has_native_reader());
+    assert_eq!(
+        raw.unpublished_buffer_len(),
+        Some(b"actual retained native body".len())
+    );
+    assert!(!raw.read_entered() && !raw.read_returned());
+    assert!(
+        error
+            .completed_payloads()
+            .any(|bytes| bytes == b"actual retained native body")
+    );
+    assert_eq!(
+        error
+            .usage()
+            .expect("original cumulative ledger")
+            .read_attempts,
+        1
+    );
+    assert_eq!(
+        error
+            .scope()
+            .expect("same operation")
+            .budget
+            .as_ref()
+            .expect("original fetch budget")
+            .absolute_expiry(),
+        expiry
+    );
+    drop(handle);
+    contended(&root.0);
+    assert!(weak.upgrade().is_some());
+    drop(error);
+    assert!(weak.upgrade().is_none());
+    StreamEngine::open(cfg).expect("original native workers/root released after last owner");
+}

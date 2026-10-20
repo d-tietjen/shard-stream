@@ -216,6 +216,19 @@ impl RetainedNativeFetchError {
                 _ => None,
             })
     }
+    /// Actual failed native reads, including unpublished current File/buffer custody.
+    /// Every entered worker has physically settled before these are returned.
+    pub fn storage_read_failures(&self) -> impl Iterator<Item = &shardlog::StorageFetchReadError> {
+        self.scope()
+            .into_iter()
+            .flat_map(|scope| &scope.child_errors)
+            .filter_map(|completion| match completion {
+                BoundedFetchCompletion::Read {
+                    result: Err(error), ..
+                } => Some(error),
+                _ => None,
+            })
+    }
     /// Retained actual queue errors that also completed after a budget refusal.
     pub fn queue_errors(&self) -> &[EngineError] {
         self.scope()

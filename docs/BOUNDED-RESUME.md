@@ -208,3 +208,53 @@ files remain unchanged, no Core call is entered, and the real lane/sync join
 releases the ordinary root while that plain outcome remains alive. All fifteen
 resume and nine owned-worker groups remain source only, uncompiled and
 unexecuted; these mechanics supply no C1 or whole-host startup qualification.
+
+
+## Returned native read ownership
+
+Bounded native reads retain one current coalesced range outside their caught
+read frame. An actual returned OS `File`, initialized raw buffer, last actual
+read outcome and any promoted `Bytes` remain owned when the original deadline,
+shared directory check, resource counter, native I/O or source unwind refuses.
+Completed earlier batches remain in the same error. A successful open Result
+may already have moved its original File into this owner; it is never recreated
+by opening the path again. Native `Ok(0)` at EOF remains distinct from the
+ordinary derived `UnexpectedEof` error. An entered call that unwinds without
+returning has no fabricated Result.
+
+The raw allocation uses the original `ReadBufferOwner` and its existing recycle
+channel/counter handles. Retention delays recycling until the returned error is
+dropped. Successful promotion moves that same owner into the existing
+`Bytes::from_owner` allocation; it creates no second data buffer or new Arc
+allocation. Complete raw and promoted children drop before the File, and the
+existing engine fetch owner drops after every physically settled child error.
+Normal unbounded reads keep their original pooling and native read loop.
+
+Public observations expose buffer presence/length and actual outcome scalars.
+A physical coalesced range can span unselected records from other topics or
+partitions, so its raw or promoted contents are never exposed by the returned
+error's API or diagnostics. The current-range Debug formatter includes only
+numeric progress and presence flags. Full-range byte/pointer checks remain
+internal to shardlog tests; previously selected completed batches retain their
+existing payload view. There is no File/FD extractor, new operation ledger,
+retry continuation or serving permission. Every
+native replay pass still shares its original fetch counters and minimum-only
+directory checker, including the immutable first typed directory refusal.
+Actual native errors, checkpoint refusals and unwind payloads remain separate;
+late transformation retains the original payload/error rather than replacing
+it with an empty expiry refusal.
+
+The source-derived cost getters include inline current-read/error/return and
+catch framing before native entry. Both retained and in-channel completion
+slots use the actual widened completion type. Existing requested path, buffer,
+metadata and read-attempt fees remain cumulative and are not refunded. These
+logical costs exclude allocator/OS internals and arbitrary panic-payload heap
+sizes. A File or buffer never returned by an abort or internal consuming-library
+transition cannot be reconstructed. Logical expiry cannot cancel blocked kernel
+I/O; callers still wait for actual physical settlement.
+
+The nine returned-owner regression groups, including an interleaved-record
+redaction case for both raw and promoted custody, are source-only until the normal
+formatting, strict Clippy, exact runtime and full workspace gates are executed.
+This ownership unit does not qualify SDK/private integration, current control,
+HA query service, product hosts or a release.
