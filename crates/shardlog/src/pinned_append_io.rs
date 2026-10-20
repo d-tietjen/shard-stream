@@ -521,7 +521,13 @@ impl Scope {
                 .checked_mul(size_of::<(TopicPartition, Vec<ExtentLocation>)>())
                 .ok_or(PinnedShardAppendFailure::Arithmetic)?;
             #[cfg(test)]
-            super::tests::point_lookup_checkpoint("prepare", false, b, lookup_work);
+            super::tests::point_lookup_checkpoint(
+                "prepare",
+                false,
+                b,
+                lookup_work,
+                (store.index.capacity(), store.by_batch.capacity()),
+            );
             // This point lookup has its own capacity fee. The earlier full
             // source scan and later movement fees do not pay for this probe.
             self.work(lookup_work, b, c)?;
@@ -545,7 +551,13 @@ impl Scope {
                 self.allocations.push(result);
             }
             #[cfg(test)]
-            super::tests::point_lookup_checkpoint("prepare", true, b, lookup_work);
+            super::tests::point_lookup_checkpoint(
+                "prepare",
+                true,
+                b,
+                lookup_work,
+                (store.index.capacity(), store.by_batch.capacity()),
+            );
             self.check(b, c)?;
             if self.allocations.last().is_some_and(Result::is_err) {
                 return Err(PinnedShardAppendFailure::Allocation);
@@ -768,11 +780,23 @@ impl Scope {
                 .checked_mul(size_of::<(TopicPartition, Vec<ExtentLocation>)>())
                 .ok_or(PinnedShardAppendFailure::Arithmetic)?;
             #[cfg(test)]
-            super::tests::point_lookup_checkpoint("segment", false, b, lookup_work);
+            super::tests::point_lookup_checkpoint(
+                "segment",
+                false,
+                b,
+                lookup_work,
+                (store.index.capacity(), store.by_batch.capacity()),
+            );
             self.work(lookup_work, b, c)?;
             let capacity = store.index.get(&topic).map_or(0, Vec::capacity);
             #[cfg(test)]
-            super::tests::point_lookup_checkpoint("segment", true, b, lookup_work);
+            super::tests::point_lookup_checkpoint(
+                "segment",
+                true,
+                b,
+                lookup_work,
+                (store.index.capacity(), store.by_batch.capacity()),
+            );
             work = work
                 .checked_add(
                     capacity
@@ -808,7 +832,13 @@ impl Scope {
                     .checked_mul(size_of::<(TopicPartition, Vec<ExtentLocation>)>())
                     .ok_or(PinnedShardAppendFailure::Arithmetic)?;
                 #[cfg(test)]
-                super::tests::point_lookup_checkpoint("install_insert", false, b, insert_work);
+                super::tests::point_lookup_checkpoint(
+                    "install_insert",
+                    false,
+                    b,
+                    insert_work,
+                    (store.index.capacity(), store.by_batch.capacity()),
+                );
                 // The preceding contains/search fee does not pay this insert.
                 self.work(insert_work, b, c)?;
                 let pending = self
@@ -822,7 +852,13 @@ impl Scope {
                     .ok_or(PinnedShardAppendFailure::Refused)?;
                 store.index.insert(topic, locations);
                 #[cfg(test)]
-                super::tests::point_lookup_checkpoint("install_insert", true, b, insert_work);
+                super::tests::point_lookup_checkpoint(
+                    "install_insert",
+                    true,
+                    b,
+                    insert_work,
+                    (store.index.capacity(), store.by_batch.capacity()),
+                );
             }
             let p = &self.prepared[i];
             let location = prepared_extent_location(p, store.active.sequence, next);
@@ -842,13 +878,25 @@ impl Scope {
                 })
                 .ok_or(PinnedShardAppendFailure::Arithmetic)?;
             #[cfg(test)]
-            super::tests::point_lookup_checkpoint("install_location", false, b, install_work);
+            super::tests::point_lookup_checkpoint(
+                "install_location",
+                false,
+                b,
+                install_work,
+                (store.index.capacity(), store.by_batch.capacity()),
+            );
             // Recompute after any insertion/growth. The unchanged native helper
             // performs its own index.entry and by_batch.insert point probes.
             self.work(install_work, b, c)?;
             store.install_location(location);
             #[cfg(test)]
-            super::tests::point_lookup_checkpoint("install_location", true, b, install_work);
+            super::tests::point_lookup_checkpoint(
+                "install_location",
+                true,
+                b,
+                install_work,
+                (store.index.capacity(), store.by_batch.capacity()),
+            );
             self.installed_frames += 1;
             self.after(PinnedShardAppendPhase::Index, b, c)?;
         }

@@ -979,7 +979,8 @@ fn actual_raw_scan_and_name_materialization_work_is_prepaid_at_exact_and_one_les
     }
 }
 
-type PointLookupObserver = Box<dyn FnMut(&'static str, bool, &mut PinnedShardAppendBudget, usize)>;
+type PointLookupObserver =
+    Box<dyn FnMut(&'static str, bool, &mut PinnedShardAppendBudget, usize, (usize, usize))>;
 thread_local! {
     static POINT_LOOKUP_OBSERVER: RefCell<Option<PointLookupObserver>> = RefCell::new(None);
 }
@@ -988,10 +989,11 @@ pub(super) fn point_lookup_checkpoint(
     completed: bool,
     budget: &mut PinnedShardAppendBudget,
     fee: usize,
+    capacities: (usize, usize),
 ) {
     POINT_LOOKUP_OBSERVER.with(|observer| {
         if let Some(observer) = &mut *observer.borrow_mut() {
-            observer(point, completed, budget, fee);
+            observer(point, completed, budget, fee, capacities);
         }
     });
 }
@@ -1002,7 +1004,8 @@ impl Drop for PointLookupObserve {
     }
 }
 fn observe_point_lookups(
-    observer: impl FnMut(&'static str, bool, &mut PinnedShardAppendBudget, usize) + 'static,
+    observer: impl FnMut(&'static str, bool, &mut PinnedShardAppendBudget, usize, (usize, usize))
+    + 'static,
 ) -> PointLookupObserve {
     POINT_LOOKUP_OBSERVER.with(|slot| {
         assert!(slot.borrow().is_none());
@@ -1079,7 +1082,7 @@ fn genuine_sparse_native_history_fits_new_lookup_fees_and_reopens_all_retained_r
     let checks = Checks::new();
     let observed = Rc::new(RefCell::new(Vec::new()));
     let saved = observed.clone();
-    let _observer = observe_point_lookups(move |point, completed, budget, fee| {
+    let _observer = observe_point_lookups(move |point, completed, budget, fee, _capacities| {
         saved
             .borrow_mut()
             .push((point, completed, budget.usage(), fee));
@@ -1135,26 +1138,27 @@ fn actual_sparse_lookup_exact_and_one_less_boundaries_precede_each_point_and_kee
                 PinnedShardAppendBudget::new(policy, original_e).expect("actual original budget");
             let observed = Rc::new(RefCell::new(Vec::new()));
             let saved = observed.clone();
-            let _observer = observe_point_lookups(move |actual, completed, budget, fee| {
-                if actual != point {
-                    return;
-                }
-                let before = budget.usage();
-                saved.borrow_mut().push((completed, before, fee));
-                if !completed {
-                    // Local test fault injection only: tighten this SAME real
-                    // ceiling, never reset usage, E or another policy axis.
-                    let exact = before
-                        .work_bytes
-                        .checked_add(fee)
-                        .expect("actual finite fee");
-                    let cap = exact - usize::from(one_less);
-                    assert!(cap <= budget.limits.max_work_bytes);
-                    budget.limits.max_work_bytes = cap;
-                    assert_eq!(budget.usage(), before);
-                    assert_eq!(budget.absolute_expiry(), original_e);
-                }
-            });
+            let _observer =
+                observe_point_lookups(move |actual, completed, budget, fee, _capacities| {
+                    if actual != point {
+                        return;
+                    }
+                    let before = budget.usage();
+                    saved.borrow_mut().push((completed, before, fee));
+                    if !completed {
+                        // Local test fault injection only: tighten this SAME real
+                        // ceiling, never reset usage, E or another policy axis.
+                        let exact = before
+                            .work_bytes
+                            .checked_add(fee)
+                            .expect("actual finite fee");
+                        let cap = exact - usize::from(one_less);
+                        assert!(cap <= budget.limits.max_work_bytes);
+                        budget.limits.max_work_bytes = cap;
+                        assert_eq!(budget.usage(), before);
+                        assert_eq!(budget.absolute_expiry(), original_e);
+                    }
+                });
             let checks = Checks::new();
             let error = fixture
                 .append(vec![input(2000, 8)], false, &mut budget, &checks)
@@ -1235,10 +1239,6 @@ fn actual_sparse_install_probes_fit_immutable_budgets_for_existing_and_new_topic
     for new_topic in [false, true] {
         let mut fixture = sparse_native_history();
         assert!(fixture.store.by_batch.capacity() > fixture.store.by_batch.len());
-        let topic_capacity = fixture.store.index.capacity();
-        let batch_capacity = fixture.store.by_batch.capacity();
-        let topic_fee = topic_capacity * size_of::<(TopicPartition, Vec<ExtentLocation>)>();
-        let batch_fee = batch_capacity * size_of::<((TopicPartition, BatchId), ExtentLocation)>();
         let mut policy = limits();
         policy.max_topic_slots = 256;
         let original_e = expiry();
@@ -1246,11 +1246,11 @@ fn actual_sparse_install_probes_fit_immutable_budgets_for_existing_and_new_topic
             .expect("immutable generous actual install policy");
         let rows = Rc::new(RefCell::new(Vec::new()));
         let saved = rows.clone();
-        let _observer = observe_point_lookups(move |point, completed, budget, fee| {
+        let _observer = observe_point_lookups(move |point, completed, budget, fee, capacities| {
             if matches!(point, "install_insert" | "install_location") {
                 saved
                     .borrow_mut()
-                    .push((point, completed, budget.usage(), fee));
+                    .push((point, completed, budget.usage(), fee, capacities));
             }
         });
         let checks = Checks::new();
@@ -1263,10 +1263,7 @@ fn actual_sparse_install_probes_fit_immutable_budgets_for_existing_and_new_topic
             )
             .expect("actual sparse index and batch-map install fit before native entry");
         let rows = rows.borrow();
-        for (point, expected_fee) in [
-            ("install_insert", topic_fee),
-            ("install_location", topic_fee + batch_fee),
-        ] {
+        for point in ["install_insert", "install_location"] {
             let before = rows.iter().find(|row| row.0 == point && !row.1);
             if point == "install_insert" && !new_topic {
                 assert!(
@@ -1280,12 +1277,26 @@ fn actual_sparse_install_probes_fit_immutable_budgets_for_existing_and_new_topic
                 .iter()
                 .find(|row| row.0 == point && row.1)
                 .expect("actual complete native point/helper");
+            // GC leaves genuine sparse tables. Reusing a deleted bucket can
+            // change reported capacity even without a new bucket allocation.
+            // Pay the actual capacities at THIS helper, after any prior insert.
+            let (topic_capacity, batch_capacity) = before.4;
+            let expected_fee = topic_capacity * size_of::<(TopicPartition, Vec<ExtentLocation>)>()
+                + if point == "install_location" {
+                    batch_capacity * size_of::<((TopicPartition, BatchId), ExtentLocation)>()
+                } else {
+                    0
+                };
             assert_eq!(before.3, expected_fee);
             assert_eq!(after.3, expected_fee);
             assert_eq!(after.2.work_bytes, before.2.work_bytes + expected_fee);
         }
-        assert_eq!(fixture.store.index.capacity(), topic_capacity);
-        assert_eq!(fixture.store.by_batch.capacity(), batch_capacity);
+        let installed = rows
+            .iter()
+            .find(|row| row.0 == "install_location" && row.1)
+            .expect("actual final native helper completed");
+        assert_eq!(fixture.store.index.capacity(), installed.4.0);
+        assert_eq!(fixture.store.by_batch.capacity(), installed.4.1);
         assert_eq!(budget.limits(), policy, "no generous-policy mutation");
         assert_eq!(budget.absolute_expiry(), original_e);
         assert!(!budget.is_refused() && !checks.denied.get());
@@ -1321,10 +1332,6 @@ fn actual_sparse_install_fee_exact_and_one_less_keep_each_entered_native_effect(
             assert!(fixture.store.by_batch.capacity() > fixture.store.by_batch.len());
             let active = fixture.store.active_path().to_path_buf();
             let original_bytes = fs::read(&active).expect("actual native active bytes");
-            let topic_fee =
-                fixture.store.index.capacity() * size_of::<(TopicPartition, Vec<ExtentLocation>)>();
-            let batch_fee = fixture.store.by_batch.capacity()
-                * size_of::<((TopicPartition, BatchId), ExtentLocation)>();
             let mut policy = limits();
             policy.max_topic_slots = 256;
             let original_e = expiry();
@@ -1332,30 +1339,33 @@ fn actual_sparse_install_fee_exact_and_one_less_keep_each_entered_native_effect(
                 .expect("same actual cumulative native policy");
             let rows = Rc::new(RefCell::new(Vec::new()));
             let saved = rows.clone();
-            let _observer = observe_point_lookups(move |actual, completed, budget, fee| {
-                if actual != point {
-                    return;
-                }
-                let before = budget.usage();
-                saved.borrow_mut().push((completed, before, fee));
-                if !completed {
-                    // Explicit local fault injection: this is not an originally
-                    // configured immutable ceiling or a complete startup proof.
-                    let old_limits = budget.limits();
-                    let exact = before
-                        .work_bytes
-                        .checked_add(fee)
-                        .expect("actual finite fee");
-                    let cap = exact - usize::from(one_less);
-                    assert!(cap <= old_limits.max_work_bytes);
-                    budget.limits.max_work_bytes = cap;
-                    let mut expected = old_limits;
-                    expected.max_work_bytes = cap;
-                    assert_eq!(budget.limits(), expected);
-                    assert_eq!(budget.usage(), before);
-                    assert_eq!(budget.absolute_expiry(), original_e);
-                }
-            });
+            let _observer =
+                observe_point_lookups(move |actual, completed, budget, fee, capacities| {
+                    if actual != point {
+                        return;
+                    }
+                    let before = budget.usage();
+                    saved
+                        .borrow_mut()
+                        .push((completed, before, fee, capacities));
+                    if !completed {
+                        // Explicit local fault injection: this is not an originally
+                        // configured immutable ceiling or a complete startup proof.
+                        let old_limits = budget.limits();
+                        let exact = before
+                            .work_bytes
+                            .checked_add(fee)
+                            .expect("actual finite fee");
+                        let cap = exact - usize::from(one_less);
+                        assert!(cap <= old_limits.max_work_bytes);
+                        budget.limits.max_work_bytes = cap;
+                        let mut expected = old_limits;
+                        expected.max_work_bytes = cap;
+                        assert_eq!(budget.limits(), expected);
+                        assert_eq!(budget.usage(), before);
+                        assert_eq!(budget.absolute_expiry(), original_e);
+                    }
+                });
             let checks = Checks::new();
             let result = fixture.append(
                 vec![sparse_install_input(new_topic)],
@@ -1376,7 +1386,12 @@ fn actual_sparse_install_fee_exact_and_one_less_keep_each_entered_native_effect(
             };
             let rows = rows.borrow();
             assert_eq!(rows.len(), if one_less { 1 } else { 2 });
-            let (_, before, fee) = rows[0];
+            let (_, before, fee, (topic_capacity, batch_capacity)) = rows[0];
+            // Use the native pre-helper state, not a capacity snapshot from
+            // before a possible conditional topic insertion.
+            let topic_fee = topic_capacity * size_of::<(TopicPartition, Vec<ExtentLocation>)>();
+            let batch_fee =
+                batch_capacity * size_of::<((TopicPartition, BatchId), ExtentLocation)>();
             assert_eq!(
                 fee,
                 topic_fee
