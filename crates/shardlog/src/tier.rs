@@ -679,7 +679,10 @@ impl LocalObjectTier {
 
 #[cfg(unix)]
 fn tier_recovery_clock(expiry: std::time::Instant) -> StorageResult<()> {
-    if std::time::Instant::now() >= expiry {
+    let now = std::time::Instant::now();
+    #[cfg(test)]
+    let now = TIER_RECOVERY_NOW.with(|clock| clock.get().unwrap_or(now));
+    if now >= expiry {
         return Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "native recovery original expiry elapsed",
@@ -697,6 +700,10 @@ type TierCopyTestStep = std::cell::RefCell<Option<Box<dyn FnMut(&str, &Path)>>>;
 thread_local! {
     static TIER_RECOVERY_STEP: TierRecoveryTestStep =
         const { std::cell::RefCell::new(None) };
+    // A single test advances observed time only after an actual native hash.
+    // Unarmed tests and all production builds use the real monotonic clock.
+    static TIER_RECOVERY_NOW: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
 }
 #[cfg(all(unix, test))]
 fn tier_recovery_test_step(step: &str) {
@@ -1225,24 +1232,40 @@ mod owned_expiry_tests {
     impl Drop for Reset {
         fn drop(&mut self) {
             TIER_RECOVERY_STEP.with(|hook| *hook.borrow_mut() = None);
+            TIER_RECOVERY_NOW.with(|clock| clock.set(None));
         }
     }
-    fn delay_first_complete(expiry: Instant) -> std::rc::Rc<std::cell::Cell<usize>> {
+    fn expire_first_complete(
+        expiry: Instant,
+    ) -> (
+        std::rc::Rc<std::cell::Cell<usize>>,
+        std::rc::Rc<std::cell::Cell<usize>>,
+    ) {
         let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let completed = std::rc::Rc::new(std::cell::Cell::new(0));
         let observed = reads.clone();
+        let observed_completed = completed.clone();
+        // Keep this operation's original E fixed. Scheduling and the actual
+        // copy/sync work cannot expire observed time before the first hash.
+        TIER_RECOVERY_NOW.with(|clock| {
+            clock.set(Some(
+                expiry
+                    .checked_sub(Duration::from_nanos(1))
+                    .expect("actual expiry has a preceding instant"),
+            ));
+        });
         TIER_RECOVERY_STEP.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move |step| {
                 if step == "hash-start" {
                     observed.set(observed.get() + 1);
                 }
                 if step == "hash-complete" {
-                    std::thread::sleep(
-                        expiry.saturating_duration_since(Instant::now()) + Duration::from_millis(5),
-                    );
+                    observed_completed.set(observed_completed.get() + 1);
+                    TIER_RECOVERY_NOW.with(|clock| clock.set(Some(expiry)));
                 }
             }))
         });
-        reads
+        (reads, completed)
     }
     #[test]
     fn owned_native_open_and_offload_stop_after_first_late_hash_before_later_verification_or_current()
@@ -1310,7 +1333,7 @@ mod owned_expiry_tests {
         let guard = TierRecoveryGuard::try_acquire(lock, tier_root.clone(), ShardId::new(0))
             .expect("same actual publication lease");
         let expiry = Instant::now() + Duration::from_millis(50);
-        let reads = delay_first_complete(expiry);
+        let (reads, completed) = expire_first_complete(expiry);
         let reset = Reset;
         assert!(
             LocalObjectTier::open_under_census_until(
@@ -1326,6 +1349,7 @@ mod owned_expiry_tests {
             1,
             "second actual CURRENT object was never opened after E"
         );
+        assert_eq!(completed.get(), 1, "first real native hash completed");
         drop(reset);
         guard.validate().expect("original native lease remains");
         let mut owned = LocalObjectTier::open_under_census_until(
@@ -1337,7 +1361,7 @@ mod owned_expiry_tests {
         .expect("actual fresh native component opening");
         let (pack, coverage) = last.expect("third actual pack");
         let expiry = Instant::now() + Duration::from_millis(50);
-        let reads = delay_first_complete(expiry);
+        let (reads, completed) = expire_first_complete(expiry);
         let reset = Reset;
         assert!(
             owned
@@ -1345,6 +1369,7 @@ mod owned_expiry_tests {
                 .is_err()
         );
         assert_eq!(reads.get(), 1);
+        assert_eq!(completed.get(), 1, "first real native hash completed");
         drop(reset);
         assert_eq!(
             load_current_manifest(&tier_root, ShardId::new(0))
