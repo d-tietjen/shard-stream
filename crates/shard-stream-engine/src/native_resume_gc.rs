@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(super) struct Early {
     budget_error: Option<shard_stream_core::NativeDirectoryFailure>,
+    checks: Option<Arc<super::DirectoryFetchChecks>>,
     deny_panic: Option<Box<dyn Any + Send>>,
     _policy: NativeResumeGcPolicy,
 }
@@ -162,6 +163,72 @@ impl Scope {
         Ok(())
     }
 }
+#[allow(
+    clippy::result_large_err,
+    reason = "retain original engine, policy and actual early refusal custody inline"
+)]
+pub(super) fn start_owned(
+    owner: &EngineHandle,
+    limits: NativeResumeLimits,
+    original_expiry: Instant,
+    policy: NativeResumeGcPolicy,
+) -> Result<Box<Scope>, RetainedNativeResumeError> {
+    let expiry = original_expiry.min(policy.budget.absolute_expiry());
+    let capped = policy.budget.cap_expiry(expiry);
+    if let Err(budget_error) = capped {
+        policy.budget.deny();
+        let deny_panic = catch_unwind(AssertUnwindSafe(|| policy.checks.deny())).err();
+        return Err(RetainedNativeResumeError {
+            failure: NativeResumeFailure::Callback,
+            gc_early: Some(Early {
+                budget_error: Some(budget_error),
+                checks: None,
+                deny_panic,
+                _policy: policy,
+            }),
+            custody: Custody::Early(owner.clone()),
+        });
+    }
+    let checks = match super::DirectoryFetchChecks::new(Arc::clone(&policy.budget)) {
+        Ok(checks) => checks,
+        Err(budget_error) => {
+            policy.budget.deny();
+            let deny_panic = catch_unwind(AssertUnwindSafe(|| policy.checks.deny())).err();
+            return Err(RetainedNativeResumeError {
+                failure: NativeResumeFailure::Callback,
+                gc_early: Some(Early {
+                    budget_error: Some(budget_error),
+                    checks: None,
+                    deny_panic,
+                    _policy: policy,
+                }),
+                custody: Custody::Early(owner.clone()),
+            });
+        }
+    };
+    let mut scope = match super::start_inner(owner, limits, expiry, Some(Arc::clone(&checks))) {
+        Ok(scope) => scope,
+        Err(mut error) => {
+            // Observe through the SAME concrete checker; a direct budget.check
+            // fallback here could escape the first-error escrow and later be
+            // superseded by a generic denial from an escaped work clone.
+            let _ = checks.check_native();
+            let budget_error = None;
+            policy.budget.deny();
+            let deny_panic = catch_unwind(AssertUnwindSafe(|| policy.checks.deny())).err();
+            error.gc_early = Some(Early {
+                budget_error,
+                checks: Some(checks),
+                deny_panic,
+                _policy: policy,
+            });
+            return Err(error);
+        }
+    };
+    scope.gc_policy = Some(policy);
+    Ok(scope)
+}
+
 impl EngineHandle {
     /// Collect real owned lane stores under one actual resume/directory budget.
     ///
@@ -185,25 +252,7 @@ impl EngineHandle {
         limits: NativeResumeLimits,
         original_expiry: Instant,
     ) -> Result<NativeResumeReport, RetainedNativeResumeError> {
-        let expiry = original_expiry.min(policy.budget.absolute_expiry());
-        let mut scope = match super::start(self, limits, expiry) {
-            Ok(scope) => scope,
-            Err(mut error) => {
-                error.gc_early = Some(Early {
-                    budget_error: None,
-                    deny_panic: None,
-                    _policy: policy,
-                });
-                if let Some(early) = &mut error.gc_early {
-                    early.budget_error = early._policy.budget.cap_expiry(expiry).err();
-                    early._policy.budget.deny();
-                    early.deny_panic =
-                        catch_unwind(AssertUnwindSafe(|| early._policy.checks.deny())).err();
-                }
-                return Err(error);
-            }
-        };
-        scope.gc_policy = Some(policy);
+        let mut scope = start_owned(self, limits, original_expiry, policy)?;
         let observed = catch_unwind(AssertUnwindSafe(|| scope.collect_owned(partition, start)));
         let observed = match observed {
             Ok(result) => result,
@@ -235,15 +284,26 @@ impl RetainedNativeResumeError {
 }
 
 impl RetainedNativeResumeError {
-    /// Actual final SAME-directory-budget refusal retained independently of
-    /// completed native reports, including a concurrent earlier minimum E.
+    /// Actual SAME-directory-budget refusal retained independently of native reports.
+    /// The first recorded checked refusal survives later sticky denial; its
+    /// immutable borrowed value is never taken, reset or replaced.
     pub fn gc_budget_error(&self) -> Option<&shard_stream_core::NativeDirectoryFailure> {
         if let Some(early) = &self.gc_early {
-            return early.budget_error.as_ref();
+            return early
+                .checks
+                .as_ref()
+                .and_then(|checks| checks.first_failure())
+                .or(early.budget_error.as_ref());
         }
         match &self.custody {
             Custody::Early(_) => None,
-            Custody::Entered(scope) => scope.gc_budget_error.as_ref(),
+            Custody::Entered(scope) => scope
+                .work
+                .inner
+                .directory
+                .as_ref()
+                .and_then(|checks| checks.first_failure())
+                .or(scope.gc_budget_error.as_ref()),
         }
     }
 }

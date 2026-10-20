@@ -1692,3 +1692,11 @@ mod table_probe_regressions {
         assert!(trace.phase("coordinator.states", ProbePhase::Refused));
     }
 }
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[path = "native_resume_sink_tests.rs"]
+mod strict_sink;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[path = "native_resume_directory_tests.rs"]
+mod directory_fetch;

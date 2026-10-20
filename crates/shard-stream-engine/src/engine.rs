@@ -54,8 +54,8 @@ pub(crate) mod native_resume;
 pub use native_resume::{
     NativeResumeCallbackError, NativeResumeCallbackResult, NativeResumeCoordinatorOutcome,
     NativeResumeCost, NativeResumeFailure, NativeResumeLimits, NativeResumeObservation,
-    NativeResumeOutcome, NativeResumeRefusal, NativeResumeReport, NativeResumeUsage,
-    NativeResumeWork, RetainedNativeResumeError, native_resume_cost,
+    NativeResumeOutcome, NativeResumeRefusal, NativeResumeReport, NativeResumeSinkCacheOperation,
+    NativeResumeUsage, NativeResumeWork, RetainedNativeResumeError, native_resume_cost,
 };
 
 const MAX_FETCH_PLAN_BATCHES_PER_SHARD: usize = 4_096;
@@ -1545,6 +1545,15 @@ impl StreamEngine {
     #[must_use]
     pub fn recovered_partitions(&self) -> Vec<TopicPartition> {
         self.recovered_partitions.clone()
+    }
+
+    /// Borrow the exact native recovery partition list without allocating a copy.
+    ///
+    /// These are historical storage observations. The composing host must join
+    /// current assignments before using them for leader-only continuation.
+    #[must_use]
+    pub fn recovered_partition_sources(&self) -> &[TopicPartition] {
+        &self.recovered_partitions
     }
 
     /// Replays retained WAL data for partitions currently led by this broker.

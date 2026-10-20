@@ -19,6 +19,15 @@ mod worker;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use recovery_census::{NativePrimaryOutcomes, NativePrimaryRecovery};
 
+// The actual neutral storage policies used by bounded native recovery.
+// Reexport the same types so composing hosts do not select a second version.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use shardlog::{
+    PinnedShardDirectoryLimits, PinnedShardGcChecks, PinnedShardGcLimits, PinnedStoreOpenChecks,
+    PinnedStoreOpenLimits, ShardDirectoryCheckFailure, ShardDirectoryChecks,
+    ShardGuardAcquireLimits,
+};
+
 #[cfg(unix)]
 pub use recovery_census::{
     NativeRecoveryCatalog, NativeRecoveryCensus, NativeRecoveryError, NativeRecoveryLimits,
@@ -43,10 +52,10 @@ pub use engine::{
     NativeFetchLimits, NativeFetchResult, NativeResumeCallbackError, NativeResumeCallbackResult,
     NativeResumeCoordinatorOutcome, NativeResumeCost, NativeResumeFailure, NativeResumeLimits,
     NativeResumeObservation, NativeResumeOutcome, NativeResumeRefusal, NativeResumeReport,
-    NativeResumeUsage, NativeResumeWork, PartitionEpochs, PartitionWatermarks, ProducerProgress,
-    ReplicationProgress, ReplicationStats, ReplicationTicket, ReplicationTransport,
-    RetainedNativeFetchError, RetainedNativeResumeError, RetentionGuard, StreamEngine,
-    native_fetch_cost, native_resume_cost,
+    NativeResumeSinkCacheOperation, NativeResumeUsage, NativeResumeWork, PartitionEpochs,
+    PartitionWatermarks, ProducerProgress, ReplicationProgress, ReplicationStats,
+    ReplicationTicket, ReplicationTransport, RetainedNativeFetchError, RetainedNativeResumeError,
+    RetentionGuard, StreamEngine, native_fetch_cost, native_resume_cost,
 };
 pub use engine_handle::{EngineHandle, WeakEngineHandle};
 pub use error::{EngineError, EngineResult};

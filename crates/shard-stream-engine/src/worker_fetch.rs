@@ -32,6 +32,31 @@ fn observer() -> Option<Observer> {
     OBSERVER.with(|observer| observer.borrow().clone())
 }
 
+#[cfg(test)]
+type PhaseObserver = Arc<dyn Fn(&str, usize) + Send + Sync>;
+#[cfg(test)]
+thread_local! { static PHASE_OBSERVER: RefCell<Option<PhaseObserver>> = RefCell::new(None); }
+#[cfg(test)]
+pub(crate) struct ObservePhases;
+#[cfg(test)]
+impl Drop for ObservePhases {
+    fn drop(&mut self) {
+        PHASE_OBSERVER.with(|observer| *observer.borrow_mut() = None);
+    }
+}
+#[cfg(test)]
+pub(crate) fn observe_phases(callback: PhaseObserver) -> ObservePhases {
+    PHASE_OBSERVER.with(|observer| {
+        assert!(observer.borrow().is_none());
+        *observer.borrow_mut() = Some(callback);
+    });
+    ObservePhases
+}
+#[cfg(test)]
+fn phase_observer() -> Option<PhaseObserver> {
+    PHASE_OBSERVER.with(|observer| observer.borrow().clone())
+}
+
 pub(crate) enum BoundedFetchCompletion {
     Plan {
         lane: usize,
@@ -108,6 +133,8 @@ pub(super) struct Command {
     pub(super) byte_charge: Option<Budgeted<()>>,
     #[cfg(test)]
     observer: Option<Observer>,
+    #[cfg(test)]
+    phase_observer: Option<PhaseObserver>,
     // Last on drop: any actual plan/payload inputs and retained queue charge
     // settle before a fallback completion reports command destruction.
     reply: Reply,
@@ -166,6 +193,8 @@ impl ShardHandle {
             byte_charge: None,
             #[cfg(test)]
             observer: observer(),
+            #[cfg(test)]
+            phase_observer: phase_observer(),
             reply: Reply {
                 lane,
                 shard: self.shard_id,
@@ -214,6 +243,8 @@ impl ShardHandle {
             byte_charge: None,
             #[cfg(test)]
             observer: observer(),
+            #[cfg(test)]
+            phase_observer: phase_observer(),
             reply: Reply {
                 lane,
                 shard: self.shard_id,
@@ -295,6 +326,12 @@ pub(super) fn execute(stores: &mut LaneStores, mut command: Command) {
         observer("entered");
     }
     let lane = command.reply.lane;
+    #[cfg(test)]
+    if matches!(&command.operation, Operation::Read(_))
+        && let Some(observer) = &command.phase_observer
+    {
+        observer("read_entered", lane);
+    }
     let operation = std::mem::replace(&mut command.operation, Operation::Taken);
     let result = match stores.primary.native_mut() {
         Some(primary) => match operation {
@@ -327,6 +364,8 @@ pub(super) fn execute(stores: &mut LaneStores, mut command: Command) {
             shard: command.reply.shard,
         },
     };
+    #[cfg(test)]
+    let published_read = matches!(&result, BoundedFetchCompletion::Read { result: Ok(_), .. });
     let Command {
         operation,
         budget,
@@ -334,6 +373,8 @@ pub(super) fn execute(stores: &mut LaneStores, mut command: Command) {
         reply,
         #[cfg(test)]
         observer,
+        #[cfg(test)]
+        phase_observer,
     } = command;
     drop(operation);
     drop(byte_charge);
@@ -341,4 +382,8 @@ pub(super) fn execute(stores: &mut LaneStores, mut command: Command) {
     #[cfg(test)]
     drop(observer);
     reply.complete(result);
+    #[cfg(test)]
+    if published_read && let Some(observer) = &phase_observer {
+        observer("read_published", lane);
+    }
 }

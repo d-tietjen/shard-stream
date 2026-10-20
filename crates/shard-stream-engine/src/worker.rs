@@ -82,6 +82,8 @@ mod physical_admission_tests;
 mod bounded_fetch;
 #[cfg(test)]
 pub(crate) use bounded_fetch::observe as observe_bounded_fetch;
+#[cfg(test)]
+pub(crate) use bounded_fetch::observe_phases as observe_bounded_fetch_phases;
 pub(crate) use bounded_fetch::{
     BoundedFetchCompletion, DispatchError as BoundedFetchDispatchError,
     PlanInput as BoundedFetchPlanInput, bounded_fetch_command_bytes,

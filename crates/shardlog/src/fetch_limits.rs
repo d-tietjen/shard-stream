@@ -5,6 +5,13 @@
 //! retains the actual storage/engine while every entered physical job settles.
 
 use crate::StorageError;
+#[cfg(unix)]
+use crate::{ShardDirectoryCheckFailure, ShardDirectoryChecks};
+#[cfg(unix)]
+use std::{
+    any::Any,
+    panic::{AssertUnwindSafe, catch_unwind},
+};
 use std::{
     error::Error,
     fmt,
@@ -77,6 +84,26 @@ pub enum StorageFetchFailure {
     Denied,
     /// The actual entered native phase refused within E.
     Storage(StorageError),
+    /// SAME composing checkpoint refused after retaining an actual native error.
+    #[cfg(unix)]
+    Checkpoint {
+        /// The exact ordinary composing checkpoint category.
+        failure: ShardDirectoryCheckFailure,
+        /// Independently completed actual native error, when present.
+        storage_error: Option<StorageError>,
+        /// The original fetch expiry elapsed after this actual outcome.
+        late: bool,
+    },
+    /// SAME composing checkpoint unwound, retaining the original payload.
+    #[cfg(unix)]
+    CheckpointUnwind {
+        /// Original callback unwind value, without formatting or replacement.
+        payload: Box<dyn Any + Send>,
+        /// Independently completed actual native error, when present.
+        storage_error: Option<StorageError>,
+        /// The original fetch expiry elapsed after this actual outcome.
+        late: bool,
+    },
 }
 impl fmt::Display for StorageFetchFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -86,6 +113,10 @@ impl fmt::Display for StorageFetchFailure {
             Self::Poisoned => "native fetch counters poisoned",
             Self::Denied => "native fetch work refused",
             Self::Storage(_) => "native fetch storage phase refused",
+            #[cfg(unix)]
+            Self::Checkpoint { .. } => "native fetch composing checkpoint refused",
+            #[cfg(unix)]
+            Self::CheckpointUnwind { .. } => "native fetch composing checkpoint unwound",
         })
     }
 }
@@ -93,6 +124,15 @@ impl Error for StorageFetchFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Expired(Some(error)) | Self::Storage(error) => Some(error),
+            #[cfg(unix)]
+            Self::Checkpoint {
+                storage_error: Some(error),
+                ..
+            }
+            | Self::CheckpointUnwind {
+                storage_error: Some(error),
+                ..
+            } => Some(error),
             _ => None,
         }
     }
@@ -103,11 +143,58 @@ struct State {
     usage: StorageFetchUsage,
     denied: bool,
 }
-#[derive(Debug)]
 struct Inner {
     limits: StorageFetchLimits,
     expiry: Instant,
     state: Mutex<State>,
+    #[cfg(unix)]
+    checks: Option<Arc<dyn ShardDirectoryChecks + Send + Sync>>,
+}
+
+impl fmt::Debug for Inner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = f.debug_struct("Inner");
+        debug
+            .field("limits", &self.limits)
+            .field("expiry", &self.expiry)
+            .field("state", &self.state);
+        #[cfg(unix)]
+        if self.checks.is_some() {
+            debug.field("checked", &true);
+        }
+        debug.finish()
+    }
+}
+
+#[cfg(unix)]
+enum CheckFailure {
+    Refused(ShardDirectoryCheckFailure),
+    Unwind(Box<dyn Any + Send>),
+}
+#[cfg(unix)]
+impl CheckFailure {
+    fn retain(self, storage_error: Option<StorageError>) -> StorageFetchFailure {
+        match self {
+            Self::Refused(failure) => StorageFetchFailure::Checkpoint {
+                failure,
+                storage_error,
+                late: false,
+            },
+            Self::Unwind(payload) => StorageFetchFailure::CheckpointUnwind {
+                payload,
+                storage_error,
+                late: false,
+            },
+        }
+    }
+}
+#[cfg(unix)]
+fn observe_checks(checks: &(dyn ShardDirectoryChecks + Send + Sync)) -> Result<(), CheckFailure> {
+    match catch_unwind(AssertUnwindSafe(|| checks.check())) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(CheckFailure::Refused(error)),
+        Err(payload) => Err(CheckFailure::Unwind(payload)),
+    }
 }
 
 /// Shared ordinary counters and the same original absolute deadline.
@@ -141,6 +228,8 @@ pub fn storage_fetch_cost(
             size_of::<StorageFetchUsage>(),
         )?,
     )?;
+    #[cfg(unix)]
+    let fixed = checked(fixed, size_of::<CheckFailure>())?;
     let string_bytes = limits.max_declared_bytes;
     let declared_bytes = checked(fixed, limits.max_declared_bytes)?;
     // The actual Inner, budget handle, cost and usage values plus the two
@@ -152,6 +241,8 @@ pub fn storage_fetch_cost(
         size_of::<StorageFetchUsage>(),
     ];
     let entries = checked(limits.max_entries, checked(fixed_values.len(), 2)?)?;
+    #[cfg(unix)]
+    let entries = checked(entries, 1)?;
     Ok(StorageFetchCost {
         declared_bytes,
         entries,
@@ -168,6 +259,35 @@ impl StorageFetchBudget {
         limits: StorageFetchLimits,
         original_expiry: Instant,
     ) -> Result<Self, StorageFetchFailure> {
+        Self::new_inner(
+            limits,
+            original_expiry,
+            #[cfg(unix)]
+            None,
+        )
+    }
+    /// Construct the SAME finite native budget with a deny-only composing check.
+    ///
+    /// The caller must prepay actual setup, retain richer checkpoint failures,
+    /// and keep original owners until every entered job physically settles.
+    /// Checks run without the fetch counter lock and cannot renew limits or E.
+    ///
+    /// # Errors
+    /// Retains a typed checkpoint refusal or original unwind payload, as well as
+    /// ordinary setup/deadline failures. This does not grant serving authority.
+    #[cfg(unix)]
+    pub fn new_with_checks(
+        limits: StorageFetchLimits,
+        original_expiry: Instant,
+        checks: Arc<dyn ShardDirectoryChecks + Send + Sync>,
+    ) -> Result<Self, StorageFetchFailure> {
+        Self::new_inner(limits, original_expiry, Some(checks))
+    }
+    fn new_inner(
+        limits: StorageFetchLimits,
+        original_expiry: Instant,
+        #[cfg(unix)] checks: Option<Arc<dyn ShardDirectoryChecks + Send + Sync>>,
+    ) -> Result<Self, StorageFetchFailure> {
         if Instant::now() >= original_expiry {
             return Err(StorageFetchFailure::Expired(None));
         }
@@ -176,11 +296,27 @@ impl StorageFetchBudget {
             return Err(StorageFetchFailure::Expired(None));
         }
         measured?;
+        #[cfg(unix)]
+        if let Some(checks) = &checks {
+            observe_checks(checks.as_ref()).map_err(|failure| {
+                let failure = failure.retain(None);
+                if Instant::now() >= original_expiry {
+                    failure.late()
+                } else {
+                    failure
+                }
+            })?;
+            if Instant::now() >= original_expiry {
+                return Err(StorageFetchFailure::Expired(None));
+            }
+        }
         let budget = Self {
             inner: Arc::new(Inner {
                 limits,
                 expiry: original_expiry,
                 state: Mutex::new(State::default()),
+                #[cfg(unix)]
+                checks,
             }),
         };
         budget.check()?;
@@ -227,6 +363,42 @@ impl StorageFetchBudget {
         self.charge(declared_bytes, entries, 0, 0, work_bytes)
     }
     pub(crate) fn charge(
+        &self,
+        declared: usize,
+        entries: usize,
+        attempts: usize,
+        read_bytes: usize,
+        work: usize,
+    ) -> Result<(), StorageFetchFailure> {
+        #[cfg(unix)]
+        if let Some(checks) = &self.inner.checks {
+            self.charge_plain(0, 0, 0, 0, 0)?;
+            self.checked_observation(checks.as_ref())?;
+            self.charge_plain(declared, entries, attempts, read_bytes, work)?;
+            self.checked_observation(checks.as_ref())?;
+            return self.charge_plain(0, 0, 0, 0, 0);
+        }
+        self.charge_plain(declared, entries, attempts, read_bytes, work)
+    }
+    #[cfg(unix)]
+    fn checked_observation(
+        &self,
+        checks: &(dyn ShardDirectoryChecks + Send + Sync),
+    ) -> Result<(), StorageFetchFailure> {
+        match observe_checks(checks) {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                self.deny();
+                let failure = failure.retain(None);
+                Err(if Instant::now() >= self.inner.expiry {
+                    failure.late()
+                } else {
+                    failure
+                })
+            }
+        }
+    }
+    fn charge_plain(
         &self,
         declared: usize,
         entries: usize,
@@ -281,6 +453,53 @@ impl StorageFetchBudget {
         &self,
         result: Result<T, StorageError>,
     ) -> Result<T, StorageFetchFailure> {
+        #[cfg(unix)]
+        if let Some(checks) = &self.inner.checks {
+            if Instant::now() >= self.inner.expiry {
+                self.deny();
+                return Err(StorageFetchFailure::Expired(result.err()));
+            }
+            if let Err(failure) = self.charge_plain(0, 0, 0, 0, 0) {
+                // Preserve existing native-error precedence over sibling denial.
+                return match result {
+                    Err(error) => {
+                        self.deny();
+                        Err(StorageFetchFailure::Storage(error))
+                    }
+                    Ok(_) => Err(failure),
+                };
+            }
+            if let Err(failure) = observe_checks(checks.as_ref()) {
+                self.deny();
+                let failure = failure.retain(result.err());
+                return Err(if Instant::now() >= self.inner.expiry {
+                    failure.late()
+                } else {
+                    failure
+                });
+            }
+            let after = self.charge_plain(0, 0, 0, 0, 0);
+            return match result {
+                Ok(value) => {
+                    after?;
+                    Ok(value)
+                }
+                Err(error) => {
+                    self.deny();
+                    if matches!(after, Err(StorageFetchFailure::Expired(_))) {
+                        Err(StorageFetchFailure::Expired(Some(error)))
+                    } else {
+                        Err(StorageFetchFailure::Storage(error))
+                    }
+                }
+            };
+        }
+        self.completed_plain(result)
+    }
+    fn completed_plain<T>(
+        &self,
+        result: Result<T, StorageError>,
+    ) -> Result<T, StorageFetchFailure> {
         if Instant::now() >= self.inner.expiry {
             self.deny();
             return Err(StorageFetchFailure::Expired(result.err()));
@@ -314,6 +533,26 @@ impl StorageFetchFailure {
         match self {
             Self::Storage(error) => Self::Expired(Some(error)),
             Self::Expired(error) => Self::Expired(error),
+            #[cfg(unix)]
+            Self::Checkpoint {
+                failure,
+                storage_error,
+                ..
+            } => Self::Checkpoint {
+                failure,
+                storage_error,
+                late: true,
+            },
+            #[cfg(unix)]
+            Self::CheckpointUnwind {
+                payload,
+                storage_error,
+                ..
+            } => Self::CheckpointUnwind {
+                payload,
+                storage_error,
+                late: true,
+            },
             _ => Self::Expired(None),
         }
     }
@@ -372,3 +611,7 @@ impl Error for StorageFetchReadError {
         Some(&self.failure)
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "fetch_limits_checked_tests.rs"]
+mod checked_tests;

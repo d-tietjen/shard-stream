@@ -1,8 +1,11 @@
 //! Actual bounded callback commands on the existing native sink workers.
 
 use super::*;
-use crate::engine::native_resume::{NativeResumeObservation, NativeResumeRefusal};
+use crate::engine::native_resume::{
+    NativeResumeObservation, NativeResumeRefusal, NativeResumeSinkCacheOperation,
+};
 use std::mem::size_of;
+use std::sync::TryLockError;
 use std::sync::mpsc::SyncSender;
 
 #[derive(Debug)]
@@ -169,7 +172,139 @@ pub(super) struct BoundedCommand {
     reply: Reply,
 }
 
+fn cache_lock_error<T>(error: TryLockError<T>) -> NativeResumeCallbackError {
+    match error {
+        TryLockError::WouldBlock => {
+            NativeResumeCallbackError::queue_full("native sink progress lock")
+        }
+        TryLockError::Poisoned(_) => refused(NativeResumeRefusal::Poisoned),
+    }
+}
+
 impl DurableSinkDispatcher {
+    #[cfg(test)]
+    pub(crate) fn test_lock_dirty(&self) -> std::sync::MutexGuard<'_, HashSet<TopicPartition>> {
+        self.shared.dirty.lock().expect("actual test dirty lock")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_lock_checkpoints(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<TopicPartition, DurableSinkCheckpoint>> {
+        self.shared
+            .checkpoints
+            .lock()
+            .expect("actual test checkpoint lock")
+    }
+    #[cfg(test)]
+    pub(crate) fn test_lock_finalized(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashSet<DurableAtomicGroup>> {
+        self.shared
+            .finalized_groups
+            .lock()
+            .expect("actual test finalized lock")
+    }
+    #[cfg(test)]
+    pub(crate) fn test_cache_growth(
+        &self,
+        groups: bool,
+        work: &NativeResumeWork,
+    ) -> NativeResumeCallbackResult<()> {
+        if groups {
+            let mut finalized = self
+                .shared
+                .finalized_groups
+                .try_lock()
+                .map_err(cache_lock_error)?;
+            reserve_groups(&mut finalized, work)
+        } else {
+            let mut checkpoints = self
+                .shared
+                .checkpoints
+                .try_lock()
+                .map_err(cache_lock_error)?;
+            reserve_map(&mut checkpoints, work, "sink.checkpoints.grow")
+        }
+    }
+
+    pub(crate) fn resume_cache(
+        &self,
+        operation: NativeResumeSinkCacheOperation,
+        work: &NativeResumeWork,
+    ) -> NativeResumeObservation<()> {
+        let actual = catch_unwind(AssertUnwindSafe(|| {
+            work.check().map_err(refused)?;
+            match operation {
+                NativeResumeSinkCacheOperation::ClearDirty(partition) => {
+                    let mut dirty = self.shared.dirty.try_lock().map_err(cache_lock_error)?;
+                    work.check().map_err(refused)?;
+                    work.reserve_table_probe::<TopicPartition>(
+                        dirty.capacity(),
+                        "sink.dirty.remove",
+                    )
+                    .map_err(refused)?;
+                    dirty.remove(&partition);
+                }
+                NativeResumeSinkCacheOperation::Checkpoint(target) => {
+                    let checkpoints = self
+                        .shared
+                        .checkpoints
+                        .try_lock()
+                        .map_err(cache_lock_error)?;
+                    work.check().map_err(refused)?;
+                    work.reserve_table_probe::<(TopicPartition, DurableSinkCheckpoint)>(
+                        checkpoints.capacity(),
+                        "sink.checkpoints.ready",
+                    )
+                    .map_err(refused)?;
+                    if !checkpoints
+                        .get(&target.topic_partition)
+                        .is_some_and(|actual| {
+                            actual.next_placement_sequence >= target.next_placement_sequence
+                                && actual.next_offset >= target.next_offset
+                        })
+                    {
+                        return Err(NativeResumeCallbackError::invalid_state(
+                            "strict sink checkpoint is not physically published",
+                        ));
+                    }
+                }
+                NativeResumeSinkCacheOperation::Decision(group) => {
+                    // This is the SAME AllDurable no-op as resume_decision;
+                    // no atomic provider/cache publication is claimed.
+                    if self.options.atomic_visibility == DurableSinkAtomicVisibility::CommittedOnly
+                    {
+                        let groups = self
+                            .shared
+                            .finalized_groups
+                            .try_lock()
+                            .map_err(cache_lock_error)?;
+                        work.check().map_err(refused)?;
+                        work.reserve_table_probe::<DurableAtomicGroup>(
+                            groups.capacity(),
+                            "sink.groups.ready",
+                        )
+                        .map_err(refused)?;
+                        if !groups.contains(&group) {
+                            return Err(NativeResumeCallbackError::invalid_state(
+                                "strict sink decision is not physically published",
+                            ));
+                        }
+                    }
+                }
+            }
+            // The actual state operation has now completed. Its Ok is saved
+            // before NativeResumeObservation performs the later E check.
+            Ok(())
+        }));
+        let actual = match actual {
+            Ok(result) => result,
+            Err(payload) => Err(NativeResumeCallbackError::from_panic(payload)),
+        };
+        NativeResumeObservation::completed(actual, work)
+    }
+
     pub(crate) fn resume_checkpoint(
         &self,
         partition: TopicPartition,
@@ -336,10 +471,13 @@ fn mul(a: usize, b: usize) -> NativeResumeCallbackResult<usize> {
 fn reserve_map<K: Eq + std::hash::Hash, V>(
     map: &mut HashMap<K, V>,
     work: &NativeResumeWork,
+    site: &'static str,
 ) -> NativeResumeCallbackResult<()> {
     let count = add(map.len(), 1)?;
     let bytes = mul(count, size_of::<(K, V)>())?;
     work.reserve_values(bytes, 0, count, bytes)
+        .map_err(refused)?;
+    work.reserve_table_probe::<(K, V)>(map.capacity(), site)
         .map_err(refused)?;
     work.check().map_err(refused)?;
     let observed = map
@@ -349,7 +487,9 @@ fn reserve_map<K: Eq + std::hash::Hash, V>(
     match (observed, after) {
         (Err(error), _) => Err(error),
         (Ok(()), Err(error)) => Err(refused(error)),
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Ok(())) => work
+            .reserve_capacity_excess::<(K, V)>(map.capacity(), count)
+            .map_err(refused),
     }
 }
 fn publish_checkpoint(
@@ -373,7 +513,7 @@ fn publish_checkpoint(
             ));
         }
     } else {
-        reserve_map(partitions, work)?;
+        reserve_map(partitions, work, "sink.partitions.grow")?;
     }
     work.check().map_err(refused)?;
     work.reserve_table_probe::<(TopicPartition, PartitionDelivery)>(
@@ -408,10 +548,7 @@ fn publish_checkpoint(
         work.check().map_err(refused)?;
     }
     work.check().map_err(refused)?;
-    let mut checkpoints = shared
-        .checkpoints
-        .lock()
-        .map_err(|_| refused(NativeResumeRefusal::Poisoned))?;
+    let mut checkpoints = shared.checkpoints.try_lock().map_err(cache_lock_error)?;
     work.check().map_err(refused)?;
     work.reserve_table_probe::<(TopicPartition, DurableSinkCheckpoint)>(
         checkpoints.capacity(),
@@ -427,7 +564,7 @@ fn publish_checkpoint(
             ));
         }
     } else {
-        reserve_map(&mut checkpoints, work)?;
+        reserve_map(&mut checkpoints, work, "sink.checkpoints.grow")?;
     }
     work.check().map_err(refused)?;
     work.reserve_table_probe::<(TopicPartition, DurableSinkCheckpoint)>(
@@ -442,6 +579,29 @@ fn publish_checkpoint(
     shared.changed.notify_all();
     work.check().map_err(refused)
 }
+fn reserve_groups(
+    groups: &mut HashSet<DurableAtomicGroup>,
+    work: &NativeResumeWork,
+) -> NativeResumeCallbackResult<()> {
+    let count = add(groups.len(), 1)?;
+    let bytes = mul(count, size_of::<DurableAtomicGroup>())?;
+    work.reserve_values(bytes, 0, count, bytes)
+        .map_err(refused)?;
+    work.reserve_table_probe::<DurableAtomicGroup>(groups.capacity(), "sink.groups.grow")
+        .map_err(refused)?;
+    work.check().map_err(refused)?;
+    let observed = groups
+        .try_reserve(1)
+        .map_err(NativeResumeCallbackError::from_allocation);
+    let after = work.check();
+    match (observed, after) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(refused(error)),
+        (Ok(()), Ok(())) => work
+            .reserve_capacity_excess::<DurableAtomicGroup>(groups.capacity(), count)
+            .map_err(refused),
+    }
+}
 fn publish_decision(
     shared: &SharedProgress,
     group: DurableAtomicGroup,
@@ -450,26 +610,13 @@ fn publish_decision(
     work.check().map_err(refused)?;
     let mut groups = shared
         .finalized_groups
-        .lock()
-        .map_err(|_| refused(NativeResumeRefusal::Poisoned))?;
+        .try_lock()
+        .map_err(cache_lock_error)?;
     work.check().map_err(refused)?;
     work.reserve_table_probe::<DurableAtomicGroup>(groups.capacity(), "sink.groups.contains")
         .map_err(refused)?;
     if !groups.contains(&group) {
-        let count = add(groups.len(), 1)?;
-        let bytes = mul(count, size_of::<DurableAtomicGroup>())?;
-        work.reserve_values(bytes, 0, count, bytes)
-            .map_err(refused)?;
-        work.check().map_err(refused)?;
-        let observed = groups
-            .try_reserve(1)
-            .map_err(NativeResumeCallbackError::from_allocation);
-        let after = work.check();
-        match (observed, after) {
-            (Err(error), _) => return Err(error),
-            (Ok(()), Err(error)) => return Err(refused(error)),
-            (Ok(()), Ok(())) => {}
-        }
+        reserve_groups(&mut groups, work)?;
     }
     work.check().map_err(refused)?;
     work.reserve_table_probe::<DurableAtomicGroup>(groups.capacity(), "sink.groups.insert")

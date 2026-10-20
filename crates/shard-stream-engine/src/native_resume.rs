@@ -99,8 +99,65 @@ struct Inner {
     limits: NativeResumeLimits,
     state: Mutex<State>,
     fetch: StorageFetchBudget,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    directory: Option<Arc<DirectoryFetchChecks>>,
     #[cfg(test)]
     probe_observer: Mutex<Option<ProbeObserver>>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+struct DirectoryFetchChecks {
+    directory: Arc<shard_stream_core::NativeDirectoryBudget>,
+    first: std::sync::OnceLock<shard_stream_core::NativeDirectoryFailure>,
+}
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl DirectoryFetchChecks {
+    fn cost() -> Result<(usize, usize), NativeResumeRefusal> {
+        Ok((add(size_of::<Self>(), size_of::<[usize; 2]>())?, 3))
+    }
+    fn new(
+        directory: Arc<shard_stream_core::NativeDirectoryBudget>,
+    ) -> Result<Arc<Self>, shard_stream_core::NativeDirectoryFailure> {
+        let (declared, entries) =
+            Self::cost().map_err(|_| shard_stream_core::NativeDirectoryFailure::Capacity)?;
+        directory.reserve(0, 0, declared, 0, entries, declared)?;
+        directory.check()?;
+        Ok(Arc::new(Self {
+            directory,
+            first: std::sync::OnceLock::new(),
+        }))
+    }
+    fn check_native(&self) -> Result<(), NativeResumeRefusal> {
+        match self.directory.check() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let refusal = match &error {
+                    shard_stream_core::NativeDirectoryFailure::Expired(_) => {
+                        NativeResumeRefusal::Expired
+                    }
+                    shard_stream_core::NativeDirectoryFailure::Capacity => {
+                        NativeResumeRefusal::Capacity
+                    }
+                    shard_stream_core::NativeDirectoryFailure::Poisoned => {
+                        NativeResumeRefusal::Poisoned
+                    }
+                    _ => NativeResumeRefusal::Denied,
+                };
+                let _ = self.first.set(error);
+                Err(refusal)
+            }
+        }
+    }
+    fn first_failure(&self) -> Option<&shard_stream_core::NativeDirectoryFailure> {
+        self.first.get()
+    }
+}
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl ShardDirectoryChecks for DirectoryFetchChecks {
+    fn check(&self) -> Result<(), ShardDirectoryCheckFailure> {
+        self.check_native()
+            .map_err(|_| ShardDirectoryCheckFailure::Refused)
+    }
 }
 
 #[cfg(test)]
@@ -159,6 +216,17 @@ fn add(a: usize, b: usize) -> Result<usize, NativeResumeRefusal> {
 fn mul(a: usize, b: usize) -> Result<usize, NativeResumeRefusal> {
     a.checked_mul(b).ok_or(NativeResumeRefusal::Capacity)
 }
+// Selected bytes 1.12.1 may allocate one Shared header when cloning a
+// promotable Vec-backed Bytes, including a losing promotion CAS. Its fields
+// are a buffer pointer, capacity and AtomicUsize. Prepay every possible clone,
+// even when this particular buffer is static or already shared. Underlying
+// payload ownership is retained separately; allocator metadata/RSS is excluded.
+fn bytes_clone_promotion_bytes(count: usize) -> Result<usize, NativeResumeRefusal> {
+    mul(
+        count,
+        size_of::<(*mut u8, usize, std::sync::atomic::AtomicUsize)>(),
+    )
+}
 impl NativeResumeWork {
     // Pay the actual table's full source-visible element-slot ceiling before
     // each point operation. Growth/movement fees are independent; callers read
@@ -211,8 +279,13 @@ impl NativeResumeWork {
             observer(self, probe);
         }
     }
-    /// The exact original absolute deadline; no duration is refreshed.
+    /// The original absolute deadline, capped only by the SAME directory owner.
+    /// No duration is refreshed and later calls cannot extend its minimum.
     pub fn absolute_expiry(&self) -> Instant {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(directory) = &self.inner.directory {
+            return self.inner.expiry.min(directory.directory.absolute_expiry());
+        }
         self.inner.expiry
     }
     /// The original immutable cumulative allowances.
@@ -276,6 +349,30 @@ impl NativeResumeWork {
             ..Debit::default()
         })
     }
+    /// Reserve one worker or transport job before attempting entry.
+    ///
+    /// This spends the SAME original job allowance and expiry. Queue values,
+    /// allocations and work require their own reservations; entered jobs must
+    /// still physically settle before the producer releases their owners.
+    ///
+    /// # Errors
+    /// Refuses the cumulative job ceiling, checked arithmetic, original
+    /// expiry, poisoned counters or a prior sibling refusal.
+    pub fn reserve_job(&self) -> Result<(), NativeResumeRefusal> {
+        self.charge(Debit {
+            jobs: 1,
+            ..Debit::default()
+        })
+    }
+    pub(crate) fn reserve_capacity_excess<T>(
+        &self,
+        actual_capacity: usize,
+        prepaid_capacity: usize,
+    ) -> Result<(), NativeResumeRefusal> {
+        let extra = actual_capacity.saturating_sub(prepaid_capacity);
+        let bytes = mul(extra, size_of::<T>())?;
+        self.reserve_values(bytes, 0, extra, bytes)
+    }
     pub(crate) fn reserve_command(
         &self,
         declared: usize,
@@ -307,7 +404,14 @@ impl NativeResumeWork {
         })
     }
     fn charge(&self, debit: Debit) -> Result<(), NativeResumeRefusal> {
-        if Instant::now() >= self.inner.expiry {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(directory) = &self.inner.directory
+            && let Err(error) = directory.check_native()
+        {
+            self.inner.fetch.deny();
+            return Err(error);
+        }
+        if Instant::now() >= self.absolute_expiry() {
             return Err(NativeResumeRefusal::Expired);
         }
         let mut state = self
@@ -315,7 +419,7 @@ impl NativeResumeWork {
             .state
             .lock()
             .map_err(|_| NativeResumeRefusal::Poisoned)?;
-        if Instant::now() >= self.inner.expiry {
+        if Instant::now() >= self.absolute_expiry() {
             state.denied = true;
             return Err(NativeResumeRefusal::Expired);
         }
@@ -372,6 +476,10 @@ impl NativeResumeWork {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .denied = true;
         self.inner.fetch.deny();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(directory) = &self.inner.directory {
+            directory.directory.deny();
+        }
     }
 }
 
@@ -666,6 +774,17 @@ impl NativeResumeCoordinatorOutcome {
     }
 }
 
+/// Actual native cache phase selected by strict sink replay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeResumeSinkCacheOperation {
+    /// Retire this partition's actual dirty marker.
+    ClearDirty(TopicPartition),
+    /// Observe the real checkpoint after physically completed strict applies.
+    Checkpoint(DurableSinkCheckpoint),
+    /// Observe the real decision cache after strict finalization.
+    Decision(DurableAtomicGroup),
+}
+
 /// Retained actual native replay observations; none imply serving authority.
 #[derive(Debug)]
 #[allow(
@@ -673,6 +792,13 @@ impl NativeResumeCoordinatorOutcome {
     reason = "retain actual GC store and result custody inline under the existing outcome prepayment"
 )]
 pub enum NativeResumeOutcome {
+    /// Actual finite native cache mutation/observation, retained before post-E.
+    SinkCache {
+        /// Exact native operation and its real target.
+        operation: NativeResumeSinkCacheOperation,
+        /// Actual state result, separately retaining subsequent work refusal.
+        observed: NativeResumeObservation<()>,
+    },
     /// Actual same-lane consuming Core GC completion or retained refusal.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     GarbageCollected {
@@ -741,6 +867,9 @@ struct Scope {
     outcomes: Vec<NativeResumeOutcome>,
     buffered: VecDeque<StoredBatch>,
     fetched_copy: Vec<StoredBatch>,
+    recovered_decisions: HashMap<DurableAtomicGroup, DurableAtomicDecision>,
+    pending_groups: Vec<DurableAtomicGroup>,
+    pending_decisions: Vec<DurableAtomicGroup>,
     current_replica: Option<ReplicaAppend>,
     current_append: Option<DurableAppend>,
     fetch_error: Option<RetainedNativeFetchError>,
@@ -769,6 +898,9 @@ impl Scope {
             outcomes: Vec::new(),
             buffered: VecDeque::new(),
             fetched_copy: Vec::new(),
+            recovered_decisions: HashMap::new(),
+            pending_groups: Vec::new(),
+            pending_decisions: Vec::new(),
             current_replica: None,
             current_append: None,
             fetch_error: None,
@@ -791,6 +923,10 @@ impl Scope {
         }
     }
     fn fail(mut self: Box<Self>, failure: NativeResumeFailure) -> RetainedNativeResumeError {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if self.work.inner.directory.is_some() || self.gc_budget_error.is_none() {
+            let _ = self.finish_directory();
+        }
         self.work.deny();
         self.drain_replication();
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -848,10 +984,6 @@ impl Scope {
         ));
         value.ok_or(NativeResumeFailure::Callback)
     }
-    #[allow(
-        dead_code,
-        reason = "retain this existing bounded resume primitive while its consuming integration remains unavailable"
-    )]
     fn inspect_group(
         &mut self,
         group: DurableAtomicGroup,
@@ -876,10 +1008,6 @@ impl Scope {
         ));
         value.ok_or(NativeResumeFailure::Callback)
     }
-    #[allow(
-        dead_code,
-        reason = "retain this existing bounded resume primitive while its consuming integration remains unavailable"
-    )]
     fn sink_checkpoint(
         &mut self,
         partition: TopicPartition,
@@ -905,25 +1033,29 @@ impl Scope {
         self.work.check()?;
         checkpoint.ok_or(NativeResumeFailure::Callback)
     }
-    #[allow(
-        dead_code,
-        reason = "retain this existing bounded resume primitive while its consuming integration remains unavailable"
-    )]
     fn sink_append(
         &mut self,
         expected: DurableSinkCheckpoint,
         append: DurableAppend,
         next: DurableSinkCheckpoint,
     ) -> Result<(), NativeResumeFailure> {
+        // Move the exact owned input into outside custody before any fee or
+        // clock can refuse. Only the already-paid clone enters the dispatcher.
+        self.current_append = Some(append);
         self.work.reserve_outcomes(1)?;
-        self.work.reserve_values(
+        let current = self
+            .current_append
+            .as_ref()
+            .ok_or(NativeResumeFailure::MissingSink)?;
+        let buffers = 1 + usize::from(current.transient_context.is_some());
+        let values = add(
             size_of::<DurableAppend>() * 2,
-            0,
-            2,
-            size_of::<DurableAppend>() * 2,
+            bytes_clone_promotion_bytes(buffers)?,
         )?;
+        self.work
+            .reserve_values(values, 0, add(2, buffers)?, values)?;
         self.work.check()?;
-        self.current_append = Some(append.clone());
+        let append = current.clone();
         self.work.check()?;
         let Some(dispatcher) = self.owner.durable_sink.as_ref() else {
             return Err(NativeResumeFailure::MissingSink);
@@ -942,10 +1074,6 @@ impl Scope {
         self.current_append.take();
         Ok(())
     }
-    #[allow(
-        dead_code,
-        reason = "retain this existing bounded resume primitive while its consuming integration remains unavailable"
-    )]
     fn sink_decision(
         &mut self,
         decision: DurableAtomicDecision,
@@ -969,10 +1097,6 @@ impl Scope {
             Err(NativeResumeFailure::Callback)
         }
     }
-    #[allow(
-        dead_code,
-        reason = "retain this existing bounded resume primitive while its consuming integration remains unavailable"
-    )]
     fn sink_pending(&mut self) -> Result<Vec<DurableAtomicGroup>, NativeResumeFailure> {
         self.work.reserve_outcomes(1)?;
         self.work.check()?;
@@ -1004,19 +1128,21 @@ impl Scope {
         self.work.reserve_groups(count)?;
         self.work.reserve_values(bytes, 0, add(count, 1)?, bytes)?;
         self.work.check()?;
-        let mut copy = Vec::new();
-        self.setup_allocation_error = copy.try_reserve_exact(count).err();
+        self.pending_groups = Vec::new();
+        self.setup_allocation_error = self.pending_groups.try_reserve_exact(count).err();
         self.work.check()?;
         if self.setup_allocation_error.is_some() {
             return Err(NativeResumeFailure::Allocation);
         }
+        self.work
+            .reserve_capacity_excess::<DurableAtomicGroup>(self.pending_groups.capacity(), count)?;
         for group in groups {
             self.work.check()?;
-            copy.push(*group);
+            self.pending_groups.push(*group);
             self.work.check()?;
         }
         self.work.check()?;
-        Ok(copy)
+        Ok(std::mem::take(&mut self.pending_groups))
     }
     fn fetch_stored(
         &mut self,
@@ -1200,9 +1326,13 @@ pub fn native_resume_cost(
     ]
     .into_iter()
     .try_fold(0usize, add)?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let fixed = add(fixed, DirectoryFetchChecks::cost()?.0)?;
     let outcomes = mul(limits.max_steps, size_of::<NativeResumeOutcome>())?;
     let native_declared = add(add(fixed, outcomes)?, limits.max_declared_bytes)?;
     let native_entries = add(add(limits.max_entries, limits.max_steps)?, 8)?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let native_entries = add(native_entries, DirectoryFetchChecks::cost()?.1)?;
     Ok(NativeResumeCost {
         declared_bytes: add(native_declared, fetch.declared_bytes)?,
         entries: add(native_entries, fetch.entries)?,
@@ -1223,6 +1353,27 @@ fn start(
     limits: NativeResumeLimits,
     expiry: Instant,
 ) -> Result<Box<Scope>, RetainedNativeResumeError> {
+    start_inner(
+        owner,
+        limits,
+        expiry,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        None,
+    )
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "retain the same engine and early refusal without a new allocation"
+)]
+fn start_inner(
+    owner: &EngineHandle,
+    limits: NativeResumeLimits,
+    expiry: Instant,
+    #[cfg(any(target_os = "linux", target_os = "android"))] directory: Option<
+        Arc<DirectoryFetchChecks>,
+    >,
+) -> Result<Box<Scope>, RetainedNativeResumeError> {
     let early = |failure| RetainedNativeResumeError {
         failure,
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1237,8 +1388,17 @@ fn start(
         return Err(early(NativeResumeFailure::Expired));
     }
     measured.map_err(&early)?;
-    let fetch = StorageFetchBudget::new(limits.fetch.storage(), expiry)
-        .map_err(|error| early(NativeResumeFailure::FetchAdmission(error.into())))?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let fetch = if let Some(checks) = &directory {
+        let shared: Arc<dyn ShardDirectoryChecks + Send + Sync> =
+            Arc::clone(checks) as Arc<dyn ShardDirectoryChecks + Send + Sync>;
+        StorageFetchBudget::new_with_checks(limits.fetch.storage(), expiry, shared)
+    } else {
+        StorageFetchBudget::new(limits.fetch.storage(), expiry)
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let fetch = StorageFetchBudget::new(limits.fetch.storage(), expiry);
+    let fetch = fetch.map_err(|error| early(NativeResumeFailure::FetchAdmission(error.into())))?;
     if Instant::now() >= expiry {
         return Err(early(NativeResumeFailure::Expired));
     }
@@ -1251,6 +1411,8 @@ fn start(
                 denied: false,
             }),
             fetch,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            directory,
             #[cfg(test)]
             probe_observer: Mutex::new(None),
         }),
@@ -1263,6 +1425,12 @@ fn start(
     }
     if scope.setup_allocation_error.is_some() {
         return Err(scope.fail(NativeResumeFailure::Allocation));
+    }
+    if let Err(error) = scope
+        .work
+        .reserve_capacity_excess::<NativeResumeOutcome>(scope.outcomes.capacity(), limits.max_steps)
+    {
+        return Err(scope.fail(error.into()));
     }
     Ok(scope)
 }
@@ -1454,12 +1622,15 @@ impl ReplicationReplay for StrictReplication<'_> {
             .fetch_stored(partition, request.start_offset, request.max_bytes)?;
         let count = self.0.buffered.len();
         let bytes = add(
-            mul(count, size_of::<StoredBatch>())?,
+            add(
+                mul(count, size_of::<StoredBatch>())?,
+                bytes_clone_promotion_bytes(count)?,
+            )?,
             size_of::<Vec<StoredBatch>>(),
         )?;
         self.0
             .work
-            .reserve_values(bytes, 0, add(count, 1)?, bytes)?;
+            .reserve_values(bytes, 0, add(mul(count, 2)?, 1)?, bytes)?;
         self.0.work.check()?;
         // Keep the original read body owners in Scope while the shared ordinary
         // loop consumes only charged metadata/Bytes clones. A late/error replay
@@ -1470,6 +1641,9 @@ impl ReplicationReplay for StrictReplication<'_> {
         if self.0.setup_allocation_error.is_some() {
             return Err(NativeResumeFailure::Allocation);
         }
+        self.0
+            .work
+            .reserve_capacity_excess::<StoredBatch>(self.0.fetched_copy.capacity(), count)?;
         for batch in &self.0.buffered {
             self.0.work.check()?;
             self.0.fetched_copy.push(batch.clone());
@@ -1483,15 +1657,23 @@ impl ReplicationReplay for StrictReplication<'_> {
         _required_followers: u32,
     ) -> Result<u32, Self::Error> {
         let batch_id = batch.reservation.batch_id;
+        self.0.current_replica = Some(batch);
         self.0.work.reserve_outcomes(2)?;
-        self.0.work.reserve_command(
+        let current = self
+            .0
+            .current_replica
+            .as_ref()
+            .ok_or(NativeResumeFailure::MissingTransport)?;
+        let buffers = 1 + usize::from(current.extension_context.is_some());
+        let values = add(
             size_of::<ReplicaAppend>() * 2 + size_of::<ReplicationTicket>(),
-            0,
-            3,
-            0,
+            bytes_clone_promotion_bytes(buffers)?,
         )?;
+        self.0
+            .work
+            .reserve_command(values, 0, add(3, buffers)?, 0)?;
         self.0.work.check()?;
-        self.0.current_replica = Some(batch.clone());
+        let batch = current.clone();
         self.0.work.check()?;
         let Some(transport) = self.0.owner.replication.as_ref() else {
             return Err(NativeResumeFailure::MissingTransport);
@@ -1553,6 +1735,26 @@ impl ReplicationReplay for StrictReplication<'_> {
 }
 
 impl Scope {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn finish_directory(&mut self) -> Result<(), NativeResumeFailure> {
+        if let Some(checks) = &self.work.inner.directory {
+            // Record the ACTUAL observation through the same immutable escrow,
+            // including this final phase before any later failure/denial.
+            return checks
+                .check_native()
+                .map_err(|_| NativeResumeFailure::Callback);
+        }
+        // Ordinary/no-checker compatibility: retain the actual original result.
+        if let Some(policy) = &self.gc_policy
+            && let Err(error) = policy.budget.check()
+        {
+            if self.gc_budget_error.is_none() {
+                self.gc_budget_error = Some(error);
+            }
+            return Err(NativeResumeFailure::Callback);
+        }
+        Ok(())
+    }
     #[allow(
         clippy::result_large_err,
         reason = "retain the original engine and actual outcomes without a refusal allocation"
@@ -1570,11 +1772,8 @@ impl Scope {
             return Err(self.fail(error.into()));
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        if let Some(policy) = &self.gc_policy
-            && let Err(error) = policy.budget.check()
-        {
-            self.gc_budget_error = Some(error);
-            return Err(self.fail(NativeResumeFailure::Callback));
+        if let Err(error) = self.finish_directory() {
+            return Err(self.fail(error));
         }
         let outcomes = std::mem::take(&mut self.outcomes);
         Ok(NativeResumeReport {
@@ -1654,9 +1853,16 @@ trait SinkReplay {
     type Error: From<EngineError>;
     fn before_partition(&mut self) -> Result<(), Self::Error>;
     fn before_batch(&mut self) -> Result<(), Self::Error>;
-    fn before_decision_insert(&mut self, existing: usize) -> Result<(), Self::Error>;
+    fn before_decision_insert(
+        &mut self,
+        decisions: &mut HashMap<DurableAtomicGroup, DurableAtomicDecision>,
+    ) -> Result<(), Self::Error>;
     fn before_pending_group(&mut self, partitions: usize) -> Result<(), Self::Error>;
-    fn before_pending_push(&mut self, existing: usize) -> Result<(), Self::Error>;
+    fn before_pending_push(
+        &mut self,
+        pending: &mut Vec<DurableAtomicGroup>,
+    ) -> Result<(), Self::Error>;
+    fn before_decision_scan(&mut self, capacity: usize) -> Result<(), Self::Error>;
     fn checkpoint(
         &mut self,
         partition: TopicPartition,
@@ -1707,13 +1913,19 @@ impl SinkReplay for OrdinarySink<'_> {
     fn before_batch(&mut self) -> EngineResult<()> {
         Ok(())
     }
-    fn before_decision_insert(&mut self, _: usize) -> EngineResult<()> {
+    fn before_decision_insert(
+        &mut self,
+        _: &mut HashMap<DurableAtomicGroup, DurableAtomicDecision>,
+    ) -> EngineResult<()> {
         Ok(())
     }
     fn before_pending_group(&mut self, _: usize) -> EngineResult<()> {
         Ok(())
     }
-    fn before_pending_push(&mut self, _: usize) -> EngineResult<()> {
+    fn before_pending_push(&mut self, _: &mut Vec<DurableAtomicGroup>) -> EngineResult<()> {
+        Ok(())
+    }
+    fn before_decision_scan(&mut self, _: usize) -> EngineResult<()> {
         Ok(())
     }
     fn checkpoint(&mut self, partition: TopicPartition) -> EngineResult<DurableSinkCheckpoint> {
@@ -1776,7 +1988,7 @@ impl SinkReplay for OrdinarySink<'_> {
 }
 // One actual native sink replay algorithm. Ordinary operations above preserve
 // their configured retry/background behavior; strict operations must substitute
-// actual bounded callbacks, native reads and the still-required true lower GC.
+// actual bounded callbacks, native reads, cache observations and consuming Core GC.
 fn replay_sink<R: SinkReplay>(
     replay: &mut R,
     partitions: &[TopicPartition],
@@ -1843,7 +2055,7 @@ fn replay_sink<R: SinkReplay>(
                     let inspection =
                         replay.inspect_atomic_group(topic_partition, group.transaction_id)?;
                     if inspection.state != AtomicGroupState::Unresolved {
-                        replay.before_decision_insert(recovered_decisions.len())?;
+                        replay.before_decision_insert(&mut recovered_decisions)?;
                         recovered_decisions.insert(
                             group,
                             DurableAtomicDecision {
@@ -1856,12 +2068,14 @@ fn replay_sink<R: SinkReplay>(
                 checkpoint = next;
             }
         }
+        replay.before_decision_scan(recovered_decisions.capacity())?;
         for decision in recovered_decisions.values().copied() {
             replay.enqueue_replay_decision(decision)?;
         }
         replay.clear_dirty(topic_partition)?;
         if replay.recovery_mode() == DurableSinkRecoveryMode::Blocking {
             replay.wait_for(checkpoint)?;
+            replay.before_decision_scan(recovered_decisions.capacity())?;
             for group in recovered_decisions.keys().copied() {
                 replay.wait_for_decision(group)?;
             }
@@ -1884,7 +2098,7 @@ fn replay_sink<R: SinkReplay>(
                 outcome: inspection.state,
             };
             replay.enqueue_replay_decision(decision)?;
-            replay.before_pending_push(pending_decisions.len())?;
+            replay.before_pending_push(&mut pending_decisions)?;
             pending_decisions.push(group);
         }
     }
@@ -1912,6 +2126,10 @@ pub(super) fn ordinary_durable_sink(
         max_bytes,
     )
 }
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[path = "native_resume_sink.rs"]
+mod sink;
 
 #[cfg(all(test, unix))]
 #[path = "native_resume_tests.rs"]
