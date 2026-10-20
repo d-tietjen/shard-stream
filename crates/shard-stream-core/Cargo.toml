@@ -11,8 +11,12 @@ description = "Core sequencing and bounded execution primitives for shard-stream
 publish = true
 
 [dependencies]
+bytes.workspace = true
 serde.workspace = true
 shardlog.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
 
 [lints]
 workspace = true

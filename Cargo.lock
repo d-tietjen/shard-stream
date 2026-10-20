@@ -2050,6 +2050,8 @@ dependencies = [
 name = "shard-stream-core"
 version = "0.2.0"
 dependencies = [
+ "bytes",
+ "rustix",
  "serde",
  "shardlog",
 ]
@@ -2058,8 +2060,11 @@ dependencies = [
 name = "shard-stream-engine"
 version = "0.2.0"
 dependencies = [
+ "blake3",
  "bytes",
  "ordered-segment-map",
+ "serde",
+ "serde_json",
  "shard-stream-core",
  "shard-stream-protocol",
  "shardlog",
@@ -2183,6 +2188,7 @@ dependencies = [
  "bytes",
  "crc32fast",
  "fs2",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

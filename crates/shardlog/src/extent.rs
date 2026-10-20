@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{IoSlice, Read, Seek, SeekFrom, Write};
+use std::mem::size_of;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,6 +20,69 @@ use crate::codec::{Decoder, push_u32, push_u64, push_u128};
 use crate::journal::{AtomicGroupSequence, DIGEST_XXH3_128, ProducerSequence};
 use crate::{StorageError, StorageResult};
 
+#[path = "extent_durability.rs"]
+mod durability;
+#[cfg(test)]
+#[path = "extent_durability_tests.rs"]
+mod durability_tests;
+#[path = "extent_fetch.rs"]
+mod fetch;
+#[cfg(unix)]
+#[path = "pinned_directory.rs"]
+mod pinned_directory;
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) use pinned_directory::WriteTrackingPhase;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use pinned_directory::{
+    OpenedPinnedShardStore, PinnedShardFetchChecks, PinnedShardFetchComplete, PinnedShardFetchCost,
+    PinnedShardFetchFailure, PinnedShardFetchObservation, PinnedShardFetchOutcome,
+    PinnedShardFetchPhase, PinnedShardFetchPlan, PinnedShardFetchPlanError,
+    PinnedShardFetchReadError, PinnedStoreDirectoryEntry, PinnedStoreOpenChecks,
+    PinnedStoreOpenCost, PinnedStoreOpenError, PinnedStoreOpenFailure, PinnedStoreOpenLimits,
+    PinnedStoreOpenOutcome, PinnedStoreOpenPhase, PinnedStoreOpenUsage, pinned_shard_fetch_cost,
+    pinned_store_open_cost,
+};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use pinned_directory::{
+    PinnedShardAppendBudget, PinnedShardAppendChecks, PinnedShardAppendCost,
+    PinnedShardAppendError, PinnedShardAppendFailure, PinnedShardAppendInput,
+    PinnedShardAppendLimits, PinnedShardAppendPhase, PinnedShardAppendReport,
+    PinnedShardAppendUsage, pinned_shard_append_cost,
+};
+#[cfg(unix)]
+pub use pinned_directory::{
+    PinnedShardDirectory, PinnedShardDirectoryCost, PinnedShardDirectoryError,
+    PinnedShardDirectoryFailure, PinnedShardDirectoryLimits, PinnedShardDirectoryObservation,
+    ShardDirectoryCheckFailure, ShardDirectoryChecks, pinned_shard_directory_cost,
+};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use pinned_directory::{
+    PinnedShardGcChecks, PinnedShardGcCost, PinnedShardGcError, PinnedShardGcFailure,
+    PinnedShardGcLimits, PinnedShardGcPack, PinnedShardGcPhase, PinnedShardGcReport,
+    PinnedShardGcUsage, pinned_shard_gc_cost,
+};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) use pinned_directory::{
+    TrackedWriteFailure, TrackedWriteLimits, TrackedWriteObservation, tracking_fixed_fee,
+};
+#[cfg(unix)]
+#[path = "guard_acquire.rs"]
+mod guard_acquire;
+#[cfg(unix)]
+pub use guard_acquire::{
+    AcquiredShardRecoveryGuard, RetainedShardGuardAcquireError, ShardGuardAcquireCost,
+    ShardGuardAcquireFailure, ShardGuardAcquireLimits, ShardGuardAcquireObservation,
+    shard_guard_acquire_cost,
+};
+#[cfg(unix)]
+#[path = "guard_validation.rs"]
+mod guard_validation;
+#[cfg(unix)]
+pub use guard_validation::{
+    ShardGuardValidation, ShardGuardValidationCost, ShardGuardValidationError,
+    ShardGuardValidationFailure, ShardGuardValidationLimits, shard_guard_validation_cost,
+};
+
 const EXTENT_MAGIC: &[u8; 4] = b"SSE8";
 const EXTENT_VERSION: u8 = 8;
 const EXTENT_FLAGS: u8 = 0;
@@ -34,6 +98,20 @@ const FETCH_PLAN_INITIAL_CAPACITY: usize = 64;
 const MAX_EXTENTS_PER_WRITE: usize = 128;
 const READ_BUFFER_POOL_SLOTS: usize = 8;
 const MAX_CACHED_READ_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+pub(crate) const fn recovery_header_bytes() -> usize {
+    HEADER_LEN
+}
+
+pub(crate) const fn recovery_frame_minimum() -> usize {
+    HEADER_LEN + CHECKSUM_LEN
+}
+
+pub(crate) fn recovery_frame_ceiling(max_batch_bytes: usize) -> StorageResult<usize> {
+    recovery_frame_minimum()
+        .checked_add(max_batch_bytes)
+        .ok_or_else(|| StorageError::LimitExceeded("extent frame ceiling overflow".into()))
+}
 static NEXT_STORE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -137,10 +215,10 @@ pub struct GarbageCollectionStats {
 }
 
 #[derive(Debug, Clone)]
-struct ExtentLocation {
-    reservation: Reservation,
-    producer: Option<ProducerSequence>,
-    atomic_group: Option<AtomicGroupSequence>,
+pub(crate) struct ExtentLocation {
+    pub(crate) reservation: Reservation,
+    pub(crate) producer: Option<ProducerSequence>,
+    pub(crate) atomic_group: Option<AtomicGroupSequence>,
     pack_sequence: u64,
     payload_offset: u64,
     payload_len: usize,
@@ -155,7 +233,7 @@ struct ActivePack {
 }
 
 #[derive(Debug)]
-struct ReadBufferOwner {
+pub(crate) struct ReadBufferOwner {
     buffer: Option<Vec<u8>>,
     recycle: SyncSender<Vec<u8>>,
     cached_buffers: Arc<AtomicUsize>,
@@ -262,6 +340,37 @@ fn claim_read_buffer_slot(cached_buffers: &AtomicUsize) -> bool {
         .is_ok()
 }
 
+/// Concrete native shard lease retaining the exact pre-open lock inode.
+#[cfg(unix)]
+pub struct ShardRecoveryGuard {
+    file: File,
+    directory: PathBuf,
+}
+
+#[cfg(unix)]
+impl ShardRecoveryGuard {
+    /// Nonblocking acquisition; no new timeout or skipped native lock.
+    pub fn try_acquire(file: File, directory: PathBuf) -> StorageResult<Self> {
+        let result = Self { file, directory };
+        result.validate(&result.directory)?;
+        fs2::FileExt::try_lock_exclusive(&result.file)?;
+        result.validate(&result.directory)?;
+        Ok(result)
+    }
+
+    /// Checks the same concrete lease against the native directory/lock path.
+    pub fn validate(&self, directory: &Path) -> StorageResult<()> {
+        let named = fs::symlink_metadata(directory.join(".shard-store.lock"))?;
+        let actual = self.file.metadata()?;
+        if guard_validation::identity_changed(self, directory, &named, &actual) {
+            return Err(StorageError::InvalidInput(
+                "shard recovery lease identity changed".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct ShardStore {
     config: ShardStoreConfig,
@@ -276,7 +385,44 @@ pub struct ShardStore {
 }
 
 impl ShardStore {
+    /// Fixed logical recovery-open slots, including both native directory scans
+    /// and the actual empty read-buffer queue. This is not allocator/RSS usage.
+    pub const fn recovery_open_fixed_bytes() -> usize {
+        size_of::<Self>()
+            + size_of::<ReadBufferPool>()
+            + READ_BUFFER_POOL_SLOTS * size_of::<Vec<u8>>()
+            + 2 * 65_536
+    }
+
     pub fn open(config: ShardStoreConfig) -> StorageResult<Self> {
+        Self::open_inner(config, None)
+    }
+
+    /// Continues with the SAME native lock held during a pre-open census.
+    #[cfg(unix)]
+    pub fn open_after_census(
+        config: ShardStoreConfig,
+        guard: ShardRecoveryGuard,
+    ) -> StorageResult<Self> {
+        guard.validate(&config.directory)?;
+        Self::open_inner(config, Some(guard.file))
+    }
+
+    /// Continues the same native lease while the recovery owner retains it.
+    ///
+    /// Cloning this descriptor preserves the same open-file-description lock;
+    /// it neither opens the pathname nor acquires a second lease. The recovery
+    /// owner retains its original guard even if native repair refuses.
+    #[cfg(unix)]
+    pub fn open_under_census(
+        config: ShardStoreConfig,
+        guard: &ShardRecoveryGuard,
+    ) -> StorageResult<Self> {
+        guard.validate(&config.directory)?;
+        Self::open_inner(config, Some(guard.file.try_clone()?))
+    }
+
+    fn open_inner(config: ShardStoreConfig, held_lock: Option<File>) -> StorageResult<Self> {
         config.validate()?;
         let directory_existed = config.directory.exists();
         fs::create_dir_all(&config.directory)?;
@@ -285,15 +431,23 @@ impl ShardStore {
         }
         let lock_path = config.directory.join(".shard-store.lock");
         let lock_existed = lock_path.exists();
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(lock_path)?;
-        fs2::FileExt::try_lock_exclusive(&lock_file).map_err(|error| {
-            StorageError::InvalidInput(format!("shard store directory is already open: {error}"))
-        })?;
+        let lock_file = match held_lock {
+            Some(file) => file,
+            None => {
+                let file = OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(lock_path)?;
+                fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
+                    StorageError::InvalidInput(format!(
+                        "shard store directory is already open: {error}"
+                    ))
+                })?;
+                file
+            }
+        };
         if !lock_existed {
             lock_file.sync_all()?;
             sync_directory(&config.directory)?;
@@ -360,6 +514,147 @@ impl ShardStore {
             pack_paths,
             read_buffer_pool: ReadBufferPool::new(),
         })
+    }
+
+    /// Native primary opening under an already-admitted absolute recovery expiry.
+    /// No clock, ownership or serving permission is created by this storage API.
+    #[cfg(unix)]
+    pub fn open_until(config: ShardStoreConfig, expiry: Instant) -> StorageResult<Self> {
+        Self::open_inner_until(config, None, expiry)
+    }
+
+    /// Continues the SAME native lease, checking E across pack scan/repair phases.
+    #[cfg(unix)]
+    pub fn open_under_census_until(
+        config: ShardStoreConfig,
+        guard: &ShardRecoveryGuard,
+        expiry: Instant,
+    ) -> StorageResult<Self> {
+        recovery_gc_clock(expiry)?;
+        guard.validate(&config.directory)?;
+        recovery_gc_clock(expiry)?;
+        Self::open_inner_until(config, Some(guard.file.try_clone()?), expiry)
+    }
+
+    #[cfg(unix)]
+    fn open_inner_until(
+        config: ShardStoreConfig,
+        held_lock: Option<File>,
+        expiry: Instant,
+    ) -> StorageResult<Self> {
+        recovery_gc_clock(expiry)?;
+        config.validate()?;
+        recovery_gc_clock(expiry)?;
+        let directory_existed = config.directory.exists();
+        recovery_gc_clock(expiry)?;
+        fs::create_dir_all(&config.directory)?;
+        if !directory_existed && let Some(parent) = config.directory.parent() {
+            recovery_gc_clock(expiry)?;
+            sync_directory(parent)?;
+        }
+        recovery_gc_clock(expiry)?;
+        let lock_path = config.directory.join(".shard-store.lock");
+        let lock_existed = lock_path.exists();
+        recovery_gc_clock(expiry)?;
+        let lock_file = match held_lock {
+            Some(file) => file,
+            None => {
+                recovery_gc_clock(expiry)?;
+                let file = OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(lock_path)?;
+                recovery_gc_clock(expiry)?;
+                fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
+                    StorageError::InvalidInput(format!(
+                        "shard store directory is already open: {error}"
+                    ))
+                })?;
+                file
+            }
+        };
+        if !lock_existed {
+            recovery_gc_clock(expiry)?;
+            lock_file.sync_all()?;
+            recovery_gc_clock(expiry)?;
+            sync_directory(&config.directory)?;
+        }
+        cleanup_pending_pack_deletions_until(&config.directory, expiry)?;
+        let mut pack_paths = discover_packs_until(&config.directory, expiry)?;
+        if pack_paths.is_empty() {
+            let path = pack_path(&config.directory, 0);
+            recovery_gc_clock(expiry)?;
+            OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            pack_paths.insert(0, path);
+            recovery_gc_clock(expiry)?;
+            sync_directory(&config.directory)?;
+        }
+
+        let last_sequence = *pack_paths.last_key_value().expect("pack map is nonempty").0;
+        let mut index: HashMap<TopicPartition, Vec<ExtentLocation>> = HashMap::new();
+        let mut by_batch = HashMap::new();
+        for (&sequence, path) in &pack_paths {
+            recovery_gc_clock(expiry)?;
+            let permit_tail_repair = sequence == last_sequence;
+            scan_pack_until(
+                path,
+                sequence,
+                config.shard_id,
+                config.max_batch_bytes,
+                permit_tail_repair,
+                &mut index,
+                &mut by_batch,
+                expiry,
+            )?;
+        }
+        for locations in index.values_mut() {
+            recovery_gc_clock(expiry)?;
+            locations.sort_by_key(|location| location.reservation.first_offset);
+        }
+
+        recovery_gc_clock(expiry)?;
+        let active_path = pack_paths
+            .get(&last_sequence)
+            .expect("last pack exists")
+            .clone();
+        recovery_gc_clock(expiry)?;
+        let active_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&active_path)?;
+        recovery_gc_clock(expiry)?;
+        let active_bytes = active_file.metadata()?.len();
+        recovery_gc_clock(expiry)?;
+        let store_token = NEXT_STORE_TOKEN
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
+                token.checked_add(1)
+            })
+            .map_err(|_| StorageError::LimitExceeded("store token space exhausted".into()))?;
+        recovery_gc_clock(expiry)?;
+        let result = Self {
+            config,
+            _lock_file: lock_file,
+            store_token,
+            plan_epoch: 0,
+            active: ActivePack {
+                sequence: last_sequence,
+                file: active_file,
+                bytes: active_bytes,
+                opened_at: Instant::now(),
+            },
+            index,
+            by_batch,
+            pack_paths,
+            read_buffer_pool: ReadBufferPool::new(),
+        };
+        recovery_gc_clock(expiry)?;
+        Ok(result)
     }
 
     pub fn append(
@@ -447,16 +742,7 @@ impl ShardStore {
         let mut group_keys = HashSet::with_capacity(prepared.len());
         for extent in prepared {
             self.validate_append(extent.reservation, &extent.payload)?;
-            let key = (
-                TopicPartition::new(extent.reservation.topic_id, extent.reservation.partition_id),
-                extent.reservation.batch_id,
-            );
-            if !group_keys.insert(key) {
-                return Err(StorageError::InvalidInput(format!(
-                    "batch {} appears more than once in an append group",
-                    extent.reservation.batch_id
-                )));
-            }
+            validate_prepared_group_key(&mut group_keys, extent.reservation)?;
         }
 
         let mut first = 0usize;
@@ -473,20 +759,13 @@ impl ShardStore {
                 self.rotate()?;
             }
 
-            let mut end = first;
-            let mut pack_bytes = self.active.bytes;
-            while end < prepared.len() && end - first < MAX_EXTENTS_PER_WRITE {
-                let frame_len = u64::try_from(prepared[end].encoded.frame_len)
-                    .map_err(|_| StorageError::LimitExceeded("extent frame exceeds u64".into()))?;
-                let next = pack_bytes
-                    .checked_add(frame_len)
-                    .ok_or_else(|| StorageError::LimitExceeded("pack length overflow".into()))?;
-                if pack_bytes > 0 && next > self.config.target_pack_bytes {
-                    break;
-                }
-                pack_bytes = next;
-                end += 1;
-            }
+            let end = prepared_segment_end(
+                first,
+                prepared.len(),
+                self.active.bytes,
+                self.config.target_pack_bytes,
+                |index| prepared[index].encoded.frame_len,
+            )?;
             debug_assert!(end > first);
             self.append_prepared_segment(&prepared[first..end])?;
             first = end;
@@ -603,14 +882,8 @@ impl ShardStore {
 
         let mut next_frame_offset = frame_offset;
         for extent in prepared {
-            let location = ExtentLocation {
-                reservation: extent.reservation,
-                producer: extent.producer,
-                atomic_group: extent.atomic_group,
-                pack_sequence: self.active.sequence,
-                payload_offset: next_frame_offset + HEADER_LEN as u64,
-                payload_len: extent.payload.len(),
-            };
+            let location =
+                prepared_extent_location(extent, self.active.sequence, next_frame_offset);
             self.install_location(location);
             next_frame_offset = next_frame_offset
                 .checked_add(extent.encoded.frame_len as u64)
@@ -667,104 +940,6 @@ impl ShardStore {
         Ok(self.read_fetch_plan(&[planned])?.pop())
     }
 
-    pub fn plan_fetch(
-        &self,
-        topic_partition: TopicPartition,
-        start_offset: LogicalOffset,
-        max_bytes: usize,
-        max_batches: usize,
-    ) -> StorageResult<Vec<StoredBatchMetadata>> {
-        if max_bytes == 0 || max_batches == 0 {
-            return Err(StorageError::InvalidInput(
-                "fetch byte and batch limits must be nonzero".into(),
-            ));
-        }
-        let Some(locations) = self.index.get(&topic_partition) else {
-            return Ok(Vec::new());
-        };
-
-        let first =
-            locations.partition_point(|location| location.reservation.last_offset < start_offset);
-        let capacity = FETCH_PLAN_INITIAL_CAPACITY
-            .min(max_batches)
-            .min(locations.len().saturating_sub(first));
-        let mut result = Vec::with_capacity(capacity);
-        let mut used = 0usize;
-        for location in &locations[first..] {
-            if result.len() == max_batches {
-                break;
-            }
-            let next = used
-                .checked_add(location.payload_len)
-                .ok_or_else(|| StorageError::LimitExceeded("fetch byte count overflow".into()))?;
-            if !result.is_empty() && next > max_bytes {
-                break;
-            }
-            result.push(self.metadata_for(location));
-            used = next;
-        }
-        Ok(result)
-    }
-
-    pub fn read_fetch_plan(
-        &mut self,
-        planned: &[StoredBatchMetadata],
-    ) -> StorageResult<Vec<StoredBatch>> {
-        if planned.iter().any(|metadata| {
-            metadata.store_token != self.store_token || metadata.plan_epoch != self.plan_epoch
-        }) {
-            return Err(StorageError::InvalidInput(
-                "fetch plan does not belong to the current store generation".into(),
-            ));
-        }
-        let mut result = Vec::with_capacity(planned.len());
-        let mut first = 0usize;
-        while first < planned.len() {
-            let mut end = first + 1;
-            let mut range_end = payload_end(&planned[first])?;
-            while end < planned.len() {
-                let next = planned[end];
-                if next.pack_sequence != planned[first].pack_sequence
-                    || next.payload_offset < range_end
-                    || next.payload_offset - range_end > MAX_COALESCED_READ_GAP
-                {
-                    break;
-                }
-                range_end = payload_end(&next)?;
-                end += 1;
-            }
-
-            let range_start = planned[first].payload_offset;
-            let range_len = usize::try_from(range_end - range_start)
-                .map_err(|_| StorageError::LimitExceeded("fetch range exceeds usize".into()))?;
-            let reader = self.open_pack_reader(planned[first].pack_sequence)?;
-            let mut buffer = self.read_buffer_pool.take(range_len);
-            if let Err(error) = read_exact_at(&reader, &mut buffer, range_start) {
-                self.read_buffer_pool.recycle_now(buffer);
-                return Err(error.into());
-            }
-            let buffer = self.read_buffer_pool.lease_bytes(buffer);
-
-            for metadata in &planned[first..end] {
-                let payload_start = usize::try_from(metadata.payload_offset - range_start)
-                    .map_err(|_| {
-                        StorageError::LimitExceeded("payload offset exceeds usize".into())
-                    })?;
-                let payload_end = payload_start
-                    .checked_add(metadata.payload_len)
-                    .ok_or_else(|| StorageError::LimitExceeded("payload range overflow".into()))?;
-                result.push(StoredBatch {
-                    reservation: metadata.reservation,
-                    producer: metadata.producer,
-                    atomic_group: metadata.atomic_group,
-                    payload: buffer.slice(payload_start..payload_end),
-                });
-            }
-            first = end;
-        }
-        Ok(result)
-    }
-
     pub fn fetch(
         &mut self,
         topic_partition: TopicPartition,
@@ -773,6 +948,30 @@ impl ShardStore {
     ) -> StorageResult<Vec<StoredBatch>> {
         let planned = self.plan_fetch(topic_partition, start_offset, max_bytes, usize::MAX)?;
         self.read_fetch_plan(&planned)
+    }
+
+    /// Actual native catalog count before a bounded caller materializes a copy.
+    #[must_use]
+    pub fn recovery_catalog_len(&self) -> usize {
+        self.by_batch.len()
+    }
+
+    /// Actual table shape and source-visible fee for one complete values scan.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn log_catalog_shape(&self) -> Option<(usize, usize, usize)> {
+        let width = size_of::<((TopicPartition, BatchId), ExtentLocation)>().max(1);
+        let scan = self
+            .by_batch
+            .capacity()
+            .checked_add(1)?
+            .checked_mul(width)?;
+        Some((self.by_batch.len(), self.by_batch.capacity(), scan))
+    }
+
+    /// Borrow actual reservations after the caller pays the complete table scan.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn log_catalog_reservations(&self) -> impl Iterator<Item = Reservation> + '_ {
+        self.by_batch.values().map(|location| location.reservation)
     }
 
     #[must_use]
@@ -797,6 +996,55 @@ impl ShardStore {
             )
         });
         entries
+    }
+
+    /// Materializes the native catalog under the original admitted recovery E.
+    #[cfg(unix)]
+    pub fn catalog_until(&self, expiry: Instant) -> StorageResult<Vec<ExtentCatalogEntry>> {
+        recovery_gc_clock(expiry)?;
+        let mut entries = Vec::with_capacity(self.by_batch.len());
+        for location in self.by_batch.values() {
+            recovery_gc_clock(expiry)?;
+            entries.push(ExtentCatalogEntry {
+                reservation: location.reservation,
+                producer: location.producer,
+                atomic_group: location.atomic_group,
+                payload_bytes: location.payload_len as u64,
+                pack_sequence: location.pack_sequence,
+                object_durable: false,
+            });
+        }
+        recovery_gc_clock(expiry)?;
+        entries.sort_by_key(|entry| {
+            (
+                entry.reservation.topic_id,
+                entry.reservation.partition_id,
+                entry.reservation.first_offset,
+            )
+        });
+        recovery_gc_clock(expiry)?;
+        Ok(entries)
+    }
+
+    /// Discovers actual sealed pack metadata without renewing recovery expiry.
+    #[cfg(unix)]
+    pub fn sealed_packs_until(&self, expiry: Instant) -> StorageResult<Vec<SealedPack>> {
+        recovery_gc_clock(expiry)?;
+        let mut packs = Vec::new();
+        for (&sequence, path) in self.pack_paths.range(..self.active.sequence) {
+            recovery_gc_clock(expiry)?;
+            let bytes = path.metadata()?.len();
+            recovery_gc_clock(expiry)?;
+            if bytes > 0 {
+                packs.push(SealedPack {
+                    sequence,
+                    path: path.clone(),
+                    bytes,
+                });
+            }
+        }
+        recovery_gc_clock(expiry)?;
+        Ok(packs)
     }
 
     pub fn sync(&mut self) -> StorageResult<()> {
@@ -854,14 +1102,9 @@ impl ShardStore {
                     .filter(|location| location.pack_sequence == sequence)
                     .collect::<Vec<_>>();
                 (!locations.is_empty()
-                    && locations.iter().all(|location| {
-                        log_starts
-                            .get(&TopicPartition::new(
-                                location.reservation.topic_id,
-                                location.reservation.partition_id,
-                            ))
-                            .is_some_and(|log_start| location.reservation.last_offset < *log_start)
-                    }))
+                    && locations
+                        .iter()
+                        .all(|location| gc_location_before_start(location, log_starts)))
                 .then(|| (sequence, path.clone(), locations.len() as u64))
             })
             .collect::<Vec<_>>();
@@ -891,6 +1134,76 @@ impl ShardStore {
             stats.extents_removed = stats.extents_removed.saturating_add(extents);
             stats.bytes_removed = stats.bytes_removed.saturating_add(bytes);
         }
+        Ok(stats)
+    }
+
+    /// Applies native pack GC under a retained operation's original Instant.
+    ///
+    /// This changes no retention policy. A late error may leave a real native
+    /// gc-pending tombstone; normal recovery keeps its existing cleanup rules.
+    #[cfg(unix)]
+    pub fn garbage_collect_until(
+        &mut self,
+        log_starts: &HashMap<TopicPartition, LogicalOffset>,
+        expiry: Instant,
+    ) -> StorageResult<GarbageCollectionStats> {
+        recovery_gc_clock(expiry)?;
+        let mut removable = Vec::new();
+        for (&sequence, path) in self.pack_paths.range(..self.active.sequence) {
+            recovery_gc_clock(expiry)?;
+            let locations = self
+                .by_batch
+                .values()
+                .filter(|location| location.pack_sequence == sequence)
+                .collect::<Vec<_>>();
+            recovery_gc_clock(expiry)?;
+            if !locations.is_empty()
+                && locations
+                    .iter()
+                    .all(|location| gc_location_before_start(location, log_starts))
+            {
+                recovery_gc_clock(expiry)?;
+                removable.push((sequence, path.clone(), locations.len() as u64));
+            }
+        }
+        recovery_gc_clock(expiry)?;
+        if !removable.is_empty() {
+            self.plan_epoch = self
+                .plan_epoch
+                .checked_add(1)
+                .ok_or_else(|| StorageError::LimitExceeded("fetch plan epoch exhausted".into()))?;
+        }
+        let mut stats = GarbageCollectionStats::default();
+        for (sequence, path, extents) in removable {
+            recovery_gc_clock(expiry)?;
+            let bytes = path.metadata()?.len();
+            recovery_gc_clock(expiry)?;
+            let tombstone = pending_pack_deletion_path(&path);
+            recovery_gc_clock(expiry)?;
+            fs::rename(&path, &tombstone)?;
+            #[cfg(test)]
+            recovery_gc_test_step("renamed");
+            recovery_gc_clock(expiry)?;
+            sync_directory(&self.config.directory)?;
+            recovery_gc_clock(expiry)?;
+            self.pack_paths.remove(&sequence);
+            self.by_batch
+                .retain(|_, location| location.pack_sequence != sequence);
+            for locations in self.index.values_mut() {
+                recovery_gc_clock(expiry)?;
+                locations.retain(|location| location.pack_sequence != sequence);
+            }
+            self.index.retain(|_, locations| !locations.is_empty());
+            recovery_gc_clock(expiry)?;
+            fs::remove_file(tombstone)?;
+            recovery_gc_clock(expiry)?;
+            sync_directory(&self.config.directory)?;
+            recovery_gc_clock(expiry)?;
+            stats.packs_removed = stats.packs_removed.saturating_add(1);
+            stats.extents_removed = stats.extents_removed.saturating_add(extents);
+            stats.bytes_removed = stats.bytes_removed.saturating_add(bytes);
+        }
+        recovery_gc_clock(expiry)?;
         Ok(stats)
     }
 
@@ -957,36 +1270,6 @@ impl ShardStore {
     }
 }
 
-fn payload_end(metadata: &StoredBatchMetadata) -> StorageResult<u64> {
-    metadata
-        .payload_offset
-        .checked_add(
-            u64::try_from(metadata.payload_len)
-                .map_err(|_| StorageError::LimitExceeded("payload length exceeds u64".into()))?,
-        )
-        .ok_or_else(|| StorageError::LimitExceeded("payload end overflow".into()))
-}
-
-fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> std::io::Result<()> {
-    while !buffer.is_empty() {
-        match file.read_at(buffer, offset)? {
-            0 => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "planned extent ended before its payload",
-                ));
-            }
-            read => {
-                offset = offset
-                    .checked_add(read as u64)
-                    .ok_or_else(|| std::io::Error::other("read offset overflow"))?;
-                buffer = &mut buffer[read..];
-            }
-        }
-    }
-    Ok(())
-}
-
 #[derive(Debug)]
 struct EncodedExtent {
     header: Vec<u8>,
@@ -1000,31 +1283,115 @@ fn encode_extent(
     atomic_group: Option<AtomicGroupSequence>,
     payload: &[u8],
 ) -> StorageResult<EncodedExtent> {
+    let (frame_len, frame_len_u64, payload_len_u64) = extent_frame_lengths(payload.len())?;
+    let mut header = Vec::with_capacity(HEADER_LEN);
+    encode_extent_header(
+        &mut header,
+        reservation,
+        producer,
+        atomic_group,
+        frame_len_u64,
+        payload_len_u64,
+    )?;
+    Ok(EncodedExtent {
+        checksum: extent_checksum(&header, payload).to_le_bytes(),
+        header,
+        frame_len,
+    })
+}
+
+fn prepared_extent_location(
+    extent: &PreparedExtent,
+    pack_sequence: u64,
+    frame_offset: u64,
+) -> ExtentLocation {
+    ExtentLocation {
+        reservation: extent.reservation,
+        producer: extent.producer,
+        atomic_group: extent.atomic_group,
+        pack_sequence,
+        payload_offset: frame_offset + HEADER_LEN as u64,
+        payload_len: extent.payload.len(),
+    }
+}
+
+fn validate_prepared_group_key(
+    group_keys: &mut HashSet<(TopicPartition, BatchId)>,
+    reservation: Reservation,
+) -> StorageResult<()> {
+    let key = (
+        TopicPartition::new(reservation.topic_id, reservation.partition_id),
+        reservation.batch_id,
+    );
+    if !group_keys.insert(key) {
+        return Err(StorageError::InvalidInput(format!(
+            "batch {} appears more than once in an append group",
+            reservation.batch_id
+        )));
+    }
+    Ok(())
+}
+
+fn prepared_segment_end(
+    first: usize,
+    total: usize,
+    active_bytes: u64,
+    target_pack_bytes: u64,
+    mut frame_len: impl FnMut(usize) -> usize,
+) -> StorageResult<usize> {
+    let mut end = first;
+    let mut pack_bytes = active_bytes;
+    while end < total && end - first < MAX_EXTENTS_PER_WRITE {
+        let frame_len = u64::try_from(frame_len(end))
+            .map_err(|_| StorageError::LimitExceeded("extent frame exceeds u64".into()))?;
+        let next = pack_bytes
+            .checked_add(frame_len)
+            .ok_or_else(|| StorageError::LimitExceeded("pack length overflow".into()))?;
+        if pack_bytes > 0 && next > target_pack_bytes {
+            break;
+        }
+        pack_bytes = next;
+        end += 1;
+    }
+    Ok(end)
+}
+
+fn extent_frame_lengths(payload_len: usize) -> StorageResult<(usize, u64, u64)> {
     let frame_len = HEADER_LEN
-        .checked_add(payload.len())
+        .checked_add(payload_len)
         .and_then(|value| value.checked_add(CHECKSUM_LEN))
         .ok_or_else(|| StorageError::LimitExceeded("extent frame length overflow".into()))?;
     let frame_len_u64 = u64::try_from(frame_len)
         .map_err(|_| StorageError::LimitExceeded("extent frame exceeds u64".into()))?;
-    let payload_len_u64 = u64::try_from(payload.len())
+    let payload_len_u64 = u64::try_from(payload_len)
         .map_err(|_| StorageError::LimitExceeded("payload exceeds u64".into()))?;
 
-    let mut header = Vec::with_capacity(HEADER_LEN);
+    Ok((frame_len, frame_len_u64, payload_len_u64))
+}
+
+fn encode_extent_header(
+    header: &mut Vec<u8>,
+    reservation: Reservation,
+    producer: Option<ProducerSequence>,
+    atomic_group: Option<AtomicGroupSequence>,
+    frame_len_u64: u64,
+    payload_len_u64: u64,
+) -> StorageResult<()> {
     header.extend_from_slice(EXTENT_MAGIC);
     header.push(EXTENT_VERSION);
     header.push(EXTENT_FLAGS);
     header.extend_from_slice(&(HEADER_LEN as u16).to_le_bytes());
-    push_u64(&mut header, frame_len_u64);
-    push_u128(&mut header, reservation.topic_id.get());
-    push_u32(&mut header, reservation.partition_id.get());
-    push_u128(&mut header, reservation.batch_id.get());
-    push_u64(&mut header, reservation.first_offset.get());
-    push_u64(&mut header, reservation.last_offset.get());
-    push_u32(&mut header, reservation.record_count.get());
-    push_u32(&mut header, reservation.placement.virtual_lane_id.get());
-    push_u64(&mut header, reservation.placement.ring_epoch.get());
-    push_u64(&mut header, reservation.placement.leader_epoch.get());
-    push_u64(&mut header, reservation.placement.sequence.get());
+    push_u64(header, frame_len_u64);
+    push_u128(header, reservation.topic_id.get());
+    push_u32(header, reservation.partition_id.get());
+    push_u128(header, reservation.batch_id.get());
+    push_u64(header, reservation.first_offset.get());
+    push_u64(header, reservation.last_offset.get());
+    push_u32(header, reservation.record_count.get());
+    push_u32(header, reservation.placement.virtual_lane_id.get());
+    push_u64(header, reservation.placement.ring_epoch.get());
+    push_u64(header, reservation.placement.leader_epoch.get());
+    push_u64(header, reservation.placement.sequence.get());
     match producer {
         Some(producer) => {
             if producer.digest_algorithm != DIGEST_XXH3_128 {
@@ -1034,9 +1401,9 @@ fn encode_extent(
             }
             header.push(1);
             header.extend_from_slice(&[0; 3]);
-            push_u128(&mut header, producer.producer_id);
-            push_u32(&mut header, producer.epoch);
-            push_u64(&mut header, producer.first_sequence);
+            push_u128(header, producer.producer_id);
+            push_u32(header, producer.epoch);
+            push_u64(header, producer.first_sequence);
             header.push(producer.digest_algorithm);
             header.extend_from_slice(&[0; 3]);
             header.extend_from_slice(&producer.payload_digest);
@@ -1044,7 +1411,7 @@ fn encode_extent(
                 Some(event_id) => {
                     header.push(1);
                     header.extend_from_slice(&[0; 3]);
-                    push_u128(&mut header, event_id.get());
+                    push_u128(header, event_id.get());
                 }
                 None => header.extend_from_slice(&[0; 20]),
             }
@@ -1055,19 +1422,15 @@ fn encode_extent(
         Some(group) => {
             header.push(1);
             header.extend_from_slice(&[0; 3]);
-            push_u128(&mut header, group.transaction_id);
-            push_u64(&mut header, group.chunk_sequence);
+            push_u128(header, group.transaction_id);
+            push_u64(header, group.chunk_sequence);
             header.extend_from_slice(&group.payload_digest);
         }
         None => header.extend_from_slice(&[0; GROUP_FIXED_LEN]),
     }
-    push_u64(&mut header, payload_len_u64);
+    push_u64(header, payload_len_u64);
     debug_assert_eq!(header.len(), HEADER_LEN);
-    Ok(EncodedExtent {
-        checksum: extent_checksum(&header, payload).to_le_bytes(),
-        header,
-        frame_len,
-    })
+    Ok(())
 }
 
 fn extent_checksum(header: &[u8], payload: &[u8]) -> u64 {
@@ -1120,7 +1483,7 @@ fn write_all_vectored(writer: &mut impl Write, buffers: &mut [IoSlice<'_>]) -> s
     Ok(())
 }
 
-fn decode_extent(
+pub(crate) fn decode_extent(
     path: &Path,
     frame_offset: u64,
     frame: &[u8],
@@ -1147,6 +1510,56 @@ fn decode_extent(
     }
 
     let mut decoder = Decoder::new(&frame[PREFIX_LEN..frame.len() - CHECKSUM_LEN]);
+    let header = decode_extent_header(path, frame_offset, &mut decoder)?;
+    if decoder.take(header.payload_len).is_err() || !decoder.is_empty() {
+        return Err(StorageError::corrupt(
+            path,
+            frame_offset,
+            "payload length does not match frame",
+        ));
+    }
+
+    Ok(ExtentLocation {
+        reservation: header.reservation,
+        producer: header.producer,
+        atomic_group: header.atomic_group,
+        pack_sequence: 0,
+        payload_offset: frame_offset + HEADER_LEN as u64,
+        payload_len: header.payload_len,
+    })
+}
+
+// Complete borrowed inspection reuses the unchanged native decoder above.
+// The payload range belongs to this codec, rather than an external SSE8 layout.
+pub(crate) fn decode_extent_payload<'a>(
+    path: &Path,
+    frame_offset: u64,
+    frame: &'a [u8],
+) -> StorageResult<(ExtentLocation, &'a [u8])> {
+    let location = decode_extent(path, frame_offset, frame, ShardId::new(0))?;
+    let mut payload = Decoder::new(&frame[HEADER_LEN..frame.len() - CHECKSUM_LEN]);
+    let bytes = payload.take(location.payload_len)?;
+    debug_assert!(
+        payload.is_empty(),
+        "native decode consumed the complete payload"
+    );
+    Ok((location, bytes))
+}
+
+pub(crate) struct DecodedExtentHeader {
+    pub(crate) reservation: Reservation,
+    pub(crate) producer: Option<ProducerSequence>,
+    pub(crate) atomic_group: Option<AtomicGroupSequence>,
+    pub(crate) payload_len: usize,
+}
+
+// One native fixed-header decoder, shared with incomplete-tail observation.
+// Complete decode calls this only AFTER its original checksum validation.
+pub(crate) fn decode_extent_header(
+    path: &Path,
+    frame_offset: u64,
+    decoder: &mut Decoder<'_>,
+) -> StorageResult<DecodedExtentHeader> {
     let topic_id = TopicId::new(decoder.u128()?);
     let partition_id = LogicalPartitionId::new(decoder.u32()?);
     let batch_id = BatchId::new(decoder.u128()?);
@@ -1270,15 +1683,7 @@ fn decode_extent(
             "record range does not match record count",
         ));
     }
-    if decoder.take(payload_len).is_err() || !decoder.is_empty() {
-        return Err(StorageError::corrupt(
-            path,
-            frame_offset,
-            "payload length does not match frame",
-        ));
-    }
-
-    Ok(ExtentLocation {
+    Ok(DecodedExtentHeader {
         reservation: Reservation {
             topic_id,
             partition_id,
@@ -1295,8 +1700,6 @@ fn decode_extent(
         },
         producer,
         atomic_group,
-        pack_sequence: 0,
-        payload_offset: frame_offset + HEADER_LEN as u64,
         payload_len,
     })
 }
@@ -1363,23 +1766,55 @@ fn scan_pack(
         let mut frame = vec![0u8; frame_len_usize];
         frame[..PREFIX_LEN].copy_from_slice(&prefix);
         file.read_exact(&mut frame[PREFIX_LEN..])?;
-        let mut location = decode_extent(path, offset, &frame, expected_shard)?;
-        location.pack_sequence = pack_sequence;
-        let topic_partition = TopicPartition::new(
-            location.reservation.topic_id,
-            location.reservation.partition_id,
-        );
-        let key = (topic_partition, location.reservation.batch_id);
-        if by_batch.insert(key, location.clone()).is_some() {
-            return Err(StorageError::corrupt(path, offset, "duplicate batch ID"));
-        }
-        index.entry(topic_partition).or_default().push(location);
+        let location = decode_extent(path, offset, &frame, expected_shard)?;
+        index_recovered_extent(
+            path,
+            offset,
+            pack_sequence,
+            location,
+            index,
+            by_batch,
+            &mut None,
+        )?;
         offset += frame_len;
     }
     Ok(())
 }
 
-fn validate_prefix(path: &Path, offset: u64, prefix: &[u8; PREFIX_LEN]) -> StorageResult<()> {
+// Bounded callers reserve the native maps and existing topic Vec first, and
+// retain an optional pre-reserved new topic Vec outside their unwind boundary.
+// Ordinary callers pass None and retain the original allocation behavior.
+// Preserve the native duplicate overwrite/refusal BEFORE any index insertion.
+fn index_recovered_extent(
+    path: &Path,
+    offset: u64,
+    pack_sequence: u64,
+    mut location: ExtentLocation,
+    index: &mut HashMap<TopicPartition, Vec<ExtentLocation>>,
+    by_batch: &mut HashMap<(TopicPartition, BatchId), ExtentLocation>,
+    spare_locations: &mut Option<Vec<ExtentLocation>>,
+) -> StorageResult<()> {
+    location.pack_sequence = pack_sequence;
+    let topic_partition = TopicPartition::new(
+        location.reservation.topic_id,
+        location.reservation.partition_id,
+    );
+    let key = (topic_partition, location.reservation.batch_id);
+    if by_batch.insert(key, location.clone()).is_some() {
+        return Err(StorageError::corrupt(path, offset, "duplicate batch ID"));
+    }
+    index
+        .entry(topic_partition)
+        .or_insert_with(|| spare_locations.take().unwrap_or_default())
+        .push(location);
+    Ok(())
+}
+
+pub(crate) fn validate_prefix(
+    path: &Path,
+    offset: u64,
+    prefix: &[u8; PREFIX_LEN],
+) -> StorageResult<()> {
     if &prefix[..4] != EXTENT_MAGIC {
         return Err(StorageError::corrupt(path, offset, "invalid extent magic"));
     }
@@ -1404,6 +1839,17 @@ fn validate_prefix(path: &Path, offset: u64, prefix: &[u8; PREFIX_LEN]) -> Stora
     Ok(())
 }
 
+// Keep the existing native accepted digit spellings and pending-name role.
+fn pack_sequence_from_name(name: &str) -> Option<u64> {
+    name.strip_prefix("pack-")
+        .and_then(|name| name.strip_suffix(".sse"))
+        .and_then(|digits| digits.parse::<u64>().ok())
+}
+
+fn is_pending_pack_deletion_name(name: &str) -> bool {
+    name.starts_with("pack-") && name.ends_with(".sse.gc-pending")
+}
+
 fn discover_packs(directory: &Path) -> StorageResult<BTreeMap<u64, PathBuf>> {
     let mut packs = BTreeMap::new();
     for entry in fs::read_dir(directory)? {
@@ -1411,11 +1857,7 @@ fn discover_packs(directory: &Path) -> StorageResult<BTreeMap<u64, PathBuf>> {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        let Some(sequence) = name
-            .strip_prefix("pack-")
-            .and_then(|name| name.strip_suffix(".sse"))
-            .and_then(|digits| digits.parse::<u64>().ok())
-        else {
+        let Some(sequence) = pack_sequence_from_name(name) else {
             continue;
         };
         if packs.insert(sequence, path).is_some() {
@@ -1428,7 +1870,247 @@ fn discover_packs(directory: &Path) -> StorageResult<BTreeMap<u64, PathBuf>> {
 }
 
 fn pack_path(directory: &Path, sequence: u64) -> PathBuf {
-    directory.join(format!("pack-{sequence:020}.sse"))
+    directory.join(native_pack_name(sequence))
+}
+
+fn native_pack_name(sequence: u64) -> String {
+    format!("pack-{sequence:020}.sse")
+}
+
+#[cfg(unix)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "keep actual pack identity, repair mode, index borrows and original deadline explicit"
+)]
+fn scan_pack_until(
+    path: &Path,
+    pack_sequence: u64,
+    expected_shard: ShardId,
+    max_batch_bytes: usize,
+    permit_tail_repair: bool,
+    index: &mut HashMap<TopicPartition, Vec<ExtentLocation>>,
+    by_batch: &mut HashMap<(TopicPartition, BatchId), ExtentLocation>,
+    expiry: Instant,
+) -> StorageResult<()> {
+    recovery_gc_clock(expiry)?;
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    recovery_gc_clock(expiry)?;
+    let file_len = file.metadata()?.len();
+    let mut offset = 0u64;
+    while offset < file_len {
+        recovery_gc_clock(expiry)?;
+        let remaining = file_len - offset;
+        if remaining < PREFIX_LEN as u64 {
+            if permit_tail_repair {
+                recovery_gc_clock(expiry)?;
+                file.set_len(offset)?;
+                recovery_gc_clock(expiry)?;
+                file.sync_data()?;
+                recovery_gc_clock(expiry)?;
+                break;
+            }
+            return Err(StorageError::corrupt(
+                path,
+                offset,
+                "truncated prefix in sealed pack",
+            ));
+        }
+        recovery_gc_clock(expiry)?;
+        file.seek(SeekFrom::Start(offset))?;
+        recovery_gc_clock(expiry)?;
+        let mut prefix = [0u8; PREFIX_LEN];
+        file.read_exact(&mut prefix)?;
+        recovery_gc_clock(expiry)?;
+        validate_prefix(path, offset, &prefix)?;
+        let frame_len = u64::from_le_bytes(prefix[8..16].try_into().expect("frame length"));
+        let max_frame_len = (HEADER_LEN as u64)
+            .checked_add(max_batch_bytes as u64)
+            .and_then(|value| value.checked_add(CHECKSUM_LEN as u64))
+            .ok_or_else(|| StorageError::LimitExceeded("configured frame limit overflow".into()))?;
+        if frame_len < (HEADER_LEN + CHECKSUM_LEN) as u64 || frame_len > max_frame_len {
+            return Err(StorageError::corrupt(
+                path,
+                offset,
+                format!("invalid frame length {frame_len}"),
+            ));
+        }
+        if offset
+            .checked_add(frame_len)
+            .is_none_or(|end| end > file_len)
+        {
+            if permit_tail_repair {
+                recovery_gc_clock(expiry)?;
+                file.set_len(offset)?;
+                recovery_gc_clock(expiry)?;
+                file.sync_data()?;
+                recovery_gc_clock(expiry)?;
+                break;
+            }
+            return Err(StorageError::corrupt(
+                path,
+                offset,
+                "truncated frame in sealed pack",
+            ));
+        }
+        let frame_len_usize = usize::try_from(frame_len)
+            .map_err(|_| StorageError::corrupt(path, offset, "frame length exceeds usize"))?;
+        recovery_gc_clock(expiry)?;
+        let mut frame = vec![0u8; frame_len_usize];
+        frame[..PREFIX_LEN].copy_from_slice(&prefix);
+        file.read_exact(&mut frame[PREFIX_LEN..])?;
+        recovery_gc_clock(expiry)?;
+        let location = decode_extent(path, offset, &frame, expected_shard)?;
+        recovery_gc_clock(expiry)?;
+        index_recovered_extent(
+            path,
+            offset,
+            pack_sequence,
+            location,
+            index,
+            by_batch,
+            &mut None,
+        )?;
+        offset += frame_len;
+    }
+    recovery_gc_clock(expiry)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn discover_packs_until(
+    directory: &Path,
+    expiry: Instant,
+) -> StorageResult<BTreeMap<u64, PathBuf>> {
+    recovery_gc_clock(expiry)?;
+    let mut packs = BTreeMap::new();
+    let mut entries = fs::read_dir(directory)?;
+    loop {
+        recovery_gc_clock(expiry)?;
+        #[cfg(test)]
+        recovery_directory_test_step("discover-next-start");
+        recovery_gc_clock(expiry)?;
+        let entry = entries.next();
+        #[cfg(test)]
+        recovery_directory_test_step("discover-next-complete");
+        // EOF and errors are physical visits too, never a renewed clock.
+        recovery_gc_clock(expiry)?;
+        let Some(entry) = entry else { break };
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            #[cfg(test)]
+            recovery_directory_test_step("discover-entry-complete");
+            continue;
+        };
+        let Some(sequence) = pack_sequence_from_name(name) else {
+            #[cfg(test)]
+            recovery_directory_test_step("discover-entry-complete");
+            continue;
+        };
+        if packs.insert(sequence, path).is_some() {
+            return Err(StorageError::InvalidInput(format!(
+                "duplicate pack sequence {sequence}"
+            )));
+        }
+        #[cfg(test)]
+        recovery_directory_test_step("discover-entry-complete");
+    }
+    recovery_gc_clock(expiry)?;
+    Ok(packs)
+}
+
+#[cfg(unix)]
+fn cleanup_pending_pack_deletions_until(directory: &Path, expiry: Instant) -> StorageResult<()> {
+    recovery_gc_clock(expiry)?;
+    let mut pending = Vec::new();
+    let mut entries = fs::read_dir(directory)?;
+    loop {
+        recovery_gc_clock(expiry)?;
+        #[cfg(test)]
+        recovery_directory_test_step("cleanup-next-start");
+        recovery_gc_clock(expiry)?;
+        let entry = entries.next();
+        #[cfg(test)]
+        recovery_directory_test_step("cleanup-next-complete");
+        // EOF and errors are physical visits too, never a renewed clock.
+        recovery_gc_clock(expiry)?;
+        let Some(entry) = entry else { break };
+        if let Ok(entry) = entry {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_pending_pack_deletion_name)
+            {
+                pending.push(path);
+            }
+        }
+        #[cfg(test)]
+        recovery_directory_test_step("cleanup-entry-complete");
+    }
+    for path in &pending {
+        recovery_gc_clock(expiry)?;
+        fs::remove_file(path)?;
+    }
+    recovery_gc_clock(expiry)?;
+    if !pending.is_empty() {
+        sync_directory(directory)?;
+    }
+    recovery_gc_clock(expiry)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn recovery_gc_clock(expiry: Instant) -> StorageResult<()> {
+    if Instant::now() >= expiry {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "native recovery original expiry elapsed",
+        )
+        .into());
+    }
+    Ok(())
+}
+#[cfg(all(unix, test))]
+type RecoveryTestStep = std::cell::RefCell<Option<Box<dyn FnMut(&str)>>>;
+
+#[cfg(all(unix, test))]
+thread_local! {
+    static RECOVERY_DIRECTORY_STEP: RecoveryTestStep =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(all(unix, test))]
+fn recovery_directory_test_step(step: &str) {
+    RECOVERY_DIRECTORY_STEP.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(step);
+        }
+    });
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    static RECOVERY_GC_STEP: RecoveryTestStep =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(all(unix, test))]
+fn recovery_gc_test_step(step: &str) {
+    RECOVERY_GC_STEP.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(step);
+        }
+    });
+}
+
+fn gc_location_before_start(
+    location: &ExtentLocation,
+    log_starts: &HashMap<TopicPartition, LogicalOffset>,
+) -> bool {
+    log_starts
+        .get(&TopicPartition::new(
+            location.reservation.topic_id,
+            location.reservation.partition_id,
+        ))
+        .is_some_and(|start| location.reservation.last_offset < *start)
 }
 
 fn pending_pack_deletion_path(path: &Path) -> PathBuf {
@@ -1441,7 +2123,7 @@ fn cleanup_pending_pack_deletions(directory: &Path) -> StorageResult<()> {
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("pack-") && name.ends_with(".sse.gc-pending"))
+                .is_some_and(is_pending_pack_deletion_name)
         })
         .collect::<Vec<_>>();
     for path in &pending {
@@ -1964,4 +2646,184 @@ mod tests {
             Err(StorageError::Corrupt { .. })
         ));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_gc_late_first_rename_keeps_tombstone_and_starts_no_second_pack_work() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                RECOVERY_GC_STEP.with(|hook| *hook.borrow_mut() = None);
+            }
+        }
+        let temp = TempDir::new("owned-gc-expiry");
+        let cfg = config(&temp.0, 1);
+        let mut store = ShardStore::open(cfg.clone()).expect("actual native store");
+        for n in 0..3 {
+            store
+                .append(
+                    reservation(u128::from(n), n * 2, 3),
+                    None,
+                    b"actual native pack",
+                    true,
+                )
+                .expect("native append");
+        }
+        let first = pack_path(&temp.0, 0);
+        let second = pack_path(&temp.0, 1);
+        let second_bytes = fs::read(&second).expect("native second pack bytes");
+        let expiry = Instant::now() + Duration::from_millis(50);
+        let steps = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = steps.clone();
+        RECOVERY_GC_STEP.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |step| {
+                assert_eq!(step, "renamed");
+                seen.set(seen.get() + 1);
+                std::thread::sleep(
+                    expiry.saturating_duration_since(Instant::now()) + Duration::from_millis(5),
+                );
+            }))
+        });
+        let reset = Reset;
+        let starts = HashMap::from([(
+            TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0)),
+            LogicalOffset::new(4),
+        )]);
+        assert!(store.garbage_collect_until(&starts, expiry).is_err());
+        assert_eq!(steps.get(), 1);
+        drop(reset);
+        assert!(!first.exists());
+        assert!(
+            pending_pack_deletion_path(&first).exists(),
+            "truthful native ambiguous directory tail remains"
+        );
+        assert_eq!(
+            fs::read(&second).expect("second pack never renamed/unlinked"),
+            second_bytes
+        );
+        assert!(!pending_pack_deletion_path(&second).exists());
+        drop(store);
+        let mut reopened = ShardStore::open(cfg).expect("ordinary native pending cleanup");
+        assert!(!pending_pack_deletion_path(&first).exists());
+        assert_eq!(reopened.catalog().len(), 2);
+        reopened
+            .garbage_collect(&starts)
+            .expect("ordinary native GC preserves its established policy");
+        assert_eq!(reopened.catalog().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_directory_iteration_checks_original_expiry_before_each_next_and_after_eof() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                RECOVERY_DIRECTORY_STEP.with(|hook| *hook.borrow_mut() = None);
+            }
+        }
+        for cleanup in [false, true] {
+            let temp = TempDir::new("owned-directory-next-expiry");
+            let cfg = config(&temp.0, 1);
+            let mut store = ShardStore::open(cfg.clone()).expect("actual native packs");
+            for n in 0..3 {
+                store
+                    .append(
+                        reservation(u128::from(n), n * 2, 3),
+                        None,
+                        b"actual native directory entry",
+                        true,
+                    )
+                    .expect("real native frame");
+            }
+            drop(store);
+            let first = pack_path(&temp.0, 0);
+            let pending = pending_pack_deletion_path(&first);
+            fs::rename(&first, &pending).expect("actual interrupted native GC");
+            let expected = fs::read(&pending).expect("retained interrupted bytes");
+            let expiry = Instant::now() + Duration::from_millis(50);
+            let visits = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let observed = visits.clone();
+            RECOVERY_DIRECTORY_STEP.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |step| {
+                    observed.borrow_mut().push(step.to_owned());
+                    if step.ends_with("-entry-complete") {
+                        std::thread::sleep(
+                            expiry.saturating_duration_since(Instant::now())
+                                + Duration::from_millis(5),
+                        );
+                    }
+                }))
+            });
+            let reset = Reset;
+            if cleanup {
+                assert!(cleanup_pending_pack_deletions_until(&temp.0, expiry).is_err());
+                assert_eq!(
+                    &*visits.borrow(),
+                    &[
+                        "cleanup-next-start",
+                        "cleanup-next-complete",
+                        "cleanup-entry-complete"
+                    ]
+                );
+            } else {
+                assert!(discover_packs_until(&temp.0, expiry).is_err());
+                assert_eq!(
+                    &*visits.borrow(),
+                    &[
+                        "discover-next-start",
+                        "discover-next-complete",
+                        "discover-entry-complete"
+                    ]
+                );
+            }
+            drop(reset);
+            assert_eq!(
+                fs::read(&pending).expect("late entry work starts no later read/unlink"),
+                expected
+            );
+            assert!(
+                discover_packs_until(&temp.0, Instant::now() + Duration::from_secs(2))
+                    .expect("fitting real traversal")
+                    .len()
+                    >= 2
+            );
+            cleanup_pending_pack_deletions_until(&temp.0, Instant::now() + Duration::from_secs(2))
+                .expect("fitting real cleanup");
+            assert!(!pending.exists());
+        }
+        // An actual empty native directory still performs one EOF next; its
+        // late completion must be checked before returning a successful scan.
+        let empty = TempDir::new("owned-directory-eof-expiry");
+        let expiry = Instant::now() + Duration::from_millis(50);
+        let visits = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = visits.clone();
+        RECOVERY_DIRECTORY_STEP.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |step| {
+                if step == "discover-next-complete" {
+                    observed.set(observed.get() + 1);
+                    std::thread::sleep(
+                        expiry.saturating_duration_since(Instant::now()) + Duration::from_millis(5),
+                    );
+                }
+            }))
+        });
+        let reset = Reset;
+        assert!(discover_packs_until(&empty.0, expiry).is_err());
+        assert_eq!(visits.get(), 1);
+        drop(reset);
+        assert!(
+            discover_packs_until(&empty.0, Instant::now() + Duration::from_secs(2))
+                .expect("normal empty native scan")
+                .is_empty()
+        );
+    }
 }
+
+#[cfg(test)]
+#[path = "extent_header_tests.rs"]
+mod header_tests;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) use pinned_directory::{TrackedGcStage, TrackedGcTransferPhase};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) use pinned_directory::{TrackedGcTrace, tracking_gc_cost};

@@ -6,7 +6,7 @@ use shard_stream_core::{
 };
 #[cfg(test)]
 use shard_stream_core::{BrokerDescriptor, BrokerId, SingleNodeAssignment};
-use shard_stream_engine::{EngineError, FetchedBatch, StreamEngine};
+use shard_stream_engine::{EngineError, EngineHandle, FetchedBatch, StreamEngine};
 use shard_stream_protocol::{
     AppendRequest as EngineAppendRequest, AtomicGroupIdentity, Durability as EngineDurability,
     FetchMode as EngineFetchMode, FetchRequest as EngineFetchRequest, LogicalTopicResolver,
@@ -27,7 +27,7 @@ use v1::producer_service_server::{ProducerService, ProducerServiceServer};
 
 #[derive(Clone)]
 struct GrpcService {
-    engine: Arc<StreamEngine>,
+    engine: EngineHandle,
     assignments: Arc<dyn AssignmentProvider>,
     topics: Option<Arc<dyn LogicalTopicResolver>>,
     stream_capacity: usize,
@@ -37,6 +37,35 @@ struct GrpcService {
 pub async fn serve(
     listener: TcpListener,
     engine: Arc<StreamEngine>,
+    assignments: Arc<dyn AssignmentProvider>,
+    topics: Option<Arc<dyn LogicalTopicResolver>>,
+    stream_capacity: usize,
+    max_request_bytes: usize,
+    max_response_bytes: usize,
+    shutdown: watch::Receiver<bool>,
+) -> Result<(), tonic::transport::Error> {
+    serve_with_engine_handle(
+        listener,
+        engine.into(),
+        assignments,
+        topics,
+        stream_capacity,
+        max_request_bytes,
+        max_response_bytes,
+        shutdown,
+    )
+    .await
+}
+
+/// Serves the same gRPC protocol while retaining the actual complete engine owner.
+///
+/// Services and callbacks that access the engine retain its complete owner,
+/// including recovered storage custody. Completed fetch response streams own
+/// their bytes. Callers remain responsible for all startup and serving joins.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_with_engine_handle(
+    listener: TcpListener,
+    engine: EngineHandle,
     assignments: Arc<dyn AssignmentProvider>,
     topics: Option<Arc<dyn LogicalTopicResolver>>,
     stream_capacity: usize,
@@ -78,7 +107,7 @@ impl ProducerService for GrpcService {
     ) -> Result<Response<Self::AppendStream>, Status> {
         let mut inbound = request.into_inner();
         let (sender, receiver) = mpsc::channel(self.stream_capacity);
-        let engine = Arc::clone(&self.engine);
+        let engine = self.engine.clone();
         let assignments = Arc::clone(&self.assignments);
         let topics = self.topics.clone();
         tokio::spawn(async move {
@@ -118,7 +147,7 @@ impl ProducerService for GrpcService {
                         .assignment(topic_partition)
                         .map(|assignment| assignment.leader_epoch.get());
                 }
-                let engine = Arc::clone(&engine);
+                let engine = engine.clone();
                 let result = tokio::task::spawn_blocking(move || engine.append(request))
                     .await
                     .map_err(|error| Status::internal(format!("engine task failed: {error}")))
@@ -150,7 +179,7 @@ impl ConsumerService for GrpcService {
         )?;
         ensure_local_fetch_owner(self.assignments.as_ref(), &request)?;
         let request_id = request.request_id;
-        let engine = Arc::clone(&self.engine);
+        let engine = self.engine.clone();
         let batches = tokio::task::spawn_blocking(move || engine.fetch(request))
             .await
             .map_err(|error| Status::internal(format!("engine task failed: {error}")))?
@@ -356,7 +385,8 @@ fn engine_status(error: EngineError) -> Status {
         EngineError::UnknownPartition { .. }
         | EngineError::UnknownShard(_)
         | EngineError::UnknownAtomicGroup(_) => Status::not_found(error.to_string()),
-        EngineError::AdmissionLimited { .. }
+        EngineError::OperationBusy(_)
+        | EngineError::AdmissionLimited { .. }
         | EngineError::ReplicaReorderLimited { .. }
         | EngineError::ReplicaBufferLimited { .. }
         | EngineError::ReplicaInFlight(_)
@@ -397,6 +427,7 @@ mod tests {
 
     use shard_stream_core::TopicId;
     use shard_stream_engine::{EngineConfig, TopicConfig};
+    use tokio_stream::StreamExt;
 
     use super::*;
 
@@ -555,5 +586,107 @@ mod tests {
 
         let _ = shutdown_sender.send(true);
         server.await.expect("server task").expect("server");
+    }
+
+    #[tokio::test]
+    async fn handle_service_fetches_actual_rf1_body_and_releases_engine_after_last_service() {
+        let temp = TempDir::new();
+        let directory = temp.0.clone();
+        let cfg = EngineConfig {
+            data_dir: directory.clone(),
+            object_store_dir: None,
+            shard_count: 1,
+            virtual_lane_count: 1,
+            replication_factor: 1,
+            min_in_sync_replicas: 1,
+            queue_slots_per_shard: 16,
+            queue_bytes_per_shard: 1 << 20,
+            target_pack_bytes: 4096,
+            max_pack_age: std::time::Duration::from_secs(30),
+            max_batch_bytes: 4096,
+            max_fetch_bytes: 4096,
+            append_linger: std::time::Duration::ZERO,
+        };
+        let engine = Arc::new(StreamEngine::open(cfg.clone()).expect("real RF1 engine"));
+        engine
+            .create_topic(TopicConfig {
+                topic_id: TopicId::new(11),
+                partitions: 1,
+                shards: None,
+            })
+            .expect("real native topic");
+        engine
+            .append(EngineAppendRequest {
+                request_id: 1,
+                topic_id: TopicId::new(11),
+                partition_id: LogicalPartitionId::new(0),
+                record_count: 1,
+                payload: bytes::Bytes::from_static(b"actual gRPC handle body"),
+                durability: EngineDurability::Leader,
+                producer: None,
+                atomic_group: None,
+                leader_epoch: None,
+                extension_context: None,
+            })
+            .expect("actual native RF1 ACK");
+        let weak = Arc::downgrade(&engine);
+        let assignments = Arc::new(
+            SingleNodeAssignment::new(
+                BrokerDescriptor {
+                    broker_id: BrokerId::new(0),
+                    incarnation: 1,
+                    rack: String::new(),
+                    zone: String::new(),
+                    internal_rest: "http://127.0.0.1:7420".into(),
+                    internal_replication: String::new(),
+                    advertised_rest: "http://127.0.0.1:7420".into(),
+                    advertised_grpc: "http://127.0.0.1:7421".into(),
+                    kafka_host: "127.0.0.1".into(),
+                    kafka_port: 9092,
+                    cpu_capacity: 1,
+                    disk_capacity_bytes: 0,
+                    network_capacity_bytes_per_sec: 0,
+                    certificate_digest: [0; 32],
+                },
+                1,
+            )
+            .expect("actual ordinary RF1 assignment"),
+        );
+        let service = GrpcService {
+            engine: engine.into(),
+            assignments,
+            topics: None,
+            stream_capacity: 2,
+        };
+        assert!(weak.upgrade().is_some());
+        let response = ConsumerService::fetch(
+            &service,
+            Request::new(v1::FetchRequest {
+                request_id: Some(encode_u128(9)),
+                topic_id: Some(encode_u128(11)),
+                partition_id: 0,
+                start_offset: 0,
+                max_bytes: 4096,
+                mode: 1,
+            }),
+        )
+        .await
+        .expect("actual shared service/blocking native fetch");
+        let mut stream = response.into_inner();
+        let batch = stream
+            .next()
+            .await
+            .expect("actual response")
+            .expect("native response encoding");
+        assert_eq!(batch.payload.as_slice(), b"actual gRPC handle body");
+        assert_eq!(
+            decode_u128(batch.batch_id, "batch").expect("actual native batch"),
+            0
+        );
+        assert!(stream.next().await.is_none());
+        drop(stream);
+        drop(service);
+        assert!(weak.upgrade().is_none());
+        StreamEngine::open(cfg).expect("real RF1 restart after final service owner");
     }
 }

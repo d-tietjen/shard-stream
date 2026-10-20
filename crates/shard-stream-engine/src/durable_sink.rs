@@ -14,7 +14,14 @@ use shard_stream_core::{
 };
 use shard_stream_protocol::AtomicGroupIdentity;
 
-use crate::{AtomicGroupState, EngineError, EngineResult};
+use crate::{
+    AtomicGroupState, EngineError, EngineResult, NativeResumeCallbackError,
+    NativeResumeCallbackResult, NativeResumeWork,
+};
+
+#[path = "durable_sink_resume.rs"]
+mod bounded_resume;
+pub use bounded_resume::NativeResumeSinkOutcome;
 
 const RETRY_MIN: Duration = Duration::from_millis(10);
 const RETRY_MAX: Duration = Duration::from_secs(1);
@@ -154,6 +161,25 @@ pub trait DurableAppendSink: Send + Sync + fmt::Debug {
         appends: &[DurableAppend],
         next: DurableSinkCheckpoint,
     ) -> EngineResult<DurableSinkApply>;
+
+    /// Applies the same actual transaction using the supplied original-E work.
+    ///
+    /// Implementations charge before materialization, carry the SAME work into
+    /// entered workers, check between native phases and physically settle every
+    /// entered job before returning. Original typed partial outcomes belong in
+    /// the returned error. The default refuses without invoking the ordinary
+    /// callback; a legacy callback is not a bounded producer.
+    fn apply_until(
+        &self,
+        _expected: DurableSinkCheckpoint,
+        _appends: &[DurableAppend],
+        _next: DurableSinkCheckpoint,
+        _work: &NativeResumeWork,
+    ) -> NativeResumeCallbackResult<DurableSinkApply> {
+        Err(NativeResumeCallbackError::unsupported(
+            "durable sink has no bounded apply producer",
+        ))
+    }
 }
 
 /// Constructs shard-local sink handles backed by one cluster-shared sink.
@@ -183,6 +209,47 @@ pub trait DurableAppendSinkFactory: Send + Sync + fmt::Debug {
     /// Atomically publishes or discards a previously staged group.
     fn finalize_atomic_group(&self, _decision: DurableAtomicDecision) -> EngineResult<()> {
         Ok(())
+    }
+
+    /// Loads a real checkpoint with the same original-E cumulative work.
+    ///
+    /// Carry this work through actual lock/read/decoder/worker phases. An
+    /// expected absent checkpoint remains ordinary `None`; late/error results
+    /// must retain their actual native cause. No legacy callback is invoked by
+    /// the refusing default.
+    fn load_checkpoint_until(
+        &self,
+        _topic_partition: TopicPartition,
+        _work: &NativeResumeWork,
+    ) -> NativeResumeCallbackResult<Option<DurableSinkCheckpoint>> {
+        Err(NativeResumeCallbackError::unsupported(
+            "durable sink has no bounded checkpoint producer",
+        ))
+    }
+
+    /// Enumerates actual pending groups with pre-allocation native limits.
+    ///
+    /// The producer reserves each group and its source values in this SAME
+    /// work before copying/pushing. Clipping an ordinary allocated result is
+    /// not an implementation of this contract.
+    fn pending_atomic_groups_until(
+        &self,
+        _work: &NativeResumeWork,
+    ) -> NativeResumeCallbackResult<Vec<DurableAtomicGroup>> {
+        Err(NativeResumeCallbackError::unsupported(
+            "durable sink has no bounded pending-group producer",
+        ))
+    }
+
+    /// Physically settles a real atomic decision using the same original E.
+    fn finalize_atomic_group_until(
+        &self,
+        _decision: DurableAtomicDecision,
+        _work: &NativeResumeWork,
+    ) -> NativeResumeCallbackResult<()> {
+        Err(NativeResumeCallbackError::unsupported(
+            "durable sink has no bounded atomic-decision producer",
+        ))
     }
 }
 
@@ -445,6 +512,7 @@ impl QueuedDecision {
 }
 
 enum Command {
+    BoundedResume(bounded_resume::BoundedCommand),
     Append(QueuedAppend),
     Decision(QueuedDecision),
     LoadCheckpoint {
@@ -556,13 +624,94 @@ impl fmt::Debug for DurableSinkDispatcher {
     }
 }
 
+#[cfg(unix)]
+pub(crate) fn recovery_dispatcher_bytes(
+    config: &DurableSinkConfig,
+    shards: usize,
+    inherited: usize,
+) -> Option<usize> {
+    use std::mem::size_of;
+    config
+        .options
+        .worker_count
+        .checked_mul(size_of::<JoinHandle<()>>() + size_of::<Sender<Command>>())?
+        .checked_add(shards.checked_mul(size_of::<(ShardId, Arc<dyn DurableAppendSink>)>())?)?
+        .checked_add(
+            config
+                .options
+                .max_pending_items
+                .checked_mul(size_of::<Command>())?,
+        )?
+        .checked_add(config.options.max_pending_bytes.unwrap_or(inherited))?
+        .checked_add(
+            size_of::<DurableSinkDispatcher>() + size_of::<Budget>() + size_of::<SharedProgress>(),
+        )
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    pub(crate) static RECOVERY_SINK_STARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// None is the original ordinary constructor: no new clock or policy.
+fn recovery_open_clock(expiry: Option<Instant>) -> EngineResult<()> {
+    if expiry.is_some_and(|end| Instant::now() >= end) {
+        return Err(EngineError::InvalidConfig(
+            "native recovery original expiry elapsed".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl DurableSinkDispatcher {
-    pub(crate) fn open(
+    pub(crate) fn open_with_ownership(
         config: DurableSinkConfig,
         shard_ids: &[ShardId],
         inherited_max_bytes: usize,
         maximum_event_bytes: usize,
+        directory_ownership: Option<Arc<shard_stream_core::DirectoryOwnership>>,
     ) -> EngineResult<Self> {
+        Self::open_inner_owned(
+            config,
+            shard_ids,
+            inherited_max_bytes,
+            maximum_event_bytes,
+            directory_ownership,
+            false,
+            None,
+        )
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn open_with_recovery_ownership(
+        config: DurableSinkConfig,
+        shard_ids: &[ShardId],
+        inherited_max_bytes: usize,
+        maximum_event_bytes: usize,
+        directory_ownership: Arc<shard_stream_core::DirectoryOwnership>,
+        expiry: Instant,
+    ) -> EngineResult<Self> {
+        Self::open_inner_owned(
+            config,
+            shard_ids,
+            inherited_max_bytes,
+            maximum_event_bytes,
+            Some(directory_ownership),
+            true,
+            Some(expiry),
+        )
+    }
+
+    fn open_inner_owned(
+        config: DurableSinkConfig,
+        shard_ids: &[ShardId],
+        inherited_max_bytes: usize,
+        maximum_event_bytes: usize,
+        directory_ownership: Option<Arc<shard_stream_core::DirectoryOwnership>>,
+        join_failed: bool,
+        expiry: Option<Instant>,
+    ) -> EngineResult<Self> {
+        recovery_open_clock(expiry)?;
         let DurableSinkConfig { factory, options } = config;
         if options.max_pending_items == 0 {
             return Err(EngineError::InvalidConfig(
@@ -595,6 +744,7 @@ impl DurableSinkDispatcher {
                 "durable sink max_pending_bytes {max_bytes} is below max_batch_bytes {maximum_event_bytes}"
             )));
         }
+        recovery_open_clock(expiry)?;
         if options.atomic_visibility == DurableSinkAtomicVisibility::CommittedOnly
             && !invoke_factory(|| Ok(factory.supports_committed_only()))?
         {
@@ -603,12 +753,17 @@ impl DurableSinkDispatcher {
                     .into(),
             ));
         }
+        recovery_open_clock(expiry)?;
         let sinks = shard_ids
             .iter()
             .map(|&shard_id| {
-                invoke_factory(|| factory.open_shard(shard_id)).map(|sink| (shard_id, sink))
+                recovery_open_clock(expiry)?;
+                let sink = invoke_factory(|| factory.open_shard(shard_id))?;
+                recovery_open_clock(expiry)?;
+                Ok((shard_id, sink))
             })
             .collect::<EngineResult<HashMap<_, _>>>()?;
+        recovery_open_clock(expiry)?;
         let budget = Arc::new(Budget {
             pending_items: AtomicUsize::new(0),
             pending_bytes: AtomicUsize::new(0),
@@ -631,16 +786,26 @@ impl DurableSinkDispatcher {
             stats: StatsState::default(),
         });
         let sinks = Arc::new(sinks);
+        let mut workers = OpeningWorkers {
+            threads: Vec::with_capacity(options.worker_count),
+            join_failed,
+        };
         let mut senders = Vec::with_capacity(options.worker_count);
-        let mut workers = Vec::with_capacity(options.worker_count);
         for worker_index in 0..options.worker_count {
+            recovery_open_clock(expiry)?;
             let (sender, receiver) = channel();
             let worker_factory = Arc::clone(&factory);
             let worker_sinks = Arc::clone(&sinks);
             let worker_shared = Arc::clone(&shared);
+            let worker_ownership = directory_ownership.as_ref().map(Arc::clone);
+            recovery_open_clock(expiry)?;
             let worker = thread::Builder::new()
                 .name(format!("shard-stream-durable-sink-{worker_index}"))
                 .spawn(move || {
+                    // Retain custody outside run_dispatcher's frame: its sink
+                    // and factory destructors must finish before this drops,
+                    // including unwinding and bounded dispatcher detachment.
+                    let ownership = worker_ownership;
                     run_dispatcher(
                         receiver,
                         worker_factory,
@@ -648,6 +813,7 @@ impl DurableSinkDispatcher {
                         options.atomic_visibility,
                         worker_shared,
                     );
+                    drop(ownership);
                 })
                 .map_err(|error| {
                     EngineError::InvalidConfig(format!(
@@ -655,15 +821,21 @@ impl DurableSinkDispatcher {
                     ))
                 })?;
             senders.push(sender);
-            workers.push(worker);
+            workers.threads.push(worker);
+            #[cfg(all(unix, test))]
+            if expiry.is_some() {
+                RECOVERY_SINK_STARTS.with(|starts| starts.set(starts.get() + 1));
+            }
+            recovery_open_clock(expiry)?;
         }
+        recovery_open_clock(expiry)?;
         Ok(Self {
             factory,
             options,
             senders,
             budget,
             shared,
-            workers,
+            workers: std::mem::take(&mut workers.threads),
         })
     }
 
@@ -927,6 +1099,38 @@ impl DurableSinkDispatcher {
     }
 }
 
+// On a new owned-opening failure, dropping senders precedes this group, so
+// disconnected workers physically finish before the outer storage owner drops.
+struct OpeningWorkers {
+    threads: Vec<JoinHandle<()>>,
+    join_failed: bool,
+}
+impl Drop for OpeningWorkers {
+    fn drop(&mut self) {
+        if self.join_failed {
+            for worker in self.threads.drain(..) {
+                let _ = worker.join();
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl DurableSinkDispatcher {
+    pub(crate) fn join_owned_recovery(&mut self) {
+        self.budget.stop();
+        self.shared.stopped.store(true, Ordering::Release);
+        self.shared.changed.notify_all();
+        self.shared.decision_changed.notify_all();
+        for sender in &self.senders {
+            let _ = sender.send(Command::Shutdown);
+        }
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
 impl Drop for DurableSinkDispatcher {
     fn drop(&mut self) {
         self.budget.stop();
@@ -938,6 +1142,7 @@ impl Drop for DurableSinkDispatcher {
         }
         // A third-party callback may be permanently blocked. Detaching keeps
         // engine destruction bounded; WAL replay recovers uncheckpointed work.
+        // Owned workers keep their directory lock until physical destruction.
         self.workers.clear();
     }
 }
@@ -973,6 +1178,7 @@ fn run_dispatcher(
             if !handle_command(
                 command,
                 &factory,
+                &sinks,
                 &mut partitions,
                 &mut decisions,
                 atomic_visibility,
@@ -987,6 +1193,7 @@ fn run_dispatcher(
                         if !handle_command(
                             command,
                             &factory,
+                            &sinks,
                             &mut partitions,
                             &mut decisions,
                             atomic_visibility,
@@ -1024,9 +1231,14 @@ fn run_dispatcher(
     shared.decision_changed.notify_all();
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "keep actual dispatcher state borrows and output flag explicit at the command boundary"
+)]
 fn handle_command(
     command: Command,
     factory: &Arc<dyn DurableAppendSinkFactory>,
+    sinks: &HashMap<ShardId, Arc<dyn DurableAppendSink>>,
     partitions: &mut HashMap<TopicPartition, PartitionDelivery>,
     decisions: &mut VecDeque<QueuedDecision>,
     atomic_visibility: DurableSinkAtomicVisibility,
@@ -1034,6 +1246,10 @@ fn handle_command(
     schedule_flush: &mut bool,
 ) -> bool {
     match command {
+        Command::BoundedResume(command) => {
+            bounded_resume::execute(factory, sinks, partitions, shared, command);
+            true
+        }
         Command::Append(mut queued) => {
             *schedule_flush = true;
             if atomic_visibility == DurableSinkAtomicVisibility::CommittedOnly
@@ -1171,13 +1387,7 @@ fn process_ready(
                     processed += 1;
                 }
                 Ok(Ok(DurableSinkApply::CheckpointConflict(actual))) => {
-                    if validate_checkpoint(partition.checkpoint.topic_partition, actual).is_err()
-                        || actual.next_placement_sequence
-                            < partition.checkpoint.next_placement_sequence
-                        || actual.next_offset < partition.checkpoint.next_offset
-                        || (actual.next_placement_sequence < next.next_placement_sequence
-                            || actual.next_offset < next.next_offset)
-                    {
+                    if checkpoint_conflict_invalid(partition.checkpoint, next, actual) {
                         shared.stats.failed_attempts.fetch_add(1, Ordering::Relaxed);
                         partition.pending.insert(sequence, queued);
                         next_wake = earlier_deadline(
@@ -1219,6 +1429,20 @@ fn process_ready(
         }
     }
     next_wake
+}
+
+// The exact original native acceptance predicate, shared by ordinary and strict
+// callbacks. The strict caller prepays its bounded native identity diagnostic.
+fn checkpoint_conflict_invalid(
+    expected: DurableSinkCheckpoint,
+    next: DurableSinkCheckpoint,
+    actual: DurableSinkCheckpoint,
+) -> bool {
+    validate_checkpoint(expected.topic_partition, actual).is_err()
+        || actual.next_placement_sequence < expected.next_placement_sequence
+        || actual.next_offset < expected.next_offset
+        || (actual.next_placement_sequence < next.next_placement_sequence
+            || actual.next_offset < next.next_offset)
 }
 
 fn defer_partition_retry(

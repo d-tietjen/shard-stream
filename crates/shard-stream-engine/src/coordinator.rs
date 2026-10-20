@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 
@@ -21,6 +22,31 @@ use crate::{
     PartitionEpochs, PartitionReplicationPolicy, PartitionWatermarks, ProducerProgress,
     TopicConfig,
 };
+
+#[path = "coordinator_fetch.rs"]
+mod bounded_fetch;
+pub(crate) use bounded_fetch::Failure as BoundedFetchCoordinatorFailure;
+
+#[path = "coordinator_resume.rs"]
+mod bounded_resume;
+
+#[path = "coordinator_origin_progress.rs"]
+mod bounded_origin_progress;
+#[cfg(test)]
+pub(crate) use bounded_origin_progress::observe as observe_origin_progress;
+pub(crate) use bounded_origin_progress::{
+    Ticket as OriginProgressTicket, command_cost as origin_progress_command_cost,
+};
+
+mod catalog;
+pub(crate) use catalog::apply_recovered_catalog_event;
+
+mod proposal;
+mod replica;
+pub(crate) use proposal::{
+    AppendIntent, CommitControl, CommitOutcome, PrepareOutcome, PreparedAppend,
+};
+pub(crate) use replica::{PrepareReplicaOutcome, PreparedReplica, ReplicaIntent};
 
 const COORDINATOR_QUEUE_SLOTS: usize = 16_384;
 const CONTROL_QUEUE_SLOTS: usize = 1_024;
@@ -45,6 +71,8 @@ struct BatchRuntime {
     payload_digest: Option<[u8; 16]>,
     payload_bytes: u64,
     object_durable: bool,
+    // Active unit owned by this real reservation through physical settlement.
+    query_lineage_active: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -56,7 +84,7 @@ struct AtomicGroupRuntime {
     record_count: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProducerCursor {
     epoch: u32,
     next_sequence: u64,
@@ -131,6 +159,7 @@ pub(crate) enum VisibilityMode {
 
 #[derive(Debug)]
 pub(crate) struct PartitionState {
+    query_lineage: Arc<crate::query_lineage::Source>,
     sequencer: TopicSequencer,
     log_start: LogicalOffset,
     batches: DenseOrderedMap<BatchRuntime>,
@@ -152,6 +181,7 @@ pub(crate) struct PartitionState {
 impl PartitionState {
     fn empty(sequencer: TopicSequencer, replication_policy: PartitionReplicationPolicy) -> Self {
         Self {
+            query_lineage: Arc::new(crate::query_lineage::Source::default()),
             sequencer,
             log_start: LogicalOffset::new(0),
             batches: DenseOrderedMap::new(0),
@@ -200,31 +230,8 @@ impl PartitionState {
         candidates: &[BatchId],
         include_unresolved: bool,
     ) -> EngineResult<CommittedBatchSet> {
-        let Some(first) = candidates.iter().map(|batch_id| batch_id.get()).min() else {
-            return Ok(CommittedBatchSet::new(0, 0));
-        };
-        let last = candidates
-            .iter()
-            .map(|batch_id| batch_id.get())
-            .max()
-            .expect("nonempty candidates have a maximum");
-        let len = last
-            .checked_sub(first)
-            .and_then(|span| span.checked_add(1))
-            .and_then(|span| usize::try_from(span).ok())
-            .ok_or_else(|| {
-                EngineError::InvalidConfig("fetch candidate window exceeds usize".into())
-            })?;
-        let mut committed = CommittedBatchSet::new(first, len);
-        for batch_id in candidates {
-            if self.batches.get(batch_id.get()).is_some_and(|batch| {
-                batch.status == BatchStatus::Committed
-                    || (include_unresolved && batch.status == BatchStatus::Unresolved)
-            }) {
-                committed.insert(*batch_id);
-            }
-        }
-        Ok(committed)
+        bounded_fetch::committed_candidates(self, candidates, include_unresolved, None, usize::MAX)
+            .map_err(bounded_fetch::Failure::into_engine_error)
     }
 
     fn advance_cached_watermarks(&mut self) {
@@ -462,6 +469,46 @@ impl ControlJournal {
         })
     }
 
+    // Same native journal loop and physical Drop, original owned clock only.
+    #[cfg(unix)]
+    pub(crate) fn spawn_until(
+        mut journal: CoordinatorJournal,
+        expiry: std::time::Instant,
+    ) -> EngineResult<Self> {
+        recovery_start_clock(expiry)?;
+        let (sender, receiver) = sync_channel(CONTROL_QUEUE_SLOTS);
+        recovery_start_clock(expiry)?;
+        let thread = thread::Builder::new()
+            .name("shard-stream-coordinator-journal".into())
+            .spawn(move || {
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        ControlCommand::Append { event, response } => {
+                            let result = journal
+                                .append(&event, true)
+                                .map_err(|error| error.to_string());
+                            let _ = response.send(result);
+                        }
+                        ControlCommand::Sync { response } => {
+                            let result = journal.sync().map_err(|error| error.to_string());
+                            let _ = response.send(result);
+                        }
+                    }
+                }
+            })
+            .map_err(|error| {
+                EngineError::InvalidConfig(format!(
+                    "failed to spawn control journal worker: {error}"
+                ))
+            })?;
+        let result = Self {
+            handle: Some(ControlJournalHandle { sender }),
+            thread: Some(thread),
+        };
+        recovery_start_clock(expiry)?;
+        Ok(result)
+    }
+
     fn handle(&self) -> ControlJournalHandle {
         self.handle
             .as_ref()
@@ -484,6 +531,13 @@ impl Drop for ControlJournal {
 }
 
 enum CoordinatorCommand {
+    QueryLineageSource {
+        topic_partition: TopicPartition,
+        response: SyncSender<EngineResult<Arc<crate::query_lineage::Source>>>,
+    },
+    BoundedFetch(bounded_fetch::Command),
+    BoundedResume(bounded_resume::Command),
+    BoundedOriginProgress(bounded_origin_progress::Command),
     Create {
         topic_partition: TopicPartition,
         shards: Vec<ShardId>,
@@ -499,6 +553,25 @@ enum CoordinatorCommand {
         payload_bytes: u64,
         payload_digest: [u8; 16],
         durability: Durability,
+        admitted_leader_epoch: Option<LeaderEpoch>,
+        response: SyncSender<EngineResult<ReserveOutcome>>,
+    },
+    Prepare {
+        intent: AppendIntent,
+        response: SyncSender<EngineResult<PrepareOutcome>>,
+    },
+    CommitPrepared {
+        prepared: PreparedAppend,
+        control: std::sync::Arc<CommitControl>,
+        response: SyncSender<EngineResult<ReserveOutcome>>,
+    },
+    PrepareReplica {
+        intent: ReplicaIntent,
+        response: SyncSender<EngineResult<PrepareReplicaOutcome>>,
+    },
+    CommitPreparedReplica {
+        prepared: PreparedReplica,
+        control: std::sync::Arc<CommitControl>,
         response: SyncSender<EngineResult<ReserveOutcome>>,
     },
     ReserveReplica {
@@ -513,7 +586,7 @@ enum CoordinatorCommand {
     ObserveLeaderEpoch {
         topic_partition: TopicPartition,
         leader_epoch: LeaderEpoch,
-        response: SyncSender<EngineResult<()>>,
+        response: SyncSender<EngineResult<Option<crate::query_lineage::Mutation>>>,
     },
     Complete {
         topic_partition: TopicPartition,
@@ -642,6 +715,87 @@ pub(crate) struct CoordinatorRouter {
 }
 
 impl CoordinatorRouter {
+    pub(crate) fn prepare(&self, intent: AppendIntent) -> EngineResult<PrepareOutcome> {
+        let (response, receiver) = sync_channel(1);
+        self.try_send(
+            intent.topic_partition,
+            CoordinatorCommand::Prepare { intent, response },
+        )?;
+        receiver.recv_timeout(proposal::RPC_TIMEOUT).map_err(|_| {
+            EngineError::Fenced(
+                "reservation preparation did not complete before its deadline".into(),
+            )
+        })?
+    }
+
+    pub(crate) fn commit_prepared(
+        &self,
+        prepared: PreparedAppend,
+        control: std::sync::Arc<CommitControl>,
+    ) -> CommitOutcome {
+        let (response, receiver) = sync_channel(1);
+        if let Err(error) = self.try_send(
+            prepared.intent.topic_partition,
+            CoordinatorCommand::CommitPrepared {
+                prepared,
+                control: control.clone(),
+                response,
+            },
+        ) {
+            // A rejected queue admission cannot have reached the coordinator.
+            control.cancel();
+            return CommitOutcome::Unallocated(error);
+        }
+        proposal::await_commit(receiver, &control)
+    }
+
+    pub(crate) fn prepare_replica(
+        &self,
+        intent: ReplicaIntent,
+    ) -> EngineResult<PrepareReplicaOutcome> {
+        let (response, receiver) = sync_channel(1);
+        self.try_send(
+            intent.topic_partition(),
+            CoordinatorCommand::PrepareReplica { intent, response },
+        )?;
+        receiver.recv_timeout(proposal::RPC_TIMEOUT).map_err(|_| {
+            EngineError::Fenced("replica preparation did not complete before its deadline".into())
+        })?
+    }
+
+    pub(crate) fn commit_prepared_replica(
+        &self,
+        prepared: PreparedReplica,
+        control: std::sync::Arc<CommitControl>,
+    ) -> CommitOutcome {
+        let (response, receiver) = sync_channel(1);
+        if let Err(error) = self.try_send(
+            prepared.intent().topic_partition(),
+            CoordinatorCommand::CommitPreparedReplica {
+                prepared,
+                control: control.clone(),
+                response,
+            },
+        ) {
+            control.cancel();
+            return CommitOutcome::Unallocated(error);
+        }
+        proposal::await_commit(receiver, &control)
+    }
+
+    fn try_send(
+        &self,
+        topic_partition: TopicPartition,
+        command: CoordinatorCommand,
+    ) -> EngineResult<()> {
+        let index = coordinator_index(topic_partition, self.senders.len());
+        self.senders[index].try_send(command).map_err(|_| {
+            EngineError::Fenced(
+                "reservation coordinator is unavailable or its bounded queue is full".into(),
+            )
+        })
+    }
+
     pub(crate) fn replica_count_durable(&self, reservation: Reservation, durable_replicas: u32) {
         let topic_partition = TopicPartition::new(reservation.topic_id, reservation.partition_id);
         let index = coordinator_index(topic_partition, self.senders.len());
@@ -686,6 +840,49 @@ impl CoordinatorPool {
             });
         }
         Ok(Self { workers })
+    }
+
+    // Already-created CoordinatorWorker values physically join on any late error.
+    #[cfg(unix)]
+    pub(crate) fn spawn_until(
+        worker_count: usize,
+        mut recovered: HashMap<TopicPartition, PartitionState>,
+        journal: &ControlJournal,
+        expiry: std::time::Instant,
+    ) -> EngineResult<Self> {
+        recovery_start_clock(expiry)?;
+        let worker_count = worker_count.max(1);
+        let mut worker_states = (0..worker_count)
+            .map(|_| HashMap::new())
+            .collect::<Vec<_>>();
+        for (topic_partition, state) in recovered.drain() {
+            recovery_start_clock(expiry)?;
+            let index = coordinator_index(topic_partition, worker_count);
+            worker_states[index].insert(topic_partition, state);
+        }
+
+        let mut workers = Vec::with_capacity(worker_count);
+        for (index, states) in worker_states.into_iter().enumerate() {
+            recovery_start_clock(expiry)?;
+            let (sender, receiver) = sync_channel(COORDINATOR_QUEUE_SLOTS);
+            let control = journal.handle();
+            recovery_start_clock(expiry)?;
+            let thread = thread::Builder::new()
+                .name(format!("shard-stream-coordinator-{index}"))
+                .spawn(move || run_coordinator(states, receiver, control))
+                .map_err(|error| {
+                    EngineError::InvalidConfig(format!(
+                        "failed to spawn partition coordinator: {error}"
+                    ))
+                })?;
+            workers.push(CoordinatorWorker {
+                sender: Some(sender),
+                thread: Some(thread),
+            });
+        }
+        let result = Self { workers };
+        recovery_start_clock(expiry)?;
+        Ok(result)
     }
 
     pub(crate) fn create_topic(
@@ -764,6 +961,7 @@ impl CoordinatorPool {
         payload_bytes: u64,
         payload_digest: [u8; 16],
         durability: Durability,
+        admitted_leader_epoch: Option<LeaderEpoch>,
     ) -> EngineResult<ReserveOutcome> {
         let (response, receiver) = sync_channel(1);
         self.send(
@@ -777,6 +975,7 @@ impl CoordinatorPool {
                 payload_bytes,
                 payload_digest,
                 durability,
+                admitted_leader_epoch,
                 response,
             },
         )?;
@@ -808,11 +1007,26 @@ impl CoordinatorPool {
         receive(receiver)
     }
 
-    pub(crate) fn observe_leader_epoch(
+    pub(crate) fn query_lineage_source(
+        &self,
+        topic_partition: TopicPartition,
+    ) -> EngineResult<Arc<crate::query_lineage::Source>> {
+        let (response, receiver) = sync_channel(1);
+        self.send(
+            topic_partition,
+            CoordinatorCommand::QueryLineageSource {
+                topic_partition,
+                response,
+            },
+        )?;
+        receive(receiver)
+    }
+
+    pub(crate) fn observe_replica_leader_epoch(
         &self,
         topic_partition: TopicPartition,
         leader_epoch: LeaderEpoch,
-    ) -> EngineResult<()> {
+    ) -> EngineResult<Option<crate::query_lineage::Mutation>> {
         let (response, receiver) = sync_channel(1);
         self.send(
             topic_partition,
@@ -1182,6 +1396,19 @@ fn run_coordinator(
 ) {
     while let Ok(command) = receiver.recv() {
         match command {
+            CoordinatorCommand::QueryLineageSource {
+                topic_partition,
+                response,
+            } => {
+                let actual = state(&states, topic_partition)
+                    .map(|partition| Arc::clone(&partition.query_lineage));
+                let _ = response.send(actual);
+            }
+            CoordinatorCommand::BoundedFetch(command) => bounded_fetch::execute(&states, command),
+            CoordinatorCommand::BoundedResume(command) => bounded_resume::execute(&states, command),
+            CoordinatorCommand::BoundedOriginProgress(command) => {
+                bounded_origin_progress::execute(&states, command)
+            }
             CoordinatorCommand::Create {
                 topic_partition,
                 shards,
@@ -1195,6 +1422,34 @@ fn run_coordinator(
                     shards,
                     replication_policy,
                 );
+                let _ = response.send(result);
+            }
+            CoordinatorCommand::Prepare { intent, response } => {
+                let result = state(&states, intent.topic_partition)
+                    .and_then(|state| proposal::prepare(state, intent));
+                let _ = response.send(result);
+            }
+            CoordinatorCommand::CommitPrepared {
+                prepared,
+                control,
+                response,
+            } => {
+                let result = state_mut(&mut states, prepared.intent.topic_partition)
+                    .and_then(|state| proposal::commit(state, prepared, Some(&control)));
+                let _ = response.send(result);
+            }
+            CoordinatorCommand::PrepareReplica { intent, response } => {
+                let result = state(&states, intent.topic_partition())
+                    .and_then(|state| replica::prepare(state, intent));
+                let _ = response.send(result);
+            }
+            CoordinatorCommand::CommitPreparedReplica {
+                prepared,
+                control,
+                response,
+            } => {
+                let result = state_mut(&mut states, prepared.intent().topic_partition())
+                    .and_then(|state| replica::commit(state, prepared, &control));
                 let _ = response.send(result);
             }
             CoordinatorCommand::ReplicaCountDurable {
@@ -1226,6 +1481,7 @@ fn run_coordinator(
                 payload_bytes,
                 payload_digest,
                 durability,
+                admitted_leader_epoch,
                 response,
             } => {
                 let result = state_mut(&mut states, topic_partition).and_then(|state| {
@@ -1238,6 +1494,7 @@ fn run_coordinator(
                         payload_bytes,
                         payload_digest,
                         durability,
+                        admitted_leader_epoch,
                     )
                 });
                 let _ = response.send(result);
@@ -1269,8 +1526,10 @@ fn run_coordinator(
                 response,
             } => {
                 let result = state_mut(&mut states, topic_partition).and_then(|state| {
+                    let activity = (leader_epoch > state.sequencer.leader_epoch())
+                        .then(|| state.query_lineage.begin());
                     state.sequencer.observe_leader_epoch(leader_epoch)?;
-                    Ok(())
+                    Ok(activity)
                 });
                 let _ = response.send(result);
             }
@@ -1419,12 +1678,14 @@ fn run_coordinator(
                 let result = state_mut(&mut states, topic_partition).and_then(|state| {
                     let mut candidate = TopicSequencer::restore(state.sequencer.state())?;
                     candidate.reconfigure(ring_epoch, shards.clone())?;
+                    let activity = state.query_lineage.begin();
                     journal.append(JournalEvent::Configure {
                         topic_partition,
                         ring_epoch,
                         shards,
                     })?;
                     state.sequencer = candidate;
+                    activity.settle();
                     Ok(())
                 });
                 let _ = response.send(result);
@@ -1521,73 +1782,23 @@ fn reserve(
     payload_bytes: u64,
     payload_digest: [u8; 16],
     durability: Durability,
+    admitted_leader_epoch: Option<LeaderEpoch>,
 ) -> EngineResult<ReserveOutcome> {
-    if let Some((response, durable_replicas, object_durable)) = check_producer(
-        state,
+    let intent = AppendIntent {
+        topic_partition: state.sequencer.topic_partition(),
         request_id,
         producer,
+        atomic_group,
         record_count,
+        payload_bytes,
         payload_digest,
         durability,
-    )? {
-        return Ok(ReserveOutcome::Duplicate {
-            response,
-            durable_replicas,
-            object_durable,
-            replication_policy: state.replication_policy,
-        });
+        admitted_leader_epoch,
+    };
+    match proposal::prepare(state, intent)? {
+        PrepareOutcome::Duplicate(outcome) => Ok(outcome),
+        PrepareOutcome::New(prepared) => proposal::commit(state, *prepared, None),
     }
-    if let Some(group) = atomic_group
-        && let Some(duplicate) = check_atomic_group(
-            state,
-            request_id,
-            group,
-            record_count,
-            payload_bytes,
-            payload_digest,
-        )?
-    {
-        return Ok(duplicate);
-    }
-    let previous = state.sequencer.state();
-    let reservation = state.sequencer.reserve(record_count)?;
-    if let Some(identity) = producer
-        && let Err(error) = advance_producer(state, identity, record_count)
-    {
-        state.sequencer =
-            TopicSequencer::restore(previous).expect("previous sequencer state was valid");
-        return Err(error);
-    }
-    let producer_sequence = producer.map(|identity| ProducerSequence {
-        producer_id: identity.producer_id,
-        epoch: identity.epoch,
-        first_sequence: identity.first_sequence,
-        event_id: identity.event_id,
-        digest_algorithm: DIGEST_XXH3_128,
-        payload_digest,
-    });
-    append_batch_runtime(
-        state,
-        BatchRuntime {
-            reservation,
-            status: BatchStatus::Pending,
-            durable_replicas: 0,
-            replica_acks: 0,
-            producer,
-            atomic_group,
-            payload_digest: Some(payload_digest),
-            payload_bytes,
-            object_durable: false,
-        },
-    )?;
-    if let Some(group) = atomic_group {
-        register_atomic_chunk(state, group, reservation, payload_bytes)?;
-    }
-    Ok(ReserveOutcome::Reserved {
-        reservation,
-        producer: producer_sequence,
-        replication_policy: state.replication_policy,
-    })
 }
 
 fn complete(
@@ -1627,6 +1838,7 @@ fn complete(
             },
         );
     }
+    finish_query_lineage_batch(state, completion.reservation);
     Ok(completion.response)
 }
 
@@ -1756,6 +1968,8 @@ fn reserve_replica(
     payload_bytes: u64,
     payload_digest: [u8; 16],
 ) -> EngineResult<ReserveOutcome> {
+    let source = Arc::clone(&state.query_lineage);
+    let lineage_activity;
     if let Some(existing) = state.batches.get_mut(reservation.batch_id.get()) {
         let identity_matches = existing.reservation == reservation
             && existing.producer == producer
@@ -1783,6 +1997,8 @@ fn reserve_replica(
                 return Err(EngineError::ReplicaInFlight(reservation.batch_id));
             }
             BatchStatus::Aborted => {
+                lineage_activity = Some(source.begin());
+                existing.query_lineage_active = true;
                 existing.status = BatchStatus::Pending;
                 existing.producer = producer;
                 existing.atomic_group = atomic_group;
@@ -1800,6 +2016,9 @@ fn reserve_replica(
             register_atomic_chunk(state, group, reservation, payload_bytes)?;
         }
         state.reset_cached_watermarks_after_truncate();
+        if let Some(activity) = lineage_activity {
+            activity.transfer_to_batch();
+        }
         return Ok(ReserveOutcome::Reserved {
             reservation,
             producer: producer.map(|identity| ProducerSequence {
@@ -1830,6 +2049,7 @@ fn reserve_replica(
         )));
     }
     let previous = state.sequencer.state();
+    let activity = source.begin();
     let expected = state.sequencer.reserve(reservation.record_count)?;
     if expected != reservation {
         state.sequencer =
@@ -1857,12 +2077,14 @@ fn reserve_replica(
             atomic_group,
             payload_digest: Some(payload_digest),
             payload_bytes,
+            query_lineage_active: true,
             object_durable: false,
         },
     )?;
     if let Some(group) = atomic_group {
         register_atomic_chunk(state, group, reservation, payload_bytes)?;
     }
+    activity.transfer_to_batch();
     Ok(ReserveOutcome::Reserved {
         reservation,
         producer: producer.map(|identity| ProducerSequence {
@@ -1926,8 +2148,25 @@ fn fail(
     if definitely_not_written {
         mark_batch(state, reservation, BatchStatus::Aborted, 0)?;
         rollback_atomic_chunk(state, reservation)?;
+        finish_query_lineage_batch(state, reservation);
+    } else if state
+        .batches
+        .get(reservation.batch_id.get())
+        .is_some_and(|batch| batch.query_lineage_active)
+    {
+        // The actual worker did not prove no-write. No rollback/renewal fact.
+        state.query_lineage.deny();
     }
     Ok(())
+}
+
+fn finish_query_lineage_batch(state: &mut PartitionState, reservation: Reservation) {
+    if let Some(batch) = state.batches.get_mut(reservation.batch_id.get())
+        && batch.query_lineage_active
+    {
+        batch.query_lineage_active = false;
+        state.query_lineage.finish();
+    }
 }
 
 fn rollback_atomic_chunk(state: &mut PartitionState, reservation: Reservation) -> EngineResult<()> {
@@ -2114,6 +2353,7 @@ fn update_replication_policy(
                 .map_or(0, |batch| batch.durable_replicas),
         });
     }
+    let activity = state.query_lineage.begin();
     journal.append(JournalEvent::UpdateReplicationPolicy {
         topic_partition,
         expected_policy_generation,
@@ -2123,6 +2363,7 @@ fn update_replication_policy(
     })?;
     state.replication_policy = replication_policy;
     state.reset_cached_watermarks_after_truncate();
+    activity.settle();
     Ok(())
 }
 
@@ -2186,6 +2427,7 @@ fn truncate(
             "retention cannot discard an unresolved sequencer tail".into(),
         ));
     }
+    let activity = state.query_lineage.begin();
     journal.append(JournalEvent::TruncateCheckpoint {
         topic_partition,
         log_start,
@@ -2202,6 +2444,7 @@ fn truncate(
             .is_some_and(|batch_id| *batch_id >= first_retained)
     });
     state.reset_cached_watermarks_after_truncate();
+    activity.settle();
     Ok(state.watermarks())
 }
 
@@ -2400,6 +2643,37 @@ pub(crate) fn retention_hints(events: &[JournalEvent]) -> HashMap<TopicPartition
     hints
 }
 
+#[cfg(unix)]
+pub(crate) fn retention_hints_until(
+    events: &[JournalEvent],
+    expiry: std::time::Instant,
+) -> EngineResult<HashMap<TopicPartition, LogicalOffset>> {
+    recovery_reduce_clock(Some(expiry))?;
+    let mut hints = HashMap::new();
+    for event in events {
+        recovery_reduce_clock(Some(expiry))?;
+        match event {
+            JournalEvent::Truncate {
+                topic_partition,
+                log_start,
+            }
+            | JournalEvent::TruncateCheckpoint {
+                topic_partition,
+                log_start,
+                ..
+            } => {
+                hints
+                    .entry(*topic_partition)
+                    .and_modify(|current: &mut LogicalOffset| *current = (*current).max(*log_start))
+                    .or_insert(*log_start);
+            }
+            _ => {}
+        }
+    }
+    recovery_reduce_clock(Some(expiry))?;
+    Ok(hints)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RecoveredTruncation {
     log_start: LogicalOffset,
@@ -2427,12 +2701,169 @@ fn record_recovered_group_outcome(
     }
 }
 
+/// Source-derived logical native queue/map/dense-segment capacity, not RSS.
+#[cfg(unix)]
+pub(crate) fn recovery_coordinator_bytes(
+    workers: usize,
+    partitions: usize,
+    batches: usize,
+) -> Option<usize> {
+    use std::mem::size_of;
+    let queues = workers
+        .checked_mul(COORDINATOR_QUEUE_SLOTS.checked_mul(size_of::<CoordinatorCommand>())?)?
+        .checked_add(CONTROL_QUEUE_SLOTS.checked_mul(size_of::<ControlCommand>())?)?;
+    let dense = partitions
+        .checked_mul(ordered_segment_map::DEFAULT_SEGMENT_CAPACITY)?
+        .checked_add(batches)?;
+    let batch_values = dense.checked_mul(size_of::<BatchRuntime>() + size_of::<u128>())?;
+    let secondary = batches.checked_mul(
+        size_of::<AtomicGroupRuntime>()
+            + size_of::<u128>() * 4
+            + size_of::<ProducerCursor>()
+            + size_of::<DedupRecord>()
+            + size_of::<ExtentCatalogEntry>() * 4,
+    )?;
+    let maps = partitions.checked_mul(
+        crate::query_lineage::allocation_bytes()
+            + size_of::<PartitionState>() * 4
+            + size_of::<TopicSequencer>() * 2
+            + size_of::<HashMap<TopicPartition, PartitionState>>() * 8
+            + 1024,
+    )?;
+    queues
+        .checked_add(batch_values)?
+        .checked_add(secondary)?
+        .checked_add(maps)
+}
+
+#[cfg(unix)]
+fn recovery_start_clock(expiry: std::time::Instant) -> EngineResult<()> {
+    if std::time::Instant::now() >= expiry {
+        return Err(EngineError::InvalidConfig(
+            "native recovery original expiry elapsed".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Bounds actual synthetic abort slots using borrowed retained native facts.
+///
+/// The caller prepays every quadratic visit before entry and admits the returned
+/// slots before real recovery. This is sizing, not a new acceptance policy.
+#[cfg(unix)]
+pub(crate) fn recovery_batch_slots(
+    events: &[JournalEvent],
+    catalog: &HashMap<(TopicPartition, BatchId), ExtentCatalogEntry>,
+    expiry: std::time::Instant,
+) -> EngineResult<usize> {
+    let mut count = catalog.len();
+    for (&(tp, _), entry) in catalog {
+        if std::time::Instant::now() >= expiry {
+            return Err(EngineError::InvalidConfig(
+                "native recovery original expiry elapsed".into(),
+            ));
+        }
+        let previous = catalog
+            .iter()
+            .filter(|((other, _), old)| {
+                *other == tp && old.reservation.first_offset < entry.reservation.first_offset
+            })
+            .max_by_key(|(_, old)| old.reservation.first_offset)
+            .and_then(|(_, old)| old.reservation.batch_id.get().checked_add(1))
+            .unwrap_or(0);
+        // Native recovery replaces the complete truncation state in event
+        // order. A later legacy Truncate clears an earlier sequencer floor.
+        let mut floor = 0;
+        for event in events {
+            if std::time::Instant::now() >= expiry {
+                return Err(EngineError::InvalidConfig(
+                    "native recovery original expiry elapsed".into(),
+                ));
+            }
+            match event {
+                JournalEvent::TruncateCheckpoint {
+                    topic_partition,
+                    next_batch_id,
+                    ..
+                } if *topic_partition == tp => floor = next_batch_id.get(),
+                JournalEvent::Truncate {
+                    topic_partition, ..
+                } if *topic_partition == tp => {
+                    floor = 0;
+                }
+                _ => {}
+            }
+        }
+        let gap = entry
+            .reservation
+            .batch_id
+            .get()
+            .saturating_sub(previous.max(floor))
+            .min(MAX_RECOVERED_GAP_BATCHES);
+        count = count
+            .checked_add(
+                usize::try_from(gap).map_err(|_| {
+                    EngineError::InvalidConfig("native recovery slot overflow".into())
+                })?,
+            )
+            .ok_or_else(|| EngineError::InvalidConfig("native recovery slot overflow".into()))?;
+    }
+    Ok(count)
+}
+
 pub(crate) fn recover_partition_states(
     config: &EngineConfig,
     events: &[JournalEvent],
     catalog: &HashMap<(TopicPartition, BatchId), ExtentCatalogEntry>,
     recovered_durable_replicas: u32,
 ) -> EngineResult<HashMap<TopicPartition, PartitionState>> {
+    recover_partition_states_inner(config, events, catalog, recovered_durable_replicas, None)
+}
+/// Same native reducer and policy with an existing owned recovery Instant.
+#[cfg(unix)]
+pub(crate) fn recover_partition_states_until(
+    config: &EngineConfig,
+    events: &[JournalEvent],
+    catalog: &HashMap<(TopicPartition, BatchId), ExtentCatalogEntry>,
+    recovered_durable_replicas: u32,
+    expiry: std::time::Instant,
+) -> EngineResult<HashMap<TopicPartition, PartitionState>> {
+    recover_partition_states_inner(
+        config,
+        events,
+        catalog,
+        recovered_durable_replicas,
+        Some(expiry),
+    )
+}
+
+#[cfg(all(unix, test))]
+type RecoveryReduceHook = Box<dyn FnMut(&str)>;
+
+#[cfg(all(unix, test))]
+thread_local! {
+    pub(crate) static RECOVERY_REDUCE_STEP: std::cell::RefCell<Option<RecoveryReduceHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+// None has the ordinary reducer's original error order and no clock access.
+fn recovery_reduce_clock(expiry: Option<std::time::Instant>) -> EngineResult<()> {
+    if expiry.is_some_and(|end| std::time::Instant::now() >= end) {
+        return Err(EngineError::InvalidConfig(
+            "native recovery original expiry elapsed".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn recover_partition_states_inner(
+    config: &EngineConfig,
+    events: &[JournalEvent],
+    catalog: &HashMap<(TopicPartition, BatchId), ExtentCatalogEntry>,
+    recovered_durable_replicas: u32,
+    expiry: Option<std::time::Instant>,
+) -> EngineResult<HashMap<TopicPartition, PartitionState>> {
+    recovery_reduce_clock(expiry)?;
     if recovered_durable_replicas == 0 || recovered_durable_replicas > config.replication_factor {
         return Err(EngineError::InvalidConfig(
             "recovered durable replica count must be within the configured replication factor"
@@ -2444,90 +2875,17 @@ pub(crate) fn recover_partition_states(
     let mut truncations: HashMap<TopicPartition, RecoveredTruncation> = HashMap::new();
     let mut group_outcomes = HashMap::new();
     for event in events {
+        recovery_reduce_clock(expiry)?;
         match event {
-            JournalEvent::Configure {
-                topic_partition,
-                ring_epoch,
-                shards,
-            } => {
-                validate_ring(config, shards)?;
-                let history = rings.entry(*topic_partition).or_default();
-                if history
-                    .last_key_value()
-                    .is_some_and(|(current, _)| ring_epoch <= current)
-                {
-                    return Err(EngineError::CorruptState(format!(
-                        "non-increasing ring epoch for {}/{}",
-                        topic_partition.topic_id, topic_partition.partition_id
-                    )));
-                }
-                history.insert(*ring_epoch, shards.clone());
-                replication_policies
-                    .entry(*topic_partition)
-                    .or_insert_with(|| config.default_replication_policy());
-            }
-            JournalEvent::CreatePartition {
-                topic_partition,
-                ring_epoch,
-                shards,
-                policy_generation,
-                replication_factor,
-                min_in_sync_replicas,
-            } => {
-                validate_ring(config, shards)?;
-                if rings.contains_key(topic_partition) {
-                    return Err(EngineError::CorruptState(format!(
-                        "duplicate partition creation for {}/{}",
-                        topic_partition.topic_id, topic_partition.partition_id
-                    )));
-                }
-                let policy = PartitionReplicationPolicy {
-                    policy_generation: *policy_generation,
-                    replication_factor: *replication_factor,
-                    min_in_sync_replicas: *min_in_sync_replicas,
-                };
-                policy.validate(config.replication_factor)?;
-                rings
-                    .entry(*topic_partition)
-                    .or_default()
-                    .insert(*ring_epoch, shards.clone());
-                replication_policies.insert(*topic_partition, policy);
-            }
-            JournalEvent::UpdateReplicationPolicy {
-                topic_partition,
-                expected_policy_generation,
-                policy_generation,
-                replication_factor,
-                min_in_sync_replicas,
-            } => {
-                if !rings.contains_key(topic_partition) {
-                    return Err(EngineError::CorruptState(format!(
-                        "replication policy update for unconfigured partition {}/{}",
-                        topic_partition.topic_id, topic_partition.partition_id
-                    )));
-                }
-                let policy = PartitionReplicationPolicy {
-                    policy_generation: *policy_generation,
-                    replication_factor: *replication_factor,
-                    min_in_sync_replicas: *min_in_sync_replicas,
-                };
-                policy.validate(config.replication_factor)?;
-                let current = replication_policies
-                    .get(topic_partition)
-                    .copied()
-                    .unwrap_or_else(|| config.default_replication_policy());
-                if current != policy {
-                    if current.policy_generation != *expected_policy_generation {
-                        return Err(EngineError::CorruptState(format!(
-                            "replication policy generation mismatch for {}/{}: expected {}, found {}",
-                            topic_partition.topic_id,
-                            topic_partition.partition_id,
-                            expected_policy_generation,
-                            current.policy_generation
-                        )));
-                    }
-                    replication_policies.insert(*topic_partition, policy);
-                }
+            JournalEvent::Configure { .. }
+            | JournalEvent::CreatePartition { .. }
+            | JournalEvent::UpdateReplicationPolicy { .. } => {
+                apply_recovered_catalog_event(
+                    config,
+                    event,
+                    &mut rings,
+                    &mut replication_policies,
+                )?;
             }
             JournalEvent::Truncate {
                 topic_partition,
@@ -2624,6 +2982,7 @@ pub(crate) fn recover_partition_states(
 
     let mut by_partition: HashMap<TopicPartition, Vec<ExtentCatalogEntry>> = HashMap::new();
     for (&(topic_partition, _), entry) in catalog {
+        recovery_reduce_clock(expiry)?;
         if !rings.contains_key(&topic_partition) {
             return Err(EngineError::CorruptState(format!(
                 "extent for unconfigured partition {}/{}",
@@ -2638,6 +2997,7 @@ pub(crate) fn recover_partition_states(
 
     let mut result = HashMap::new();
     for (topic_partition, history) in rings {
+        recovery_reduce_clock(expiry)?;
         let (&ring_epoch, shards) = history
             .last_key_value()
             .expect("configured partition has a ring");
@@ -2668,6 +3028,7 @@ pub(crate) fn recover_partition_states(
                 topic_partition.topic_id, topic_partition.partition_id
             )));
         }
+        recovery_reduce_clock(expiry)?;
         let mut state = PartitionState::empty(
             TopicSequencer::new(
                 topic_partition.topic_id,
@@ -2689,6 +3050,7 @@ pub(crate) fn recover_partition_states(
         }
 
         for entry in entries {
+            recovery_reduce_clock(expiry)?;
             let reservation = entry.reservation;
             let atomic_group = entry.atomic_group.map(|group| AtomicGroupIdentity {
                 transaction_id: group.transaction_id,
@@ -2720,17 +3082,33 @@ pub(crate) fn recover_partition_states(
                     reservation.batch_id
                 )));
             }
-            append_recovered_aborts(
-                &mut state,
-                &history,
-                topic_partition,
-                next_batch_id,
-                next_offset,
-                next_placement_sequence,
-                missing_batches,
-                missing_records,
-                reservation.placement.ring_epoch,
-            )?;
+            if let Some(expiry) = expiry {
+                append_recovered_aborts_until(
+                    &mut state,
+                    &history,
+                    topic_partition,
+                    next_batch_id,
+                    next_offset,
+                    next_placement_sequence,
+                    missing_batches,
+                    missing_records,
+                    reservation.placement.ring_epoch,
+                    expiry,
+                )?;
+            } else {
+                append_recovered_aborts(
+                    &mut state,
+                    &history,
+                    topic_partition,
+                    next_batch_id,
+                    next_offset,
+                    next_placement_sequence,
+                    missing_batches,
+                    missing_records,
+                    reservation.placement.ring_epoch,
+                )?;
+            }
+            recovery_reduce_clock(expiry)?;
             append_batch_runtime(
                 &mut state,
                 BatchRuntime {
@@ -2758,6 +3136,7 @@ pub(crate) fn recover_partition_states(
                         .map(|producer| producer.payload_digest)
                         .or_else(|| entry.atomic_group.map(|group| group.payload_digest)),
                     payload_bytes: entry.payload_bytes,
+                    query_lineage_active: false,
                     object_durable: entry.object_durable,
                 },
             )?;
@@ -2789,17 +3168,28 @@ pub(crate) fn recover_partition_states(
                 .ok_or_else(|| EngineError::CorruptState("placement sequence exhausted".into()))?;
         }
         for (&transaction_id, group) in &mut state.atomic_groups {
+            recovery_reduce_clock(expiry)?;
             group.state = group_outcomes
                 .get(&(topic_partition, transaction_id))
                 .copied()
                 .unwrap_or(AtomicGroupState::Unresolved);
         }
-        state.finalized_groups.extend(
-            group_outcomes
-                .iter()
-                .filter(|((partition, _), _)| *partition == topic_partition)
-                .map(|((_, transaction_id), outcome)| (*transaction_id, *outcome)),
-        );
+        if expiry.is_some() {
+            for ((partition, transaction_id), outcome) in &group_outcomes {
+                recovery_reduce_clock(expiry)?;
+                if *partition == topic_partition {
+                    state.finalized_groups.insert(*transaction_id, *outcome);
+                }
+            }
+        } else {
+            state.finalized_groups.extend(
+                group_outcomes
+                    .iter()
+                    .filter(|((partition, _), _)| *partition == topic_partition)
+                    .map(|((_, transaction_id), outcome)| (*transaction_id, *outcome)),
+            );
+        }
+        recovery_reduce_clock(expiry)?;
         state.sequencer = TopicSequencer::restore(SequencerState {
             topic_id: topic_partition.topic_id,
             partition_id: topic_partition.partition_id,
@@ -2831,8 +3221,10 @@ pub(crate) fn recover_partition_states(
             .batches
             .truncate_before(first_retained.expect("validated retained batch key"));
         state.reset_cached_watermarks_after_truncate();
+        recovery_reduce_clock(expiry)?;
         result.insert(topic_partition, state);
     }
+    recovery_reduce_clock(expiry)?;
     Ok(result)
 }
 
@@ -2941,11 +3333,104 @@ fn append_recovered_aborts(
                 atomic_group: None,
                 payload_digest: None,
                 payload_bytes: 0,
+                query_lineage_active: false,
                 object_durable: false,
             },
         )?;
         offset = last_offset + 1;
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_recovered_aborts_until(
+    state: &mut PartitionState,
+    rings: &BTreeMap<RingEpoch, Vec<ShardId>>,
+    topic_partition: TopicPartition,
+    first_batch_id: u128,
+    first_offset: u64,
+    first_sequence: u64,
+    missing_batches: u128,
+    missing_records: u64,
+    ring_epoch: RingEpoch,
+    expiry: std::time::Instant,
+) -> EngineResult<()> {
+    recovery_reduce_clock(Some(expiry))?;
+    if missing_batches == 0 {
+        if missing_records == 0 {
+            return Ok(());
+        }
+        return Err(EngineError::CorruptState(
+            "logical offset gap has no missing reservations".into(),
+        ));
+    }
+    let missing_batches_u64 = u64::try_from(missing_batches)
+        .map_err(|_| EngineError::CorruptState("recovered batch gap exceeds u64".into()))?;
+    if missing_batches > MAX_RECOVERED_GAP_BATCHES
+        || missing_records < missing_batches_u64
+        || missing_records > missing_batches_u64.saturating_mul(u64::from(u32::MAX))
+    {
+        return Err(EngineError::CorruptState(
+            "recovered reservation gap exceeds safety bounds".into(),
+        ));
+    }
+    let shards = rings.get(&ring_epoch).ok_or_else(|| {
+        EngineError::CorruptState("recovered gap references an unknown ring".into())
+    })?;
+    let base = missing_records / missing_batches_u64;
+    let remainder = missing_records % missing_batches_u64;
+    let mut offset = first_offset;
+    for index in 0..missing_batches_u64 {
+        recovery_reduce_clock(Some(expiry))?;
+        let count = base + u64::from(index < remainder);
+        let count_u32 = u32::try_from(count)
+            .map_err(|_| EngineError::CorruptState("recovered abort is too large".into()))?;
+        let record_count = NonZeroU32::new(count_u32)
+            .ok_or_else(|| EngineError::CorruptState("zero recovered abort".into()))?;
+        let batch_id = first_batch_id + u128::from(index);
+        let sequence = first_sequence + index;
+        let shard_index = sequence as usize % shards.len();
+        let last_offset = offset
+            .checked_add(count - 1)
+            .ok_or_else(|| EngineError::CorruptState("abort offset overflow".into()))?;
+        let reservation = Reservation {
+            topic_id: topic_partition.topic_id,
+            partition_id: topic_partition.partition_id,
+            batch_id: BatchId::new(batch_id),
+            first_offset: LogicalOffset::new(offset),
+            last_offset: LogicalOffset::new(last_offset),
+            record_count,
+            placement: Placement {
+                virtual_lane_id: shards[shard_index],
+                ring_epoch,
+                leader_epoch: state.sequencer.state().leader_epoch,
+                sequence: PlacementSequence::new(sequence),
+            },
+        };
+        append_batch_runtime(
+            state,
+            BatchRuntime {
+                reservation,
+                status: BatchStatus::Aborted,
+                durable_replicas: 0,
+                replica_acks: 0,
+                producer: None,
+                atomic_group: None,
+                payload_digest: None,
+                payload_bytes: 0,
+                query_lineage_active: false,
+                object_durable: false,
+            },
+        )?;
+        #[cfg(all(unix, test))]
+        RECOVERY_REDUCE_STEP.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook("abort-appended");
+            }
+        });
+        offset = last_offset + 1;
+    }
+    recovery_reduce_clock(Some(expiry))?;
     Ok(())
 }
 

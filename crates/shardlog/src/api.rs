@@ -4,6 +4,24 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 
+#[path = "api_durability.rs"]
+mod durability;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[path = "api_pinned.rs"]
+pub(crate) mod pinned;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use pinned::{
+    OpenedPinnedShardLog, PinnedShardLogGcChecks, PinnedShardLogGcComplete, PinnedShardLogGcError,
+    PinnedShardLogGcFailure, PinnedShardLogGcObservation, PinnedShardLogOpenChecks,
+    PinnedShardLogOpenError, PinnedShardLogOpenFailure, PinnedShardLogOpenObservation,
+    PinnedShardLogReadComplete, PinnedShardLogReadError, PinnedShardLogReadFailure,
+    PinnedShardLogReadPhase, PinnedShardLogWriteChecks, PinnedShardLogWriteComplete,
+    PinnedShardLogWriteError, PinnedShardLogWriteFailure, PinnedShardLogWriteLimits,
+    PinnedShardLogWriteObservation, pinned_shard_log_gc_cost, pinned_shard_log_open_cost,
+    pinned_shard_log_read_cost, pinned_shard_log_write_cost,
+};
+
 use crate::{
     BatchId, LeaderEpoch, LogicalOffset, LogicalPartitionId, Placement, PlacementSequence,
     Reservation, RingEpoch, ShardId, ShardStore, ShardStoreConfig, StorageError, TopicId,
@@ -13,6 +31,10 @@ use crate::{
 const SHARDLOG_TOPIC_ID: TopicId = TopicId::new(0x5348_4152_444c_4f47_5f56_3100);
 const SHARDLOG_PARTITION_ID: LogicalPartitionId = LogicalPartitionId::new(0);
 const SHARDLOG_SHARD_ID: ShardId = ShardId::new(0);
+const CANONICAL_STREAM_DIAGNOSTIC: &str =
+    "ShardLog directory contains records outside its canonical stream";
+const RETAINED_GAP_DIAGNOSTIC: &str = "ShardLog retained sequence contains a gap";
+const SEQUENCE_OVERFLOW_DIAGNOSTIC: &str = "ShardLog sequence or byte count overflow";
 
 /// Result type returned by ShardLog operations.
 pub type ShardLogResult<T> = Result<T, StorageError>;
@@ -108,22 +130,7 @@ impl ShardLog {
             .into_iter()
             .map(|entry| validate_catalog_entry(entry.reservation))
             .collect::<ShardLogResult<Vec<_>>>()?;
-        if sequences.is_empty() {
-            return Ok(None);
-        }
-        sequences.sort_unstable();
-        for pair in sequences.windows(2) {
-            if pair[1] != pair[0].checked_add(1).ok_or_else(sequence_overflow)? {
-                return Err(StorageError::InvalidInput(
-                    "ShardLog retained sequence contains a gap".to_string(),
-                ));
-            }
-        }
-        let first = sequences[0];
-        let next = sequences[sequences.len() - 1]
-            .checked_add(1)
-            .ok_or_else(sequence_overflow)?;
-        Ok(Some((first, next)))
+        retained_bounds(&mut sequences)
     }
 
     /// Appends a contiguous record group.
@@ -136,20 +143,11 @@ impl ShardLog {
         records: &[Bytes],
         durable: bool,
     ) -> ShardLogResult<ShardLogAppendReceipt> {
-        if records.is_empty() {
-            return Err(StorageError::InvalidInput(
-                "ShardLog append group cannot be empty".to_string(),
-            ));
-        }
-        let last_sequence = first_sequence
-            .checked_add(u64::try_from(records.len() - 1).map_err(|_| sequence_overflow())?)
-            .ok_or_else(sequence_overflow)?;
+        let last_sequence = append_group_last_sequence(first_sequence, records)?;
         let mut payload_bytes = 0u64;
         let mut prepared = Vec::with_capacity(records.len());
         for (index, payload) in records.iter().enumerate() {
-            let sequence = first_sequence
-                .checked_add(u64::try_from(index).map_err(|_| sequence_overflow())?)
-                .ok_or_else(sequence_overflow)?;
+            let sequence = append_group_sequence(first_sequence, index)?;
             payload_bytes = payload_bytes
                 .checked_add(u64::try_from(payload.len()).map_err(|_| sequence_overflow())?)
                 .ok_or_else(sequence_overflow)?;
@@ -185,13 +183,7 @@ impl ShardLog {
         self.inner
             .read_fetch_plan(&plan)?
             .into_iter()
-            .map(|batch| {
-                let sequence = validate_catalog_entry(batch.reservation)?;
-                Ok(ShardLogRecord {
-                    sequence,
-                    payload: batch.payload,
-                })
-            })
+            .map(record_from_batch)
             .collect()
     }
 
@@ -215,11 +207,7 @@ impl ShardLog {
             topic_partition(),
             LogicalOffset::new(sequence),
         )]))?;
-        Ok(ShardLogCompactionReceipt {
-            packs_removed: stats.packs_removed,
-            records_removed: stats.extents_removed,
-            bytes_removed: stats.bytes_removed,
-        })
+        Ok(compaction_receipt(stats))
     }
 
     /// Returns the current active pack path for operational inspection.
@@ -257,12 +245,70 @@ fn validate_catalog_entry(reservation: Reservation) -> ShardLogResult<u64> {
         || reservation.first_offset != reservation.last_offset
     {
         return Err(StorageError::InvalidInput(
-            "ShardLog directory contains records outside its canonical stream".to_string(),
+            CANONICAL_STREAM_DIAGNOSTIC.to_string(),
         ));
     }
     Ok(reservation.first_offset.get())
 }
 
 fn sequence_overflow() -> StorageError {
-    StorageError::LimitExceeded("ShardLog sequence or byte count overflow".to_string())
+    StorageError::LimitExceeded(SEQUENCE_OVERFLOW_DIAGNOSTIC.to_string())
+}
+
+/// Shared canonical sequence policy for ordinary and pinned log adoption.
+fn retained_bounds(sequences: &mut [u64]) -> ShardLogResult<Option<(u64, u64)>> {
+    if sequences.is_empty() {
+        return Ok(None);
+    }
+    sequences.sort_unstable();
+    for pair in sequences.windows(2) {
+        if pair[1] != pair[0].checked_add(1).ok_or_else(sequence_overflow)? {
+            return Err(StorageError::InvalidInput(
+                RETAINED_GAP_DIAGNOSTIC.to_string(),
+            ));
+        }
+    }
+    let first = sequences[0];
+    let next = sequences[sequences.len() - 1]
+        .checked_add(1)
+        .ok_or_else(sequence_overflow)?;
+    Ok(Some((first, next)))
+}
+
+// Shared whole ordinary batch-to-canonical-record mapping.
+fn record_from_batch(batch: crate::StoredBatch) -> ShardLogResult<ShardLogRecord> {
+    let sequence = validate_catalog_entry(batch.reservation)?;
+    Ok(ShardLogRecord {
+        sequence,
+        payload: batch.payload,
+    })
+}
+
+// Shared actual canonical append validation/arithmetic. The ordinary call body
+// is recovered exactly by inlining these two helpers (bound in draft proof).
+fn append_group_last_sequence(first_sequence: u64, records: &[Bytes]) -> ShardLogResult<u64> {
+    if records.is_empty() {
+        return Err(StorageError::InvalidInput(
+            "ShardLog append group cannot be empty".to_string(),
+        ));
+    }
+    let last_sequence = first_sequence
+        .checked_add(u64::try_from(records.len() - 1).map_err(|_| sequence_overflow())?)
+        .ok_or_else(sequence_overflow)?;
+    Ok(last_sequence)
+}
+fn append_group_sequence(first_sequence: u64, index: usize) -> ShardLogResult<u64> {
+    first_sequence
+        .checked_add(u64::try_from(index).map_err(|_| sequence_overflow())?)
+        .ok_or_else(sequence_overflow)
+}
+
+// Pure receipt mapping shared with consuming tracked compaction. No native phase
+// or ordinary retention predicate is changed by this scalar factorization.
+fn compaction_receipt(stats: crate::GarbageCollectionStats) -> ShardLogCompactionReceipt {
+    ShardLogCompactionReceipt {
+        packs_removed: stats.packs_removed,
+        records_removed: stats.extents_removed,
+        bytes_removed: stats.bytes_removed,
+    }
 }

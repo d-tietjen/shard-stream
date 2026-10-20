@@ -12,6 +12,10 @@ Before submitting a change:
 5. record copied or substantially adapted `shard-kv` code in `UPSTREAM.md`;
 6. run formatting, Clippy with warnings denied, and the full test workspace.
 
+The repository's `rustfmt.toml` fixes the existing 100-column Rust style so
+canonical formatting does not inherit configuration from an unrelated parent
+checkout. This keeps the default CI style unchanged.
+
 Performance changes must report durability spelling, RF1, record and batch
 sizes, compression, hardware, queue bounds, and latency percentiles. A faster
 result with weaker local durability or unbounded buffering is not valid.

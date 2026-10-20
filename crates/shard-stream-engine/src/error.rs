@@ -11,6 +11,8 @@ pub type EngineResult<T> = Result<T, EngineError>;
 #[derive(Debug)]
 pub enum EngineError {
     InvalidConfig(String),
+    /// Retryable refusal before an operation entered physical work.
+    OperationBusy(&'static str),
     TopicAlreadyExists(TopicId),
     UnknownPartition {
         topic_id: TopicId,
@@ -91,6 +93,7 @@ impl fmt::Display for EngineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidConfig(message) => write!(formatter, "invalid engine config: {message}"),
+            Self::OperationBusy(reason) => write!(formatter, "engine operation busy: {reason}"),
             Self::TopicAlreadyExists(topic_id) => {
                 write!(formatter, "topic {topic_id} already exists")
             }

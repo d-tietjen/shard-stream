@@ -5,7 +5,7 @@ use std::sync::mpsc::{SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use shard_stream_core::{BatchId, TopicPartition};
+use shard_stream_core::{BatchId, ReplicaSourceIdentity, TopicPartition};
 use shard_stream_protocol::{AppendResponse, ReplicaAppend};
 
 use crate::engine::ReplicaAppendPlan;
@@ -53,11 +53,13 @@ impl DurableApplyConfig {
 
 struct AdmissionCommand {
     batch: ReplicaAppend,
+    source: Option<ReplicaSourceIdentity>,
     response: SyncSender<EngineResult<AppendResponse>>,
 }
 
 struct PendingBatch {
     batch: ReplicaAppend,
+    source: Option<ReplicaSourceIdentity>,
     waiters: Vec<SyncSender<EngineResult<AppendResponse>>>,
 }
 
@@ -128,16 +130,58 @@ impl fmt::Debug for DurableApplyQueue {
 
 impl DurableApplyQueue {
     pub fn spawn(engine: Arc<StreamEngine>, config: DurableApplyConfig) -> EngineResult<Self> {
+        Self::spawn_with_engine_handle(engine.into(), config)
+    }
+
+    /// Starts the unchanged replica queues retaining the actual engine owner.
+    ///
+    /// A recovered handle remains alive through every admission/append worker
+    /// and physical join. This grants no replica identity or write permission.
+    pub fn spawn_with_engine_handle(
+        engine: crate::EngineHandle,
+        config: DurableApplyConfig,
+    ) -> EngineResult<Self> {
+        Self::spawn_with_engine_handle_inner(engine, config, None)
+    }
+
+    /// Starts replica queues within the caller's original absolute startup expiry.
+    ///
+    /// Each channel and worker starts only after checking that same `Instant`.
+    /// A started spawn may settle late; refusal then physically joins all started
+    /// workers while retaining the complete engine owner. This does not limit
+    /// the lifetime of a successfully constructed queue or grant write authority.
+    pub fn spawn_with_engine_handle_until(
+        engine: crate::EngineHandle,
+        config: DurableApplyConfig,
+        original_expiry: Instant,
+    ) -> EngineResult<Self> {
+        Self::spawn_with_engine_handle_inner(engine, config, Some(original_expiry))
+    }
+
+    fn spawn_with_engine_handle_inner(
+        engine: crate::EngineHandle,
+        config: DurableApplyConfig,
+        original_expiry: Option<Instant>,
+    ) -> EngineResult<Self> {
+        queue_start_clock(original_expiry)?;
         let config = config.validate()?;
+        queue_start_clock(original_expiry)?;
         let append_worker_count = engine.replica_append_worker_count();
+        queue_start_clock(original_expiry)?;
         let mut append_workers = Vec::with_capacity(append_worker_count);
+        queue_start_clock(original_expiry)?;
         let mut append_senders = Vec::with_capacity(append_worker_count);
         for index in 0..append_worker_count {
+            queue_start_clock(original_expiry)?;
             let (sender, receiver) =
                 sync_channel::<DurableApplyWork>(config.queue_slots_per_worker);
-            let engine = Arc::clone(&engine);
-            let thread = thread::Builder::new()
-                .name(format!("shard-stream-replica-append-{index}"))
+            queue_start_clock(original_expiry)?;
+            let engine = engine.clone();
+            queue_start_clock(original_expiry)?;
+            let builder =
+                thread::Builder::new().name(format!("shard-stream-replica-append-{index}"));
+            queue_start_clock(original_expiry)?;
+            let thread = builder
                 .spawn(move || {
                     while let Ok(work) = receiver.recv() {
                         let mut works = vec![work];
@@ -174,15 +218,28 @@ impl DurableApplyQueue {
                 sender: Some(sender),
                 thread: Some(thread),
             });
+            // Store the actual join handle before any late refusal or observer
+            // unwind. On failure, extra append senders drop before these workers;
+            // the engine parameter remains alive until every physical join ends.
+            #[cfg(test)]
+            queue_spawn_phase(QueueSpawnPhase::AppendStarted, index);
+            queue_start_clock(original_expiry)?;
         }
 
+        queue_start_clock(original_expiry)?;
         let mut admission_workers = Vec::with_capacity(config.worker_count);
         for index in 0..config.worker_count {
+            queue_start_clock(original_expiry)?;
             let (sender, receiver) = sync_channel(config.queue_slots_per_worker);
-            let engine = Arc::clone(&engine);
+            queue_start_clock(original_expiry)?;
+            let engine = engine.clone();
+            queue_start_clock(original_expiry)?;
             let append_senders = append_senders.clone();
-            let thread = thread::Builder::new()
-                .name(format!("shard-stream-replica-admission-{index}"))
+            queue_start_clock(original_expiry)?;
+            let builder =
+                thread::Builder::new().name(format!("shard-stream-replica-admission-{index}"));
+            queue_start_clock(original_expiry)?;
+            let thread = builder
                 .spawn(move || {
                     let mut partitions = HashMap::new();
                     while let Ok(command) = receiver.recv() {
@@ -198,7 +255,11 @@ impl DurableApplyQueue {
                 sender: Some(sender),
                 thread: Some(thread),
             });
+            #[cfg(test)]
+            queue_spawn_phase(QueueSpawnPhase::AdmissionStarted, index);
+            queue_start_clock(original_expiry)?;
         }
+        queue_start_clock(original_expiry)?;
         Ok(Self {
             admission_workers,
             append_workers,
@@ -206,6 +267,27 @@ impl DurableApplyQueue {
     }
 
     pub fn append(&self, batch: ReplicaAppend) -> EngineResult<AppendResponse> {
+        self.append_with_source(batch, None)
+    }
+
+    /// Applies a replica batch with identity supplied by a verified transport.
+    ///
+    /// The host must construct `source` from the actual authenticated connection.
+    /// This queue does not authenticate its fields or infer a sender from the
+    /// payload. An installed fence must explicitly validate replica authority.
+    pub fn append_from_peer(
+        &self,
+        batch: ReplicaAppend,
+        source: ReplicaSourceIdentity,
+    ) -> EngineResult<AppendResponse> {
+        self.append_with_source(batch, Some(source))
+    }
+
+    fn append_with_source(
+        &self,
+        batch: ReplicaAppend,
+        source: Option<ReplicaSourceIdentity>,
+    ) -> EngineResult<AppendResponse> {
         let topic_partition =
             TopicPartition::new(batch.reservation.topic_id, batch.reservation.partition_id);
         let index = partition_worker(topic_partition, self.admission_workers.len());
@@ -215,12 +297,74 @@ impl DurableApplyQueue {
             .ok_or_else(|| EngineError::CorruptState("durable apply worker stopped".into()))?;
         let (response, receiver) = sync_channel(1);
         sender
-            .send(AdmissionCommand { batch, response })
+            .send(AdmissionCommand {
+                batch,
+                source,
+                response,
+            })
             .map_err(|_| EngineError::CorruptState("durable apply worker stopped".into()))?;
         receiver
             .recv()
             .map_err(|_| EngineError::CorruptState("durable apply response lost".into()))?
     }
+}
+
+fn queue_start_clock(original_expiry: Option<Instant>) -> EngineResult<()> {
+    if original_expiry.is_some_and(|expiry| Instant::now() >= expiry) {
+        return Err(EngineError::InvalidConfig(
+            "durable apply original startup expiry elapsed".into(),
+        ));
+    }
+    Ok(())
+}
+
+// These observers schedule tests at actual completed spawns. They cannot
+// replace the original clock, native worker, owner, channel, or join handle.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QueueSpawnPhase {
+    AppendStarted,
+    AdmissionStarted,
+}
+
+#[cfg(test)]
+type QueueSpawnCallback = Box<dyn FnMut(QueueSpawnPhase, usize)>;
+
+#[cfg(test)]
+std::thread_local! {
+    static QUEUE_SPAWN_OBSERVER: std::cell::RefCell<Option<QueueSpawnCallback>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) struct QueueSpawnObserver;
+
+#[cfg(test)]
+impl QueueSpawnObserver {
+    pub(crate) fn install(observer: impl FnMut(QueueSpawnPhase, usize) + 'static) -> Self {
+        QUEUE_SPAWN_OBSERVER.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(observer));
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for QueueSpawnObserver {
+    fn drop(&mut self) {
+        QUEUE_SPAWN_OBSERVER.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn queue_spawn_phase(phase: QueueSpawnPhase, index: usize) {
+    QUEUE_SPAWN_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.borrow_mut().as_mut() {
+            observer(phase, index);
+        }
+    });
 }
 
 fn admit(
@@ -257,6 +401,7 @@ fn admit(
             engine,
             append_senders,
             command.batch,
+            command.source,
             vec![command.response],
         );
         return;
@@ -297,11 +442,12 @@ fn admit(
                 state.pending_bytes = state.pending_bytes.saturating_add(received_bytes);
                 entry.insert(PendingBatch {
                     batch: command.batch,
+                    source: command.source,
                     waiters: vec![command.response],
                 });
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => {
-                if entry.get().batch == command.batch {
+                if entry.get().batch == command.batch && entry.get().source == command.source {
                     entry.get_mut().waiters.push(command.response);
                 } else {
                     let _ = command.response.send(Err(EngineError::CorruptState(format!(
@@ -318,6 +464,7 @@ fn admit(
         engine,
         append_senders,
         command.batch,
+        command.source,
         vec![command.response],
     ) {
         state.next_batch_id = state.next_batch_id.saturating_add(1);
@@ -334,7 +481,13 @@ fn drain_contiguous(
         state.pending_bytes = state
             .pending_bytes
             .saturating_sub(pending.batch.payload.len());
-        if reserve_and_dispatch(engine, append_senders, pending.batch, pending.waiters) {
+        if reserve_and_dispatch(
+            engine,
+            append_senders,
+            pending.batch,
+            pending.source,
+            pending.waiters,
+        ) {
             state.next_batch_id = state.next_batch_id.saturating_add(1);
         } else {
             break;
@@ -346,12 +499,22 @@ fn reserve_and_dispatch(
     engine: &StreamEngine,
     append_senders: &[SyncSender<DurableApplyWork>],
     batch: ReplicaAppend,
+    source: Option<ReplicaSourceIdentity>,
     waiters: Vec<SyncSender<EngineResult<AppendResponse>>>,
 ) -> bool {
-    let plan = match engine.plan_replica_append(&batch) {
+    let plan = match engine.plan_replica_append_from_peer(&batch, source.as_ref()) {
         Ok(ReplicaAppendPlan::Duplicate(response)) => {
             respond_all(waiters, Ok(response));
             return true;
+        }
+        Ok(plan @ ReplicaAppendPlan::Prepared { .. }) => {
+            // Guarded preparation allocates nothing. Advance this admission
+            // cursor only after the actual receiver guard/commit/WAL result;
+            // a later batch must not observe a speculative reserved predecessor.
+            let result = engine.execute_replica_append(batch, plan);
+            let accepted = result.is_ok();
+            respond_all(waiters, result);
+            return accepted;
         }
         Ok(plan @ ReplicaAppendPlan::Reserved { .. }) => plan,
         Err(error) => {

@@ -51,7 +51,7 @@ use serde::Serialize;
 use shard_stream_core::{
     AssignmentProvider, LogicalOffset, LogicalPartitionId, TopicId, TopicPartition,
 };
-use shard_stream_engine::{EngineError, EngineResult, StreamEngine, TopicConfig};
+use shard_stream_engine::{EngineError, EngineHandle, EngineResult, StreamEngine, TopicConfig};
 use shard_stream_protocol::{AppendRequest, Durability, FetchMode, FetchRequest};
 use tokio::io::AsyncRead;
 #[cfg(test)]
@@ -336,7 +336,7 @@ pub trait TopicAdmin: Send + Sync {
 }
 
 struct LocalTopicAdmin {
-    engine: Arc<StreamEngine>,
+    engine: EngineHandle,
 }
 
 impl TopicAdmin for LocalTopicAdmin {
@@ -344,7 +344,7 @@ impl TopicAdmin for LocalTopicAdmin {
         &self,
         topic: TopicConfig,
     ) -> Pin<Box<dyn Future<Output = EngineResult<()>> + Send + '_>> {
-        let engine = Arc::clone(&self.engine);
+        let engine = self.engine.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || engine.create_topic(topic))
                 .await
@@ -356,7 +356,7 @@ impl TopicAdmin for LocalTopicAdmin {
 }
 
 struct Broker {
-    engine: Arc<StreamEngine>,
+    engine: EngineHandle,
     config: KafkaConfig,
     topic_admin: Arc<dyn TopicAdmin>,
     known_topics: KnownTopics,
@@ -432,15 +432,40 @@ pub async fn serve(
     config: KafkaConfig,
     shutdown: watch::Receiver<bool>,
 ) -> KafkaResult<()> {
-    let topic_admin = Arc::new(LocalTopicAdmin {
-        engine: Arc::clone(&engine),
-    });
-    serve_with_admin(listener, engine, config, topic_admin, shutdown).await
+    serve_with_engine_handle(listener, engine.into(), config, shutdown).await
 }
 
 pub async fn serve_with_admin(
     listener: TcpListener,
     engine: Arc<StreamEngine>,
+    config: KafkaConfig,
+    topic_admin: Arc<dyn TopicAdmin>,
+    shutdown: watch::Receiver<bool>,
+) -> KafkaResult<()> {
+    serve_with_admin_and_engine_handle(listener, engine.into(), config, topic_admin, shutdown).await
+}
+
+/// Serves the same Kafka protocol and native topic admin with actual engine custody.
+/// This retains a recovered wrapper through connection and blocking work, without
+/// granting startup, assignment or serving permission.
+pub async fn serve_with_engine_handle(
+    listener: TcpListener,
+    engine: EngineHandle,
+    config: KafkaConfig,
+    shutdown: watch::Receiver<bool>,
+) -> KafkaResult<()> {
+    let topic_admin = Arc::new(LocalTopicAdmin {
+        engine: engine.clone(),
+    });
+    serve_with_admin_and_engine_handle(listener, engine, config, topic_admin, shutdown).await
+}
+
+/// Serves the same Kafka protocol with the host's existing topic-admin contract.
+/// The caller must ensure that admin shares the intended actual storage; the
+/// handle retains the broker's engine and creates no authority for either one.
+pub async fn serve_with_admin_and_engine_handle(
+    listener: TcpListener,
+    engine: EngineHandle,
     config: KafkaConfig,
     topic_admin: Arc<dyn TopicAdmin>,
     mut shutdown: watch::Receiver<bool>,
@@ -1249,7 +1274,8 @@ fn engine_error(error: EngineError) -> ResponseError {
         EngineError::UnknownPartition { .. } | EngineError::UnknownShard(_) => {
             ResponseError::UnknownTopicOrPartition
         }
-        EngineError::AdmissionLimited { .. }
+        EngineError::OperationBusy(_)
+        | EngineError::AdmissionLimited { .. }
         | EngineError::ReplicaReorderLimited { .. }
         | EngineError::ReplicaBufferLimited { .. }
         | EngineError::ReplicaInFlight(_) => ResponseError::ThrottlingQuotaExceeded,
@@ -1678,5 +1704,56 @@ mod tests {
                 }
             },
         ]
+    }
+
+    #[tokio::test]
+    async fn actual_local_topic_admin_future_retains_handle_and_persists_rf1_native_topic() {
+        let temp = TempDir::new();
+        let directory = temp.0.clone();
+        let cfg = EngineConfig {
+            data_dir: directory.clone(),
+            object_store_dir: None,
+            shard_count: 1,
+            virtual_lane_count: 1,
+            replication_factor: 1,
+            min_in_sync_replicas: 1,
+            queue_slots_per_shard: 16,
+            queue_bytes_per_shard: 1 << 20,
+            target_pack_bytes: 4096,
+            max_pack_age: std::time::Duration::from_secs(30),
+            max_batch_bytes: 4096,
+            max_fetch_bytes: 4096,
+            append_linger: std::time::Duration::ZERO,
+        };
+        let engine = Arc::new(StreamEngine::open(cfg.clone()).expect("real native RF1 engine"));
+        let weak = Arc::downgrade(&engine);
+        let admin = LocalTopicAdmin {
+            engine: engine.into(),
+        };
+        let future = admin.create_topic(TopicConfig {
+            topic_id: TopicId::new(42),
+            partitions: 1,
+            shards: None,
+        });
+        assert_eq!(
+            weak.strong_count(),
+            2,
+            "actual admin future retains a second native owner"
+        );
+        future
+            .await
+            .expect("real native admin blocking worker and journal mutation");
+        assert_eq!(
+            weak.strong_count(),
+            1,
+            "only the actual admin remains after its worker completed"
+        );
+        drop(admin);
+        assert!(weak.upgrade().is_none());
+        let restarted = StreamEngine::open(cfg).expect("actual native RF1 restart");
+        assert!(restarted.all_partitions().contains(&TopicPartition::new(
+            TopicId::new(42),
+            LogicalPartitionId::new(0)
+        )));
     }
 }
