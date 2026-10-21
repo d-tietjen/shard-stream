@@ -39,3 +39,7 @@ published; the release gates and manual publication in
   advisories. The normal resolution also updates the required AWS-LC pair to
   aws-lc-rs `1.18.2` and aws-lc-sys `0.46.0`. Existing TLS feature and provider
   selections remain unchanged.
+- Update quinn-proto to `0.11.18` to address five inherited QUIC advisories,
+  preserving the existing transport and crypto feature selections.
+- Update h2 to `0.4.16` to address the inherited HTTP/2 empty DATA-frame
+  resource-exhaustion advisory.
