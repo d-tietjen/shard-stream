@@ -30,3 +30,16 @@ published; the release gates and manual publication in
 - Preserve the public single-node RF1 product boundary. The new recovery and
   observation APIs do not add a distributed host or establish private HA
   qualification.
+
+### Security
+
+- Raise the direct Rustls minimum to `0.23.46` and update the workspace lock
+  to Rustls `0.23.46`, rustls-webpki `0.103.16` and webpki-root-certs `1.0.10`
+  to address inherited TLS, certificate-validation and root-certificate
+  advisories. The normal resolution also updates the required AWS-LC pair to
+  aws-lc-rs `1.18.2` and aws-lc-sys `0.46.0`. Existing TLS feature and provider
+  selections remain unchanged.
+- Update quinn-proto to `0.11.18` to address five inherited QUIC advisories,
+  preserving the existing transport and crypto feature selections.
+- Update h2 to `0.4.16` to address the inherited HTTP/2 empty DATA-frame
+  resource-exhaustion advisory.
