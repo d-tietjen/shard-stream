@@ -4,6 +4,11 @@ The public workspace publishes one lockstep version across eleven crates.
 `shard-stream-storage` is a source-compatibility facade and
 `shard-stream-bench` is an internal harness; neither is published.
 
+The next candidate is `0.3.0`; its changes and compatibility boundary are in
+[`CHANGELOG.md`](../CHANGELOG.md). Preparing that version does not publish or
+reserve it. Recheck the complete registry version lists and release tags before
+publishing. The published `0.2.0` packages and `v0.2.0` tag must not be replaced.
+
 ## Public release gate
 
 From a clean checkout of the approved public commit, run:
@@ -52,9 +57,11 @@ Do not publish the server until both default features and
 server feature but remains an optional dependency for embedders.
 
 After the final upload, verify docs.rs and install the exact server version in
-a clean directory. The existing `v0.1.0` product tag is immutable and predates
-crate publication; use a distinct `crates-v0.1.0` tag for the publication
-commit. Publishing and tagging are deliberately manual external actions.
+a clean directory. Record the approved publication commit with a fresh
+annotated `vMAJOR.MINOR.PATCH` tag matching the workspace version (`v0.3.0` for
+this candidate). Confirm the tag resolves to the same commit used for every
+package. Keep the existing `v0.1.0` and `v0.2.0` tags immutable. Publishing and
+tagging are deliberately manual external actions requiring release approval.
 
 ## Private update
 
