@@ -41,3 +41,5 @@ published; the release gates and manual publication in
   selections remain unchanged.
 - Update quinn-proto to `0.11.18` to address five inherited QUIC advisories,
   preserving the existing transport and crypto feature selections.
+- Update h2 to `0.4.16` to address the inherited HTTP/2 empty DATA-frame
+  resource-exhaustion advisory.
