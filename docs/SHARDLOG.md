@@ -33,18 +33,20 @@ ShardLog's tests and lints, warnings-as-errors documentation, and the exact
 crate archive Cargo would upload. It creates a package locally but does not
 publish it.
 
-Before the `0.1.0` publication:
+For `0.3.0`, ShardLog participates in the eleven-crate lockstep release and
+publish order in [`RELEASING.md`](RELEASING.md). Before its upload:
 
-1. confirm `main` and `origin/main` identify the approved commit;
+1. confirm the clean checkout identifies the approved workspace release commit;
 2. run `scripts/shardlog-release-gate.sh` on Rust 1.93;
 3. inspect `cargo package --locked -p shardlog --list`;
-4. create and push an annotated `shardlog-crates-v0.1.0` tag without moving
-   the existing `v0.1.0` product tag;
+4. run `cargo publish --locked --dry-run -p shardlog`;
 5. publish with `cargo publish --locked -p shardlog`; and
 6. verify the registry package and docs.rs build before updating consumers.
 
-Publishing is intentionally a separate manual action. The release gate never
-uploads to a registry.
+Use the workspace's annotated `v0.3.0` release tag rather than a separate
+ShardLog publication tag. Existing release tags remain immutable. Publishing
+and tagging are separate manual actions requiring release approval; preparing
+the version and running the release gate do not upload or reserve it.
 
 ## Consumer rollout
 
